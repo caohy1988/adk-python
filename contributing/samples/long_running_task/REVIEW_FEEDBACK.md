@@ -1,239 +1,132 @@
-# Design Document Review: Durable Session Persistence for Long-Horizon ADK Agents
+# Durable Session Persistence for Long-Horizon Data Research Agents
 
-**Reviewer:** Claude Code
-**Date:** 2026-02-01
-**Document:** `long_running_task_design.md`
-
----
-
-## Executive Summary
-
-The design document is **well-structured and comprehensive**, covering a real problem with a thorough technical approach. However, there are **critical accuracy issues** regarding ADK's current capabilities that must be addressed before the document can be considered accurate for review.
-
-**Overall Assessment:** Good foundation, requires significant revisions to accurately reflect ADK's existing resumability features.
+**Authors:** Haiyuan Cao
+**Date:** 02/03/2026
 
 ---
 
-## 1. Reference Validation
+## Objective
 
-### External URLs (7 total) - ALL VALID
-
-| # | URL | Status | Notes |
-|---|-----|--------|-------|
-| 1 | LangGraph durable-execution | VALID | Content matches claims |
-| 2 | LangGraph persistence | VALID | Checkpointing docs |
-| 3 | LangGraph overview | VALID | Framework intro |
-| 4 | LangGraph checkpoints reference | VALID | API docs |
-| 5 | Deep Agents overview | VALID | LangChain library |
-| 6 | Deep Agents long-term memory | VALID | Memory patterns |
-| 7 | Anthropic harnesses article | VALID | Published 2025-11-26 |
+To enable a new class of **Long-Horizon Deep Research Agents** in BigQuery that can execute multi-day autonomous investigations. By implementing a **Durable Session Persistence Layer**, these agents move beyond simple Q&A to perform complex, asynchronous rollouts—cross-dataset synthesis, persistent document monitoring, and multi-step "deep dives"—that survive cloud sandbox timeouts and process restarts.
 
 ---
 
-## 2. CRITICAL ISSUE: ADK Already Has Resumability
+## 1. Current State & Limitations
 
-### Problem Statement Inaccuracy
+It is critical to distinguish between ADK's existing *session delegation* capabilities and the proposed *durable execution* model.
 
-The document states (Section 2):
-> "Current ADK sessions are optimized for synchronous 'serving' patterns... state is ephemeral... background execution is not a first-class runtime mode"
+### 1.1 Existing Capability: `ResumabilityConfig`
 
-**This is inaccurate.** ADK already has an experimental resumability feature:
+ADK currently supports an experimental `ResumabilityConfig` (see `src/google/adk/apps/app.py`) that allows an agent to "pause" execution when calling a long-running tool.
 
-```python
-# src/google/adk/apps/app.py lines 42-58
-@experimental
-class ResumabilityConfig(BaseModel):
-  """The "resumability" in ADK refers to the ability to:
-  1. pause an invocation upon a long-running function call.
-  2. resume an invocation from the last event, if it's paused or failed midway
-  through.
-  """
-  is_resumable: bool = False
+* **Mechanism:** The invocation pauses in-memory. If the user polls the API or the tool returns, the specific runner instance resumes the thread.
+* **Storage Delegation:** ADK can currently delegate session storage (chat history) to BigQuery or Postgres. This saves the *conversation log* (`User: ...`, `Agent: ...`).
+
+### 1.2 The Gap: Chat History vs. Execution State
+
+While ADK can save *what was said* (Chat History) to BigQuery, it does not currently save *what the agent is thinking* (Execution State) in a way that survives a crash.
+
+| Feature | Current ADK (BQ Session Delegation) | Proposed Durable Extension |
+| --- | --- | --- |
+| **What is Saved?** | **Conversation Log:** Messages, user inputs, final tool outputs. | **Execution Snapshot:** The "Job Ledger," partial plans, active stack frames, and retry counters. |
+| **Process Death** | **Fatal:** If the runner crashes, the "thought process" is lost. You can reload chat history, but the agent forgets it was waiting for Job ID #504. | **Recoverable:** The agent wakes up, reads the checkpoint, and knows exactly where it left off in the logic loop. |
+| **Resume Trigger** | **Reactive:** Requires a user or API to poke the agent. | **Proactive:** Can wake itself up via Pub/Sub events (e.g., "Job Done"). |
+| **Consistency** | **Event Replay:** Replays history to rebuild context (expensive & fragile). | **Authoritative Reconciliation:** Deterministically syncs with cloud state (BQ Information Schema). |
+
+**Problem Statement:** Current workflows are brittle. If a Cloud Run instance recycles during a 4-hour job, the agent effectively "dies," leaving orphaned BigQuery jobs and no record of its intent. We need a way to hibernate the *brain*, not just the *transcript*.
+
+---
+
+## 2. The Solution: Two-Phase Commit Persistence
+
+We introduce a **Two-Phase Commit** mechanism to ensure every research step is durably persisted before the agent hibernates. This extends `ResumabilityConfig` to support cross-process durability.
+
+### 2.1 Architecture
+
+1. **Phase 1 (GCS - Data Plane):** The agent serializes its "Research Notebook" (partial drafts, URL ledgers, and reasoning state) to GCS. This handles the bulk state (>1MB).
+2. **Phase 2 (BigQuery - Control Plane):** A metadata row is inserted into a new `checkpoints` table. **Crucially, a checkpoint is only considered "live" once this row commits.** This ensures atomic visibility and prevents "half-saved" states.
+3. **Hibernation:** The agent releases all compute resources. Cost drops to near zero.
+
+### 2.2 Authoritative Reconciliation
+
+Upon waking (via Pub/Sub), the agent does not blindly trust the event stream. It performs a **Deterministic Sync**:
+
+* It loads the checkpoint from GCS.
+* It queries `INFORMATION_SCHEMA.JOBS` to verify the actual status of delegated tasks.
+* It updates its internal ledger (e.g., marking "RUNNING" tasks as "FAILED" if BQ reports a quota error) before generating the next step.
+
+---
+
+## 3. CUJ: Autonomous Deep Research & Trend Analysis
+
+**Persona:** Strategic Market Analyst
+**User Story:** *"As an analyst, I want to trigger a deep research mission. I want the agent to scan three years of financial filings, monitor news for 48 hours, and synthesize a strategy memo without me keeping a tab open."*
+
+### Agent-Based Journey:
+
+1. **Initiation:** A Cloud Scheduler triggers the agent.
+* **Mission:** "Analyze `global_financials` for R&D trends. Monitor `live_news_stream` for 24h."
+
+
+2. **Execution & Hibernation:** The agent submits 30 complex BigQuery jobs. It performs a **Two-Phase Commit** to save its state to GCS/BQ, then enters **PAUSED**.
+3. **Event-Driven Resume:** A Pub/Sub message (BQ Job Complete) triggers the **Resume Service**.
+4. **Reconciliation:** The agent acquires a **Lease** (preventing race conditions), loads the checkpoint, and reconciles its ledger. It finds 28 successes and 2 failures, schedules retries, and drafts the report.
+5. **Outcome:** 24 hours later, a final Markdown report is written to the `executive_briefings` table.
+
+---
+
+## 4. System Design & Schemas
+
+### 4.1 BigQuery Schema (Control Plane)
+
+*Additions based on Technical Review:*
+
+```sql
+-- Checkpoints Table (Control Plane)
+CREATE TABLE `adk_metadata.checkpoints` (
+  session_id STRING NOT NULL,
+  checkpoint_seq INT64 NOT NULL,
+  gcs_state_uri STRING NOT NULL,
+  sha256 STRING NOT NULL,  -- Integrity check
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  agent_state_summary JSON, -- For querying "what was the agent thinking?"
+  PRIMARY KEY (session_id, checkpoint_seq) NOT ENFORCED
+);
+
+-- Events Table (Trigger Log)
+CREATE TABLE `adk_metadata.events` (
+  event_id STRING NOT NULL,
+  session_id STRING NOT NULL,
+  event_type STRING, -- e.g., 'BQ_JOB_DONE', 'PUB_SUB_MSG'
+  payload JSON,
+  processed BOOL DEFAULT FALSE,
+  PRIMARY KEY (event_id) NOT ENFORCED
+);
+
 ```
 
-### Existing ADK Capabilities Not Mentioned
+### 4.2 Cost Estimation
 
-| Capability | Location | Status |
-|------------|----------|--------|
-| `ResumabilityConfig` | `src/google/adk/apps/app.py:42-58` | Experimental |
-| `should_pause_invocation()` | `src/google/adk/agents/invocation_context.py:355-389` | Implemented |
-| `long_running_tool_ids` | `src/google/adk/events/event.py` | Implemented |
-| Resume from last event | `src/google/adk/runners.py:1294` | Implemented |
+By shifting from "Idle Compute" to "Durable Pause":
 
-### Required Fix
+* **Compute:** Drops from ~$1.40/day (Cloud Run idle) to **$0**.
+* **Storage:** BQ Rows + GCS Blobs cost **<$0.01/day** per active session.
+* **Total Savings:** >99% reduction for long-horizon tasks.
 
-**The document must:**
-1. Acknowledge existing `ResumabilityConfig` and pause/resume capability
-2. Clearly articulate how this proposal **extends** existing features vs. replacing them
-3. Update Section 2 (Problem Statement) to reflect actual gaps (e.g., durable cross-process persistence, BigQuery-based audit, external event triggers)
+### 4.3 Rollback & Safety
+
+* **Leasing:** We use a BQ `active_lease_id` column with a 5-minute TTL to ensure only one runner owns a session.
+* **Rollback:** If a runner crashes *during* a checkpoint write, the Phase 2 (BQ commit) never happens. The system simply resumes from the *previous* valid checkpoint, ensuring zero corruption.
 
 ---
 
-## 3. Technical Review
+## Q&A
 
-### 3.1 SQL Schema (Appendix B) - VALID WITH MINOR ISSUES
+**Why can't we just use the existing BQ Session Storage?**
+Existing BQ storage saves the *transcript*. If an agent has processed 500 documents and built a complex internal mental model, reloading the transcript and asking the LLM to "re-read" everything to rebuild that mental model is slow, expensive, and error-prone. This proposal saves the *mental model itself*.
 
-**Strengths:**
-- Proper partitioning strategy (`PARTITION BY DATE`)
-- Sensible clustering choices
-- JSON columns for flexibility
+**What happens if the Resume Service fails?**
+The architecture is idempotent. Pub/Sub will redeliver the message. The Resume Service will check the BQ `events` table; if the event is already marked `processed`, it ignores it. If not, it acquires the lease and proceeds.
 
-**Issues:**
-
-1. **Missing primary key constraint on checkpoints:**
-   ```sql
-   -- Should add:
-   PRIMARY KEY (session_id, checkpoint_seq)
-   ```
-
-2. **events table lacks PRIMARY KEY:**
-   ```sql
-   -- Consider adding:
-   PRIMARY KEY (event_id)  -- or composite key
-   ```
-
-3. **View `v_latest_checkpoint` uses ARRAY_AGG with OFFSET(0):**
-   - This is valid but will error if no checkpoints exist
-   - Consider `SAFE_OFFSET(0)` or handle NULL case
-
-### 3.2 Python Code Snippets - MOSTLY VALID
-
-**Section 7.1 `write_checkpoint()`:**
-- Logic is sound (two-phase commit pattern)
-- Consider adding error handling for partial failures
-
-**Section 7.2 `reconcile_on_resume()`:**
-- Good idempotency pattern
-- Missing: what happens if `bq.get_job()` fails?
-
-### 3.3 Leasing Approach (Section 7.3) - REASONABLE
-
-The BQ-based optimistic lease is correctly noted as best-effort. The suggestion to use Firestore/Spanner for stronger guarantees is appropriate.
-
-**Suggestion:** Add a concrete example of when to use each backend (BQ vs Firestore).
-
----
-
-## 4. Architecture Feedback
-
-### 4.1 Strengths
-
-1. **Clear separation of control plane (BQ) vs data plane (GCS)** - follows Google best practices
-2. **Logical checkpointing over heap snapshots** - pragmatic and maintainable
-3. **Two-phase commit pattern** - ensures atomic visibility
-4. **Authoritative reconciliation** - critical for BigQuery job scenarios
-5. **Good competitive analysis** (Section 14)
-
-### 4.2 Gaps / Missing Considerations
-
-| Gap | Impact | Suggested Action |
-|-----|--------|------------------|
-| No mention of existing `ResumabilityConfig` | Misleading problem statement | Add section on existing capability |
-| No cost estimates for BQ storage/queries | Budget planning | Add rough estimates |
-| No mention of BQ quota limits | Operational risk | Document relevant quotas |
-| Checkpoint versioning migration strategy | Future maintenance | Expand Section 16.2 |
-| No monitoring/alerting design | Operability | Add observability section |
-| No rollback strategy | Safety | Document how to rollback |
-
-### 4.3 API Contract Review
-
-The proposed `CheckpointableAgentState` interface is clean:
-
-```python
-class CheckpointableAgentState:
-    def export_state(self) -> dict: ...
-    def import_state(self, state: dict) -> None: ...
-```
-
-**Suggestion:** Consider alignment with existing ADK patterns:
-- Existing `BaseAgentState` in `src/google/adk/agents/base_agent.py`
-- Existing state patterns in `src/google/adk/sessions/state.py`
-
----
-
-## 5. Specific Line-by-Line Feedback
-
-### Section 0 (Executive Summary)
-- Line 14: "12-minute barrier" - should cite source or clarify this is environment-specific
-- Line 28: Cost estimate "< $0.01/session-day paused" - show calculation
-
-### Section 2 (Problem Statement)
-- **Major revision needed** - must acknowledge existing resumability
-
-### Section 4.1 (States)
-- Consider: should PAUSED be a first-class `Session.status` field or remain at `InvocationContext` level?
-
-### Section 8 (API Extensions)
-- `checkpoint_policy` options are good, but:
-  - What triggers `superstep`?
-  - How does `manual` interact with `long_running_tool_ids`?
-
-### Section 13 (Moltbot Alignment)
-- Moltbot reference is useful context
-- Consider adding link/citation if public
-
-### Section 18 (Open Questions)
-- Good list, but add: "How does this integrate with existing `ResumabilityConfig`?"
-
----
-
-## 6. Recommended Document Changes
-
-### High Priority (Must Fix)
-
-1. **Add Section 1.3: "Existing ADK Resumability"**
-   - Document current `ResumabilityConfig` capability
-   - Explain limitations this design addresses
-   - Position proposal as extension, not replacement
-
-2. **Revise Section 2 (Problem Statement)**
-   - Remove/qualify claims about ADK lacking pause/resume
-   - Focus on actual gaps: cross-process durability, external event triggers, enterprise audit
-
-3. **Add explicit integration plan**
-   - How does `CheckpointableAgentState` relate to `BaseAgentState`?
-   - Migration path from current resumability to new design
-
-### Medium Priority
-
-4. Add cost estimation section
-5. Add monitoring/observability design
-6. Add rollback/recovery procedures
-7. Fix SQL schema issues (PKs)
-
-### Low Priority
-
-8. Add Moltbot citation if available
-9. Add BQ quota documentation links
-10. Consider adding architecture diagram (beyond Mermaid sequence)
-
----
-
-## 7. Summary Table
-
-| Category | Status | Details |
-|----------|--------|---------|
-| External URLs | VALID | All 7 references work |
-| SQL Syntax | VALID with issues | Missing PKs, edge cases |
-| Python Code | VALID | Sound patterns |
-| Problem Statement | INACCURATE | Ignores existing resumability |
-| Architecture | SOUND | Good Google-scale patterns |
-| Completeness | GAPS | Missing cost, monitoring, rollback |
-
----
-
-## 8. Conclusion
-
-This is a **solid technical design** for extending ADK's capabilities for long-running BigQuery workloads. The core architecture (BQ control plane, GCS data plane, two-phase commit, authoritative reconciliation) is well-reasoned.
-
-**However, the document cannot be approved in its current form** because it misrepresents ADK's existing capabilities. Once the existing `ResumabilityConfig` is acknowledged and the document is repositioned as an extension rather than a new capability, it will be ready for technical review.
-
-**Recommended Next Steps:**
-1. Revise document to acknowledge existing resumability
-2. Add cost/monitoring sections
-3. Fix SQL schema issues
-4. Re-submit for review
-
----
-
-*Review generated by Claude Code on 2026-02-01*
+**Is this only for BigQuery?**
+No. While BigQuery is the control plane, this pattern works for any long-running async task (e.g., waiting for human approval, video rendering, or external API webhooks).
