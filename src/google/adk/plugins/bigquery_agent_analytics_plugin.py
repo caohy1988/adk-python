@@ -1171,7 +1171,21 @@ class BatchProcessor:
           yield req
 
         async def perform_write():
-          responses = await self.write_client.append_rows(requests_iter())
+          # The AppendRows streaming RPC does not auto-populate the
+          # request-routing header, so writes to any region other than
+          # the US multiregion fail with a "session not found" /
+          # stream-not-found error. Set the routing header explicitly
+          # (same as google.cloud.bigquery_storage_v1.writer) so the
+          # request reaches the region that owns the write stream.
+          responses = await self.write_client.append_rows(
+              requests_iter(),
+              metadata=(
+                  (
+                      "x-goog-request-params",
+                      f"write_stream={self.write_stream}",
+                  ),
+              ),
+          )
           async for response in responses:
             error = getattr(response, "error", None)
             error_code = getattr(error, "code", None)
