@@ -636,6 +636,55 @@ class TestBigQueryAgentAnalyticsPlugin:
       mock_write_client.append_rows.assert_called_once()
 
   @pytest.mark.asyncio
+  async def test_append_rows_sets_regional_routing_header(
+      self,
+      mock_write_client,
+      callback_context,
+      mock_auth_default,
+      mock_bq_client,
+      mock_to_arrow_schema,
+      dummy_arrow_schema,
+      mock_asyncio_to_thread,
+  ):
+    """Regression test for cross-region writes (issue #262).
+
+    The Storage Write API streaming AppendRows RPC does not
+    auto-populate the request-routing header, so writes to a dataset
+    outside the US multiregion (e.g. northamerica-northeast1) fail with
+    a "session not found" / stream-not-found error unless the header is
+    set explicitly. Assert the header is passed to append_rows so the
+    request reaches the region that owns the write stream.
+    """
+    _ = mock_auth_default
+    _ = mock_bq_client
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig()
+    async with managed_plugin(
+        PROJECT_ID,
+        DATASET_ID,
+        table_id=TABLE_ID,
+        config=config,
+        location="northamerica-northeast1",
+    ) as plugin:
+      await plugin._ensure_started()
+      mock_write_client.append_rows.reset_mock()
+      llm_request = llm_request_lib.LlmRequest(
+          model="gemini-pro",
+          contents=[types.Content(parts=[types.Part(text="Prompt")])],
+      )
+      bigquery_agent_analytics_plugin.TraceManager.push_span(callback_context)
+      await plugin.before_model_callback(
+          callback_context=callback_context, llm_request=llm_request
+      )
+      await asyncio.sleep(0.01)  # Allow background task to run
+      mock_write_client.append_rows.assert_called_once()
+      metadata = mock_write_client.append_rows.call_args.kwargs.get("metadata")
+      assert metadata is not None, "append_rows must receive routing metadata"
+      assert (
+          "x-goog-request-params",
+          f"write_stream={DEFAULT_STREAM_NAME}",
+      ) in tuple(metadata)
+
+  @pytest.mark.asyncio
   async def test_content_formatter(
       self,
       mock_write_client,
