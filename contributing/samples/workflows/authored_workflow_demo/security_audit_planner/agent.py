@@ -225,10 +225,11 @@ async def author_validate_execute(ctx: Context, node_input):
     )
   else:
     reused = False
+    cap_list = ", ".join(f"`{n}`" for n in reg.names())
     yield _msg(
         "🧭 **Model-authored Workflow** — planning a security audit over "
         f"{len(FILES)} files using only registered capabilities "
-        "(`reviewer`, `triager`, `formatter`)."
+        f"({cap_list})."
     )
     planner = Agent(
         name="planner",

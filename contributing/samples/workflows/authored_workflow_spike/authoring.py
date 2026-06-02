@@ -182,6 +182,9 @@ class CapabilityRegistry:
   def __getitem__(self, name):
     return self._by_name[name]
 
+  def names(self) -> list[str]:
+    return list(self._by_name)
+
   def open_map_warnings(self) -> list[str]:
     """Spike lesson: open-ended dict[str, X] output fields are a structured-
     output reliability hazard (Gemini fills them unreliably). Warn on them."""
