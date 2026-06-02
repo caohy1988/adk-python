@@ -189,7 +189,7 @@ Fully additive. New `authoring/` package + `AuthoredWorkflowAgent`; no change to
 1. **Discriminated unions are incompatible with Gemini `response_schema`** — `Field(discriminator="kind")` emits a `discriminator` keyword genai rejects (`Schema: extra_forbidden`). Use a plain `kind`-tagged union.
 1. **Planner quality vs capability quality are separable** — authoring/structure was reliably good; the residual variance was per-capability output quality (prompts/schemas/retries), proven via an intermediate-output diff (authored vs baseline findings were semantically identical). The strict `unmatched=fail` branch contract also caught a bad field-binding loudly instead of mis-routing.
 
-Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (10 deterministic tests + env-gated live sweep) and `authored_workflow_demo/` (ADK Web `root_agent` + 4 CI-safe tests incl. the no-LLM reuse path), in `caohy1988/adk-python` PR #3.
+Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (14 deterministic tests + env-gated live sweep) and `authored_workflow_demo/` (ADK Web `root_agent` + 4 CI-safe tests incl. the no-LLM reuse path), in `caohy1988/adk-python` PR #3.
 
 ## 10. Plan export & storage — the frozen spec as a durable artifact
 

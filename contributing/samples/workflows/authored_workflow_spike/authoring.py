@@ -301,7 +301,7 @@ def _bindings(n) -> list[Binding]:
 # ----------------------------------------------------------------- interpreter
 class SpecInterpreter:
   """Executes a validated WorkflowSpec on the real ADK engine via the #92
-  supervisor. Handles step / fan_out / branch / loop_until."""
+  supervisor. Handles step / fan_out / pipeline / branch / loop_until."""
 
   def __init__(self, registry: CapabilityRegistry, ctx, *, gate: int = 8):
     self.registry = registry
@@ -361,6 +361,15 @@ class SpecInterpreter:
         # (NOT two barriered fan_outs). stage[0] input defaults to the per-item
         # element; stage[k] input defaults to stage[k-1]'s per-item output.
         items = self._resolve(n.over, task_input)
+        # Each stage dispatches once per item, so every stage capability is
+        # subject to the same data-dependent fan-out cap as a FanOut.
+        for st in n.stages:
+          cap = self.registry[st.capability]
+          if len(items) > cap.max_fan_out:
+            raise SpecValidationError(
+                f"runtime: pipeline stage {st.capability!r} fan_out"
+                f" {len(items)} exceeds max_fan_out {cap.max_fan_out}"
+            )
         stage_fns = []
         for si, st in enumerate(n.stages):
 

@@ -15,7 +15,7 @@
 """Deterministic, CI-safe tests for the authored-workflow spike (RFC #93).
 
 No LLM. Capabilities are deterministic stub nodes, so these exercise the
-validator + the interpreter (step / fan_out / branch / loop_until + binding
+validator + the interpreter (step / fan_out / pipeline / branch / loop_until + binding
 scope) on the real ADK Workflow engine. The live planner sweep lives in
 test_live_planner_sweep.py (env-gated).
 """
@@ -438,3 +438,16 @@ async def test_interpreter_pipeline_ordered_and_barrier_free():
       t for (n, p, t) in log if n == "reviewer" and p == "end"
   )
   assert first_verifier_start < last_reviewer_end
+
+
+@pytest.mark.asyncio
+async def test_interpreter_pipeline_enforces_max_fan_out():
+  # Each stage dispatches once per item, so a stage capability's max_fan_out is
+  # a data-dependent cap that must be enforced at runtime (same as FanOut).
+  log = []
+  reg = _timed_registry(log)
+  reg["verifier"].max_fan_out = 1  # 2 items > cap -> reject before dispatch
+  with pytest.raises(SpecValidationError):
+    await _run_spec(_pipeline_spec(), reg, {"items": [0, 1]})
+  # rejected pre-dispatch: no stage ran.
+  assert log == []
