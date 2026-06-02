@@ -174,11 +174,16 @@ Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (10 deter
     "capability_versions": { "reviewer": "...", "triager": "..." },
     "validation": { "passed": true, "warnings": [] },
     "created_at": "<ISO-8601, recorded at export>",
-    "task_input_digest": "<hash of the task input, NOT the raw input>"
+    "task_input_schema": { "...": "expected task-input JSON schema, or null" },
+    "task_input_digest": "<digest of the task input, NOT the raw input>"
   }
   ```
 
-  This is the enterprise story: a model-authored plan becomes **reviewable, diffable, auditable, replayable** data. `created_at` is stamped at export (not at replay); `task_input_digest` is a hash so a portable plan doesn't carry raw task content.
+  This is the enterprise story: a model-authored plan becomes **reviewable, diffable, auditable, replayable** data. `created_at` is stamped at export (not at replay); `task_input_digest` is a digest so a portable plan doesn't carry raw task content.
+
+  **Digest/hash definition.** `spec_hash` and `task_input_digest` are `sha256` over **canonical JSON** — `json.dumps(value, sort_keys=True, separators=(",", ":"))` — of the spec and the task input respectively. A single fixed definition so two exporters produce identical hashes for the same logical value (no whitespace/key-order drift).
+
+  **Execution-input contract on import.** `task_input_digest` is *advisory provenance* for replaying the **original** run. Reusing a plan against a **new** task input is template behavior: ADK validates the new input against the captured `task_input_schema`. If `task_input_schema` is null (none captured), import may only **replay** with a matching `task_input_digest`, or must go through explicit **template promotion** (which attaches a `task_input_schema`) first. A stored plan must never silently bind (e.g. `task.files`) against an incompatible task shape.
 
   ```python
   def export_plan(frozen) -> dict: ...                  # the envelope above
