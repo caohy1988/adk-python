@@ -4,7 +4,7 @@ Canonical technical design for RFC #93 (GoogleCloudPlatform/BigQuery-Agent-Analy
 
 ## 1. Data model — `WorkflowSpec`
 
-A discriminated-by-`kind`, recursive, ordered **tree of blocks** (not a graph with jumps). `id`s are globally-unique **binding names** for dataflow, never jump targets — which removes join / fall-through / GOTO ambiguity by construction.
+A plain `kind`-tagged, recursive, ordered **tree of blocks** (not a graph with jumps). `id`s are globally-unique **binding names** for dataflow, never jump targets — which removes join / fall-through / GOTO ambiguity by construction.
 
 ```python
 # src/google/adk/workflow/authoring/_spec.py  (NEW)
@@ -113,10 +113,27 @@ Then **`Graph.validate_graph()`** (reused) handles duplicate names, `START`/reac
 
 ## 5. Frozen-spec contract (correctness requirement)
 
-Before any execution, persist: spec JSON, content hash, planner model+version, registry/capability version, validation result. Deterministic replay holds **only** if resume loads the **same** frozen spec → **resume MUST reuse it and MUST NOT re-plan** unless the user starts a new run; a registry-version mismatch on resume is a hard error.
+Persist **one** `FrozenWorkflowRecord` before any execution — the *same* shape backs session state, the audit event, and the export envelope (§10), so v1 storage is never a weaker subset:
 
-- **Storage target (v1):** session state under an **unprefixed (session-scoped) key** (e.g. `authored_workflow:frozen_spec`). **Not** `app:` — that's app-scoped (`State.APP_PREFIX`, extracted in `_session_util.extract_state_delta`) and shared across sessions/users, leaking per-run data and breaking per-run resume.
-- **Audit event shape:** persist **state-only** — `Event(state={"authored_workflow:frozen_spec": frozen_record})`, hash/kind inside the record or a sibling key. **Not** `Event.output` (`NodeRunner._track_event_in_context` sets `ctx.output = event.output` and `Context.output` rejects a second output → "Output already set"). **Not** `Event.content` (would re-enter a model's context).
+```python
+class FrozenWorkflowRecord(BaseModel):
+  schema_version: str                 # "v1"
+  spec: WorkflowSpec
+  spec_hash: str                      # sha256(canonical_json(spec)) — see §10
+  planner_model: str
+  registry_version: str
+  capability_versions: dict[str, str]
+  validation: ValidationResult        # {passed: bool, warnings: [...]}
+  created_at: str                     # ISO-8601, stamped at freeze
+  task_input_schema: dict | None      # expected root task-input schema (enables template reuse)
+  task_input_digest: str | None       # sha256(canonical_json(task_input))
+```
+
+Deterministic replay holds **only** if resume loads the **same** record → **resume MUST reuse it and MUST NOT re-plan** unless the user starts a new run; a registry/capability-version mismatch on resume is a hard error.
+
+- **Storage target (v1):** the **full record** in session state under an **unprefixed (session-scoped) key** `authored_workflow:frozen_record` — not just `{spec, hash}`, so drift detection and audit have everything they need. **Not** `app:` (app-scoped — `State.APP_PREFIX`, extracted in `_session_util.extract_state_delta` — would leak per-run data and break per-run resume).
+- **Audit event shape:** persist **state-only** — `Event(state={"authored_workflow:frozen_record": record})`. **Not** `Event.output` (`NodeRunner._track_event_in_context` sets `ctx.output = event.output`; `Context.output` rejects a second output → "Output already set"). **Not** `Event.content` (would re-enter a model's context).
+- *(The committed demo persists a minimal `{spec, hash}` subset for illustration; the canonical v1 shape is `FrozenWorkflowRecord`.)*
 
 ## 6. Security model
 
@@ -160,9 +177,9 @@ Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (10 deter
 
 **Source of truth = the typed `WorkflowSpec`.** The compiled `Workflow` is a *derived* artifact. Storage is tiered, scoped to keep generated code and compiled graphs out of v1:
 
-- **v1 (required) — persist frozen spec per run.** Already core (§5): session state `authored_workflow:frozen_spec` + hash, for resume/replay.
+- **v1 (required) — persist the full `FrozenWorkflowRecord` per run** (§5) under `authored_workflow:frozen_record` — for resume/replay **and** drift detection.
 
-- **v1.1 (recommended) — export the frozen spec as a portable JSON envelope.** An explicit "Export plan" operation producing a self-describing record:
+- **v1.1 (recommended) — export the record as a portable JSON envelope.** The envelope **is a serialized `FrozenWorkflowRecord`** (§5) — same fields, never a weaker shape — produced by an explicit "Export plan" operation:
 
   ```json
   {
@@ -186,8 +203,16 @@ Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (10 deter
   **Execution-input contract on import.** `task_input_digest` is *advisory provenance* for replaying the **original** run. Reusing a plan against a **new** task input is template behavior: ADK validates the new input against the captured `task_input_schema`. If `task_input_schema` is null (none captured), import may only **replay** with a matching `task_input_digest`, or must go through explicit **template promotion** (which attaches a `task_input_schema`) first. A stored plan must never silently bind (e.g. `task.files`) against an incompatible task shape.
 
   ```python
-  def export_plan(frozen) -> dict: ...                  # the envelope above
-  def import_plan(envelope, registry) -> WorkflowSpec:  # re-validates vs the CURRENT registry
+  def export_plan(record: FrozenWorkflowRecord) -> dict: ...   # serialize the §5 record
+  def import_plan(envelope, registry, *, task_input=None) -> WorkflowSpec:
+    # INTEGRITY (never trust the envelope's own `validation`):
+    #   1. recompute sha256(canonical_json(spec)); REJECT if != envelope["spec_hash"]
+    #   2. re-run WorkflowSpecValidator against the CURRENT registry
+    #   3. registry/capability drift -> fail loudly (or explicit migration)
+    # EXECUTION-INPUT:
+    #   replay   : task_input digest must match envelope["task_input_digest"] (else audit-only)
+    #   template : task_input validated against envelope["task_input_schema"] before execution
+    #   neither  : do NOT execute against arbitrary new input
   ```
 
 - **v2 (optional) — promote an exported plan to a reusable template.** A human approves a spec and saves it as a template. **On import, ADK MUST re-validate against the *current* registry**; registry/capability drift **fails loudly or requires explicit migration** — never a silent run against a changed capability set. (The envelope's `registry_version` / `capability_versions` are what make drift detectable.)
