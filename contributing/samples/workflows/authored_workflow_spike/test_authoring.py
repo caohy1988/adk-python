@@ -41,6 +41,8 @@ from authoring import Capability
 from authoring import CapabilityRegistry
 from authoring import FanOut
 from authoring import LoopUntil
+from authoring import Pipeline
+from authoring import PipelineStage
 from authoring import Route
 from authoring import SpecInterpreter
 from authoring import SpecValidationError
@@ -349,3 +351,90 @@ async def test_interpreter_loop_until_stops_and_outputs():
       "text": "v",
       "len": len("topic"),
   }  # loop output = last body node output
+
+
+# ----------------------------------------------------------------- pipeline
+def _timed_registry(log):
+  """reviewer (stage 0) + verifier (stage 1) as deterministic timed stubs."""
+  import asyncio
+  import time
+
+  def stage_cap(name, slow_for=None, key="r"):
+    def build():
+      @node(name=name)
+      async def n(ctx, node_input):
+        item = node_input
+        log.append((name, "start", time.perf_counter()))
+        await asyncio.sleep(
+            0.05 if (slow_for is not None and item == slow_for) else 0.0
+        )
+        log.append((name, "end", time.perf_counter()))
+        yield Event(output={key: item})
+
+      return n
+
+    return Capability(
+        name=name, build=build, input_kind="item", serialize_input=False
+    )
+
+  return CapabilityRegistry([
+      stage_cap("reviewer", slow_for=1, key="review"),
+      stage_cap("verifier", key="verdict"),
+  ])
+
+
+def _pipeline_spec():
+  return WorkflowSpec(
+      goal="pipe",
+      steps=[
+          Pipeline(
+              kind="pipeline",
+              id="pp",
+              over=Binding(source="task", path="items"),
+              stages=[
+                  PipelineStage(capability="reviewer"),
+                  PipelineStage(capability="verifier"),
+              ],
+          )
+      ],
+      output=Binding(source="step", step="pp"),
+  )
+
+
+def test_validator_accepts_pipeline():
+  log = []
+  WorkflowSpecValidator(_timed_registry(log)).validate(_pipeline_spec())
+
+
+def test_validator_rejects_pipeline_list_stage():
+  spec = _pipeline_spec()
+  # "count" takes a list, not an item -> invalid pipeline stage
+  spec.steps[0].stages[1] = PipelineStage(capability="count")
+  with pytest.raises(SpecValidationError):
+    WorkflowSpecValidator(_registry()).validate(spec)
+
+
+@pytest.mark.asyncio
+async def test_interpreter_pipeline_ordered_and_barrier_free():
+  log = []
+  reg = _timed_registry(log)
+  # input items [0, 1]; reviewer is slow for item 1 only.
+  out = await _run_spec(_pipeline_spec(), reg, {"items": [0, 1]})
+
+  # Ordered, per-item review->verify (verdict carries the reviewed value):
+  assert out == [{"verdict": {"review": 0}}, {"verdict": {"review": 1}}]
+
+  starts = {n: t for (n, p, t) in log if p == "start"}
+  ends = {n: t for (n, p, t) in log if p == "end"}
+  # BARRIER-FREE proof: item 0 reaches stage 2 (verifier) BEFORE item 1 finishes
+  # stage 1 (reviewer). Two barriered fan_outs could NOT do this — every
+  # reviewer would finish before any verifier started.
+  assert "verifier" in starts and "reviewer" in ends
+  # earliest verifier start precedes the latest reviewer end:
+  first_verifier_start = min(
+      t for (n, p, t) in log if n == "verifier" and p == "start"
+  )
+  last_reviewer_end = max(
+      t for (n, p, t) in log if n == "reviewer" and p == "end"
+  )
+  assert first_verifier_start < last_reviewer_end

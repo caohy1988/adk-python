@@ -26,9 +26,9 @@ behind the RFC's "can a model author good plans?" question.
 pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q
 ```
 
-Expected: **10 passed** — `Binding` invariant, `max_iters>=1`, validator accepts a
+Expected: **13 passed** — `Binding` invariant, `max_iters>=1`, validator accepts a
 valid spec and rejects unknown capability / non-preceding binding / duplicate id,
-the open-map warning, and interpreter execution of fan_out→aggregate, branch
+the open-map warning, and interpreter execution of fan_out→aggregate, **pipeline (barrier-free per-item review→verify)**, branch
 (correct route), and loop_until (stops + correct output).
 
 ## Live planner sweep (optional evidence)

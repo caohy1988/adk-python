@@ -22,8 +22,8 @@ A minimal, faithful implementation of the RFC's authoring layer:
 * ``WorkflowSpecValidator`` — semantic validation (capability refs, binding
   scope, list/loop/branch rules) + an open-map output-schema warning.
 * ``SpecInterpreter`` — executes a validated spec on the real ADK Workflow
-  engine via the #92 ``DynamicNodeSupervisor`` (step / fan_out / branch /
-  loop_until).
+  engine via the #92 ``DynamicNodeSupervisor`` (step / fan_out / pipeline /
+  branch / loop_until).
 
 This is a demand-gate artifact, not production code. See README.md.
 """
@@ -84,6 +84,24 @@ class FanOut(BaseModel):
   collect: Literal["list"] = "list"
 
 
+class PipelineStage(BaseModel):
+  capability: str  # registered; takes an item
+  input: Binding | None = (
+      None  # defaults to the previous stage's per-item output
+  )
+
+
+class Pipeline(BaseModel):
+  # Barrier-free per-item multi-stage flow: each item runs through ALL stages
+  # via #92 ctx.pipeline (item A can be in stage k while item B is in stage 1) —
+  # NOT two barriered fan_outs. Compiles to DynamicNodeSupervisor.pipeline.
+  kind: Literal["pipeline"]
+  id: str
+  over: Binding  # MUST resolve to a list
+  stages: list[PipelineStage]
+  collect: Literal["list"] = "list"
+
+
 class Route(BaseModel):
   value: str
   block: list["SpecNode"]
@@ -114,7 +132,7 @@ class LoopUntil(BaseModel):
 # rejects (Schema: extra_forbidden — verified on gemini-3.5-flash). Each member still
 # carries a `kind` Literal, so this is a structurally-tagged union: unambiguous to parse
 # and to switch on, AND accepted as a Gemini response_schema.
-SpecNode = Union[StepRef, FanOut, Branch, LoopUntil]
+SpecNode = Union[StepRef, FanOut, Pipeline, Branch, LoopUntil]
 
 
 class WorkflowSpec(BaseModel):
@@ -123,7 +141,16 @@ class WorkflowSpec(BaseModel):
   output: Binding
 
 
-for _m in (StepRef, FanOut, Branch, Route, LoopUntil, WorkflowSpec):
+for _m in (
+    StepRef,
+    FanOut,
+    PipelineStage,
+    Pipeline,
+    Branch,
+    Route,
+    LoopUntil,
+    WorkflowSpec,
+):
   _m.model_rebuild()
 
 
@@ -227,6 +254,25 @@ class WorkflowSpecValidator:
         raise SpecValidationError(
             f"fan_out {n.id}: capability must take an item"
         )
+      if isinstance(n, Pipeline):
+        if not n.stages:
+          raise SpecValidationError(f"pipeline {n.id}: needs >= 1 stage")
+        for st in n.stages:
+          if st.capability not in self.registry:
+            raise SpecValidationError(f"unknown capability {st.capability!r}")
+          if self.registry[st.capability].input_kind != "item":
+            raise SpecValidationError(
+                f"pipeline {n.id}: stage {st.capability!r} must take an item"
+            )
+          if (
+              isinstance(st.input, Binding)
+              and st.input.source == "step"
+              and st.input.step not in preceding
+          ):
+            raise SpecValidationError(
+                f"pipeline {n.id}: stage input references non-preceding step"
+                f" {st.input.step!r}"
+            )
       if isinstance(n, LoopUntil):
         # body executes in-scope; until_input may reference a body step.
         body_scope = self._walk(n.body, preceding | {n.id}, ids)
@@ -309,6 +355,30 @@ class SpecInterpreter:
                 )
             ),
         )
+      elif isinstance(n, Pipeline):
+        # Barrier-free per-item multi-stage flow via #92 ctx.pipeline — each item
+        # threads ALL stages; item A can be in stage k while item B is in stage 1
+        # (NOT two barriered fan_outs). stage[0] input defaults to the per-item
+        # element; stage[k] input defaults to stage[k-1]'s per-item output.
+        items = self._resolve(n.over, task_input)
+        stage_fns = []
+        for si, st in enumerate(n.stages):
+
+          def stage(prev, it, i, si=si, st=st, rid=rid):
+            cap = self.registry[st.capability]
+            value = (
+                self._resolve(st.input, task_input)
+                if st.input is not None
+                else (it if si == 0 else prev)
+            )
+            return self.sup.dispatch(
+                cap.build(),
+                node_input=self._arg(cap, value),
+                run_id=f"{rid}_{i}_{si}",
+            )
+
+          stage_fns.append(stage)
+        self.state[n.id] = await self.sup.pipeline(items, *stage_fns)
       elif isinstance(n, Branch):
         value = str(self._resolve(n.on, task_input))
         routes = {r.value: r.block for r in n.routes}
