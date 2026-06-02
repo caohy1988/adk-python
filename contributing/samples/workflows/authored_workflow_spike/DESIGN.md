@@ -2,6 +2,8 @@
 
 Canonical technical design for RFC #93 (GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK#93). Mirrors the issue's Technical Design comment. Covers the data model, validator, interpreter/compilation, frozen-spec contract, security model, framework changes, testing, and the empirical findings that shaped it. Audience: implementers / technical reviewers.
 
+> **Phasing (MVP-first).** Ship **#92 first**; build full #93 only once leadership commits it as a product bet **and** 3–5 real tasks beat hand-wired workflows. **MVP scope** = `WorkflowSpec` + validator + **freeze/replay + export**; **defer** templates (v2), complex loops, and broad compiler features. (Strategic rationale: the concise RFC's *Positioning & priority*.)
+
 ## 1. Data model — `WorkflowSpec`
 
 A plain `kind`-tagged, recursive, ordered **tree of blocks** (not a graph with jumps). `id`s are globally-unique **binding names** for dataflow, never jump targets — which removes join / fall-through / GOTO ambiguity by construction.
