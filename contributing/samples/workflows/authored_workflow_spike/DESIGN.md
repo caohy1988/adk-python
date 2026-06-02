@@ -1,4 +1,4 @@
-# Design — Reproducible Model-Authored Workflows for ADK (RFC #93)
+# Technical Design — Agent-authored typed Workflows (RFC #93)
 
 Canonical technical design for RFC #93 (GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK#93). Mirrors the issue's Technical Design comment. Covers the data model, validator, interpreter/compilation, frozen-spec contract, security model, framework changes, testing, and the empirical findings that shaped it. Audience: implementers / technical reviewers.
 
@@ -32,6 +32,20 @@ class FanOut(BaseModel):
   capability: str                      # run once per element (compiles to ctx.pipeline/parallel)
   collect: Literal["list"] = "list"    # per-item outputs aggregate to an order-preserving list
 
+class PipelineStage(BaseModel):
+  capability: str                      # MUST resolve in the registry; takes an item
+  input: Binding | None = None         # defaults to the previous stage's per-item output
+
+class Pipeline(BaseModel):
+  kind: Literal["pipeline"]
+  id: str
+  over: Binding                        # MUST resolve to a LIST-typed value
+  stages: list[PipelineStage]          # each item flows through ALL stages, BARRIER-FREE
+  collect: Literal["list"] = "list"    # outputs aggregate to an order-preserving list
+  # Compiles to #92 ctx.pipeline: item A may be in stage k while item B is in stage 1.
+  # Failed item -> None; control exceptions follow #92. stage[0] input defaults to the
+  # per-item element; stage[n] input defaults to stage[n-1]'s per-item output.
+
 class Route(BaseModel):
   value: str                           # the switch value this route matches
   block: list["SpecNode"]              # non-empty; output = block's last-node output
@@ -55,7 +69,7 @@ class LoopUntil(BaseModel):
 # Annotated[..., Field(discriminator="kind")]: the discriminated form emits a
 # JSON-schema `discriminator` keyword that Gemini's response_schema rejects
 # (Schema: extra_forbidden — verified). `kind` still disambiguates parsing.
-SpecNode = Union[StepRef, FanOut, Branch, LoopUntil]
+SpecNode = Union[StepRef, FanOut, Pipeline, Branch, LoopUntil]
 
 class WorkflowSpec(BaseModel):
   goal: str
@@ -89,7 +103,7 @@ class AuthoredWorkflowAgent(BaseAgent):
 
 - **Authoring** = `LlmAgent(output_schema=WorkflowSpec)`; ADK validates structured output, so a malformed plan is caught and re-planned (bounded by `max_replans`).
 - **Validation** is a **new semantic validator** (below) that *lowers to* `Graph.validate_graph()` for structural checks.
-- **Compilation** lowers the block tree: sequence → edges; `Branch` → conditional route edges over nested blocks; `FanOut`/`LoopUntil` → the #92 `ctx.pipeline`/`ctx.parallel` + bounded loop. The compiled artifact is an ordinary `Workflow` — nothing downstream knows it was machine-authored.
+- **Compilation** lowers the block tree: sequence → edges; `Branch` → conditional route edges over nested blocks; `FanOut` → `ctx.parallel`-map; `Pipeline` → barrier-free `ctx.pipeline` (multi-stage); `LoopUntil` → bounded loop. The compiled artifact is an ordinary `Workflow` — nothing downstream knows it was machine-authored.
 - **Registry** = developer-supplied capabilities (an agent, or a tool wrapped as a node), each with per-capability policy.
 
 ## 3. Validator — semantic, then structural
@@ -100,6 +114,7 @@ class AuthoredWorkflowAgent(BaseAgent):
 - `Binding` invariant + path/type compatibility vs the producer's `output_schema` and consumer's `input_schema`;
 - `FanOut.over` resolves to a list; the fan-out capability takes an item;
 - `Branch.on` is string/str-enum-typed; route blocks share a compatible last-node output schema; non-exhaustive enum domain is flagged (unmatched at runtime fails);
+- `Pipeline`: `over` resolves to a list; every stage `capability` is registered and takes an item; stage[0] input defaults to the per-item element, stage[n] to stage[n-1]'s output; the last stage's output type defines the pipeline output (validated for downstream bindings);
 - `LoopUntil`: strict-bool `until_capability`, present/compatible `until_input`, `max_iters >= 1`;
 - globally-unique `id`s; binding-scope (no non-preceding / cross-route references);
 - registry-version match vs a frozen spec (drift = hard error).
@@ -110,6 +125,7 @@ Then **`Graph.validate_graph()`** (reused) handles duplicate names, `START`/reac
 
 - **Authoring non-deterministic; execution deterministic.** Once frozen, execution + resume replay is fully deterministic (it's just a `Workflow`).
 - **Reuses #92 + the engine wholesale.** Fan-out → supervised `ctx.pipeline`/`ctx.parallel` (bounded, interrupt-safe); sequence/branch → edges + routes; loop → bounded loop. No new executor.
+- **`Pipeline` is barrier-free per-item** (compiles directly to #92's `ctx.pipeline`): item A may be in stage *k* while item B is in stage 1; an ordinary failure drops that item to `None`; control exceptions follow #92. This closes the gap where the vocabulary was *less* expressive than its own executor — a single-capability `fan_out` is parallel-map; `Pipeline` is the multi-stage barrier-free form.
 - **Re-plan is pre-execution-only.** `max_replans` applies only to validation failures; an execution failure fails the frozen run; recovery = a new explicit run/version. No recursive planner-spawning-planner.
 - **Budget + agent caps from #92** bound a mis-plan's spend.
 
@@ -222,6 +238,10 @@ Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (10 deter
 - **Deferred — compiled `Workflow`/graph (or generated Python) as the source of truth.** The compiled `Workflow` is regenerated from the spec on demand; it is **not** stored as canonical, because compiler behavior and ADK internals evolve. Persisting generated code or a compiled graph is explicitly out of scope.
 
 Net: this turns the proposal from "a model can author plans" into "**model-authored plans become durable enterprise artifacts**" — without committing to durable generated code.
+
+## 11. Future (post-gate, NOT MVP)
+
+**Hierarchical / sub-plan authoring** — a registered capability that is itself an `AuthoredWorkflowAgent`, so a step can expand into its own authored sub-plan. This is the likely path to parity with Claude Code's unbounded orchestration (it lifts the single-response plan-size ceiling), but it is **out of MVP scope** and should be evaluated **only after the 3–5-task build gate**. MVP stays single-level: `WorkflowSpec` + validator + freeze/replay + export.
 
 ## References
 
