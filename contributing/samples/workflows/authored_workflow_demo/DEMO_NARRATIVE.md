@@ -58,6 +58,8 @@ Send: **"Plan and run a codebase security review."** The chat streams:
 > "Open the **State** tab: `authored_workflow:frozen_spec` and `…_hash`. The plan
 > is now durable data you can store, diff, and audit."
 
+*(Presenter note: this demo persists only `{spec, hash}` for readability. Production v1 stores the full `FrozenWorkflowRecord` — planner/registry/capability versions, validation, `task_input_schema`/`digest` — see `authored_workflow_spike/DESIGN.md` §5. The demo illustrates the behavior; it is not the canonical persistence contract.)*
+
 ## Beat 4 — execute (Events / trace tab)
 
 ```

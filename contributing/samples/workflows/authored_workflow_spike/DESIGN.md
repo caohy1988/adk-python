@@ -135,7 +135,7 @@ Deterministic replay holds **only** if resume loads the **same** record → **re
 
 - **Storage target (v1):** the **full record** in session state under an **unprefixed (session-scoped) key** `authored_workflow:frozen_record` — not just `{spec, hash}`, so drift detection and audit have everything they need. **Not** `app:` (app-scoped — `State.APP_PREFIX`, extracted in `_session_util.extract_state_delta` — would leak per-run data and break per-run resume).
 - **Audit event shape:** persist **state-only** — `Event(state={"authored_workflow:frozen_record": record})`. **Not** `Event.output` (`NodeRunner._track_event_in_context` sets `ctx.output = event.output`; `Context.output` rejects a second output → "Output already set"). **Not** `Event.content` (would re-enter a model's context).
-- *(The committed demo persists a minimal `{spec, hash}` subset for illustration; the canonical v1 shape is `FrozenWorkflowRecord`.)*
+- **Demo vs production:** the committed demo persists only a minimal `{spec, hash}` subset to keep the walkthrough readable — **it illustrates the behavior; production v1 would store the full `FrozenWorkflowRecord`.** The demo is illustrative, not the canonical contract.
 
 ## 6. Security model
 

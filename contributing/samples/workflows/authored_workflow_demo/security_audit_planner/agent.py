@@ -238,6 +238,11 @@ async def author_validate_execute(ctx: Context, node_input):
 
   # 3. FREEZE — persist spec + hash to session state on first author only
   # (visible in the State tab; reused runs already have it).
+  # NOTE: this demo persists only a minimal {spec, hash} subset to keep the
+  # walkthrough readable. Production v1 would store the full FrozenWorkflowRecord
+  # (planner/registry/capability versions, validation, task_input_schema/digest)
+  # — see authored_workflow_spike/DESIGN.md §5. The demo is illustrative, not the
+  # canonical persistence contract.
   if not reused:
     ctx.state["authored_workflow:frozen_spec"] = spec.model_dump()
     ctx.state["authored_workflow:frozen_spec_hash"] = spec_hash
