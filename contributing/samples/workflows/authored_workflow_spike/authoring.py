@@ -412,6 +412,9 @@ class PlanImportError(Exception):
   """Raised when an exported plan fails integrity, drift, or input checks."""
 
 
+SUPPORTED_SCHEMA_VERSION = "v1"
+
+
 def export_plan(record: FrozenWorkflowRecord) -> dict:
   """Serialize the §5 record to a portable JSON-able envelope."""
   return record.model_dump(mode="json")
@@ -423,15 +426,24 @@ def import_plan(
   """Re-hydrate an exported plan, NEVER trusting the envelope's own checks.
 
   Integrity + drift (DESIGN.md §10):
+    0. reject an unsupported schema_version;
     1. recompute sha256(canonical_json(spec)); REJECT if != envelope spec_hash;
     2. re-run WorkflowSpecValidator against the CURRENT registry (catches a
        dropped/renamed capability);
-    3. per-capability version drift vs the envelope -> fail loudly.
+    3. registry-version and per-capability version drift -> fail loudly.
   Execution-input contract:
     * replay   (no schema): task_input digest MUST match the envelope's;
     * template (schema):    task_input is validated against task_input_schema;
     * neither: do NOT execute against arbitrary new input.
   """
+  # 0. schema_version — a defensive importer refuses formats it doesn't know.
+  schema_version = envelope.get("schema_version")
+  if schema_version != SUPPORTED_SCHEMA_VERSION:
+    raise PlanImportError(
+        f"unsupported schema_version {schema_version!r} (this importer supports"
+        f" {SUPPORTED_SCHEMA_VERSION!r})"
+    )
+
   spec = WorkflowSpec.model_validate(envelope["spec"])
 
   # 1. integrity — recompute, don't trust.
@@ -449,7 +461,15 @@ def import_plan(
   except SpecValidationError as e:
     raise PlanImportError(f"re-validation against current registry failed: {e}")
 
-  # 3. per-capability version drift.
+  # 3a. registry-version drift is a hard error (DESIGN.md §10).
+  if envelope.get("registry_version") != registry.version:
+    raise PlanImportError(
+        "registry_version drift (recorded"
+        f" {envelope.get('registry_version')!r} vs current"
+        f" {registry.version!r}) — re-validate / migrate before reuse"
+    )
+
+  # 3b. per-capability version drift.
   current = registry.capability_versions(only=referenced_capabilities(spec))
   recorded = envelope.get("capability_versions", {})
   drifted = {

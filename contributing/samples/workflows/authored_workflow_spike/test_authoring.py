@@ -45,9 +45,9 @@ from authoring import FanOut
 from authoring import FrozenWorkflowRecord
 from authoring import import_plan
 from authoring import LoopUntil
-from authoring import PlanImportError
 from authoring import Pipeline
 from authoring import PipelineStage
+from authoring import PlanImportError
 from authoring import Route
 from authoring import sha256_hex
 from authoring import SpecInterpreter
@@ -508,6 +508,24 @@ def test_import_rejects_capability_version_drift():
   bumped["review"].version = "2"
   with pytest.raises(PlanImportError, match="version drift"):
     import_plan(env, bumped, task_input=_TASK)
+
+
+def test_import_rejects_unsupported_schema_version():
+  env = export_plan(_frozen())
+  env["schema_version"] = "v2"  # an importer must refuse formats it can't read
+  with pytest.raises(PlanImportError, match="schema_version"):
+    import_plan(env, _registry(), task_input=_TASK)
+
+
+def test_import_rejects_registry_version_drift():
+  env = export_plan(_frozen())
+  # same capabilities/versions, but the whole registry was re-versioned ->
+  # hard error per DESIGN.md §10.
+  v2_registry = CapabilityRegistry(
+      list(_registry()._by_name.values()), version="2"
+  )
+  with pytest.raises(PlanImportError, match="registry_version"):
+    import_plan(env, v2_registry, task_input=_TASK)
 
 
 def test_import_rejects_new_input_without_template_schema():

@@ -58,11 +58,11 @@ Proof points: multi-stage `fan_out → step → step`; branch `step → branch`;
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 19
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 21
 pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 4
 ```
 
-- Deterministic suites: #92 **11** + #93 **19** + demo **4** = **34** (incl. a no-LLM reuse-path test).
+- Deterministic suites: #92 **11** + #93 **21** + demo **4** = **36** (incl. a no-LLM reuse-path test).
 - PR #3 CI green except the documented fork-only `agent-triage` token job.
 
 ## Recording notes

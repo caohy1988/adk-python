@@ -133,13 +133,13 @@ Same hash, `reused` flips to `true` — the model is not called the second time.
 > "So: a model authored a typed, validated, capability-bounded plan; ADK executed
 > it on the real engine; the plan **exported** to a portable, defensively-imported
 > audit artifact; and a re-send replayed the exact frozen plan. The deterministic
-> test suites — 11 (#92) + 19 (#93) + 4 (demo) — lock all of this in CI, including
+> test suites — 11 (#92) + 21 (#93) + 4 (demo) — lock all of this in CI, including
 > the no-LLM reuse path and the export round-trip / tamper / drift checks."
 
 ## Proof commands (terminal, ~60s)
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 19
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 21
 pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 4
 ```
