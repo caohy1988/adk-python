@@ -1,4 +1,4 @@
-# Design — Agent-authored typed Workflows (RFC #93)
+# Design — Reproducible Model-Authored Workflows for ADK (RFC #93)
 
 Canonical technical design for RFC #93 (GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK#93). Mirrors the issue's Technical Design comment. Covers the data model, validator, interpreter/compilation, frozen-spec contract, security model, framework changes, testing, and the empirical findings that shaped it. Audience: implementers / technical reviewers.
 
