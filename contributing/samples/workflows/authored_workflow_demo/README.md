@@ -36,11 +36,11 @@ Plan and run a codebase security review.
 
 Point at the ADK-native evidence as it streams:
 
-1. **Authored `WorkflowSpec`** — the chat shows the JSON plan (`fan_out → step → step`).
+1. **Authored `WorkflowSpec`** — the chat shows the JSON plan (`pipeline → step → step`: a `reviewer → verifier` pipeline over the files, then `triager`, then `formatter`).
 1. **Validation** — "Validation passed" + the capability list (all registered).
 1. **Frozen spec + hash** — open the **State** tab: `authored_workflow:frozen_spec` and `…_hash`.
-1. **Execution** — the **Events / trace** view shows the `reviewer` fan-out, then `triager`, then `formatter` node runs.
-1. **Final output** — the triaged audit (e.g. 3 HIGH + 1 MEDIUM across `auth.py`/`db.py`/`net.py`/`math.py`).
+1. **Execution** — the **Events / trace** view shows `reviewer` and `verifier` interleaving **per file** (the barrier-free pipeline), then `triager`, then `formatter`.
+1. **Final output** — the triaged audit (1 CRITICAL + 2 HIGH + 1 MEDIUM across `auth.py`/`db.py`/`net.py`/`math.py`).
 
 (Re-send the same prompt to show resume reuses the frozen spec — same hash, not re-authored.)
 

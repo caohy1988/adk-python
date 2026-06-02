@@ -40,7 +40,8 @@ import agent as demo  # noqa: E402
 from authoring import Binding  # noqa: E402
 from authoring import Capability  # noqa: E402
 from authoring import CapabilityRegistry  # noqa: E402
-from authoring import FanOut  # noqa: E402
+from authoring import Pipeline  # noqa: E402
+from authoring import PipelineStage  # noqa: E402
 from authoring import StepRef  # noqa: E402
 from authoring import WorkflowSpec  # noqa: E402
 from authoring import WorkflowSpecValidator  # noqa: E402
@@ -50,11 +51,14 @@ def _demo_spec() -> WorkflowSpec:
   return WorkflowSpec(
       goal="audit",
       steps=[
-          FanOut(
-              kind="fan_out",
+          Pipeline(
+              kind="pipeline",
               id="rev",
               over=Binding(source="task", path="files"),
-              capability="reviewer",
+              stages=[
+                  PipelineStage(capability="reviewer"),
+                  PipelineStage(capability="verifier"),
+              ],
           ),
           StepRef(
               kind="step",
@@ -81,9 +85,10 @@ def test_root_agent_importable_and_named():
 
 def test_demo_registry_is_clean():
   reg = demo._registry()
-  for name in ("reviewer", "triager", "formatter"):
+  for name in ("reviewer", "verifier", "triager", "formatter"):
     assert name in reg
   assert reg["reviewer"].input_kind == "item"
+  assert reg["verifier"].input_kind == "item"  # pipeline stages take an item
   assert reg["triager"].input_kind == "list"
   # ReportFixed uses enumerated fields, not an open dict[str, X] map.
   assert reg.open_map_warnings() == []
@@ -112,6 +117,15 @@ def _stub_registry() -> CapabilityRegistry:
           build=stub(
               "reviewer",
               lambda f: {"path": f["path"], "severity": "HIGH", "issue": "x"},
+          ),
+      ),
+      Capability(
+          name="verifier",
+          input_kind="item",
+          serialize_input=False,
+          build=stub(
+              "verifier",
+              lambda finding: {**finding, "issue": finding["issue"] + "!"},
           ),
       ),
       Capability(
@@ -174,5 +188,10 @@ async def test_reuse_path_no_llm(monkeypatch):
   assert (
       out["hash"] == "deadbeef0000"
   )  # same frozen hash, not re-derived from a new plan
-  assert set(out["capabilities"]) == {"reviewer", "triager", "formatter"}
+  assert set(out["capabilities"]) == {
+      "reviewer",
+      "verifier",
+      "triager",
+      "formatter",
+  }
   assert out["result"]["note"].startswith("audited")

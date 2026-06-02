@@ -19,29 +19,34 @@ Send: **"Plan and run a codebase security review."** The chat streams:
 
 ```
 🧭 Model-authored Workflow — planning a security audit over 4 files using only
-   registered capabilities (reviewer, triager, formatter).
+   registered capabilities (reviewer, verifier, triager, formatter).
 
-📋 Authored plan (fan_out → step → step):
+📋 Authored plan (pipeline → step → step):
    {
      "goal": "Audit files and format the report",
      "steps": [
-       {"kind": "fan_out", "id": "review_files",   "over": {"source":"task","path":"files"}, "capability": "reviewer"},
-       {"kind": "step",     "id": "triage_findings", "input": {"source":"step","step":"review_files"}, "capability": "triager"},
-       {"kind": "step",     "id": "format_report",   "input": {"source":"step","step":"triage_findings"}, "capability": "formatter"}
+       {"kind": "pipeline", "id": "review_pipeline",
+        "over": {"source":"task","path":"files"},
+        "stages": [{"capability":"reviewer"}, {"capability":"verifier"}],
+        "collect": "list"},
+       {"kind": "step", "id": "triage_step",   "input": {"source":"step","step":"review_pipeline"}, "capability": "triager"},
+       {"kind": "step", "id": "format_step",   "input": {"source":"step","step":"triage_step"},     "capability": "formatter"}
      ],
-     "output": {"source": "step", "step": "format_report"}
+     "output": {"source": "step", "step": "format_step"}
    }
 ```
 
-> "The model emitted a *typed plan*, not code — a fan-out of `reviewer` over the
-> files, then `triager`, then `formatter`, with explicit data bindings between
-> steps."
+> "The model emitted a *typed plan*, not code — a **pipeline** over the files
+> (`reviewer → verifier` per file, barrier-free), then `triager`, then
+> `formatter`, with explicit data bindings between steps. The pipeline is the
+> construct that lets each file flow review→verify independently — item A can be
+> verifying while item B is still being reviewed."
 
 ## Beat 2 — validate (capability allow-list)
 
 ```
 ✅ Validation passed. Capabilities referenced (all registered):
-   ['formatter', 'reviewer', 'triager'].
+   ['formatter', 'reviewer', 'triager', 'verifier'].
 ```
 
 > "Validation confirms every capability the plan names is in the registry. The
@@ -51,7 +56,7 @@ Send: **"Plan and run a codebase security review."** The chat streams:
 ## Beat 3 — freeze (State tab)
 
 ```
-🔒 Frozen spec persisted to session state — hash 206fb4d3a27b.
+🔒 Frozen spec persisted to session state — hash 1f4c0883beb6.
    Re-send the prompt: it replays this exact plan, not a new one.
 ```
 
@@ -67,15 +72,18 @@ Send: **"Plan and run a codebase security review."** The chat streams:
    2 high (hardcoded credentials and SQL injection), and 1 medium (division by zero).
 ```
 
-> "Open **Events**: ADK runs the plan on the real engine via the #92 supervisor —
-> the `reviewer` fan-out over the 4 files, then `triager`, then `formatter`. The
-> findings are real: a CRITICAL `os.system` injection, HIGH hardcoded creds and
-> SQL injection, and a MEDIUM divide-by-zero."
+> "Open **Events**: ADK runs the plan on the real engine via the #92 supervisor.
+> Note the interleaving — `reviewer` and `verifier` events alternate **per
+> file** (a file is being verified while another is still under review); that's
+> the barrier-free pipeline, not two separate fan-out waves. Then `triager` over
+> all verified findings, then `formatter`. The findings are real: a CRITICAL
+> `os.system` injection, HIGH hardcoded creds and SQL injection, and a MEDIUM
+> divide-by-zero."
 
 ## Beat 5 — reproduce (re-send the same prompt)
 
 ```
-♻️ Reusing frozen plan from session state — hash 206fb4d3a27b.
+♻️ Reusing frozen plan from session state — hash 1f4c0883beb6.
    The model is NOT re-invoked; the exact prior plan is replayed.
 ✅ Validation passed. ...
 📄 Audit result: ...
@@ -89,8 +97,8 @@ Send: **"Plan and run a codebase security review."** The chat streams:
 
 | Run         | `reused` | `hash`         |
 | ----------- | -------- | -------------- |
-| 1 (author)  | `false`  | `206fb4d3a27b` |
-| 2 (re-send) | `true`   | `206fb4d3a27b` |
+| 1 (author)  | `false`  | `1f4c0883beb6` |
+| 2 (re-send) | `true`   | `1f4c0883beb6` |
 
 Same hash, `reused` flips to `true` — the model is not called the second time.
 

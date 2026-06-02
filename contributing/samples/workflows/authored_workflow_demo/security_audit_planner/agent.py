@@ -119,6 +119,24 @@ def _registry() -> CapabilityRegistry:
           ),
       ),
       Capability(
+          name="verifier",
+          input_kind="item",
+          output_model=Finding,
+          serialize_input=True,
+          max_fan_out=50,
+          build=lambda: Agent(
+              name="verifier",
+              model=MODEL,
+              output_schema=Finding,
+              generate_content_config=DET,
+              instruction=(
+                  "Input: a Finding JSON (path, severity, issue). Confirm the"
+                  " severity and keep or adjust the issue. Output the Finding"
+                  " (echo the path)."
+              ),
+          ),
+      ),
+      Capability(
           name="triager",
           input_kind="list",
           output_model=ReportFixed,
@@ -155,18 +173,23 @@ def _registry() -> CapabilityRegistry:
 
 
 _REGISTRY_DESC = (
-    "reviewer (item: a file with path and code -> Finding), triager (LIST of"
-    " Findings -> ReportFixed), formatter (item: a ReportFixed -> Note)."
+    "reviewer (item: a file with path and code -> Finding), verifier (item: a"
+    " Finding -> a confirmed Finding), triager (LIST of Findings ->"
+    " ReportFixed), formatter (item: a ReportFixed -> Note)."
 )
 _PLANNER_INSTR = (
     "Author a WorkflowSpec using ONLY these capabilities: "
     + _REGISTRY_DESC
     + " The task input has a 'files' list of objects with path and code."
-    " Author:"
-    " a fan_out of reviewer over task.files, then a step running triager on the"
-    " findings, then a step running formatter on the report. Use"
-    " Binding(source='task', path='files') and Binding(source='step',"
-    " step=<id>) to chain. Set output to the formatter step."
+    " Author, in order:"
+    " (1) a pipeline over task.files with two stages, reviewer then verifier,"
+    " so each file is reviewed and then its finding is verified per item;"
+    " (2) a step running triager on the pipeline output;"
+    " (3) a step running formatter on the report."
+    " Use Binding(source='task', path='files') for the pipeline's over, and"
+    " Binding(source='step', step=<id>) to chain steps. A pipeline stage takes"
+    " its input from the previous stage automatically, so stages need no input"
+    " binding. Set output to the formatter step."
 )
 
 
@@ -229,7 +252,13 @@ async def author_validate_execute(ctx: Context, node_input):
 
   # 2. VALIDATE — semantic validation against the registry (always).
   warnings = WorkflowSpecValidator(reg).validate(spec)  # raises on hard error
-  caps = sorted({getattr(s, "capability", None) for s in spec.steps} - {None})
+  caps = set()
+  for s in spec.steps:
+    if getattr(s, "capability", None):
+      caps.add(s.capability)
+    for st in getattr(s, "stages", None) or []:  # pipeline stage capabilities
+      caps.add(st.capability)
+  caps = sorted(caps)
   yield _msg(
       "✅ **Validation passed.** Capabilities referenced (all registered): "
       f"`{caps}`."
