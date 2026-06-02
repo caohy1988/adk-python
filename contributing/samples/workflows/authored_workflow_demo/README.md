@@ -39,6 +39,7 @@ Point at the ADK-native evidence as it streams:
 1. **Authored `WorkflowSpec`** — the chat shows the JSON plan (`pipeline → step → step`: a `reviewer → verifier` pipeline over the files, then `triager`, then `formatter`).
 1. **Validation** — "Validation passed" + the capability list (all registered).
 1. **Frozen spec + hash** — open the **State** tab: `authored_workflow:frozen_spec` and `…_hash`.
+1. **Exported plan** — `📦 Exported plan → security_audit_plan.json`. The full `FrozenWorkflowRecord` (spec, `sha256`, planner model, registry + capability versions, validation, task-input digest) as a portable envelope; import recomputes the hash and re-validates against the current registry. `cat security_audit_plan.json | jq .` on camera.
 1. **Execution** — the **Events / trace** view shows `reviewer` and `verifier` interleaving **per file** (the barrier-free pipeline), then `triager`, then `formatter`.
 1. **Final output** — the triaged audit (1 CRITICAL + 2 HIGH + 1 MEDIUM across `auth.py`/`db.py`/`net.py`/`math.py`).
 
@@ -57,11 +58,11 @@ Proof points: multi-stage `fan_out → step → step`; branch `step → branch`;
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 14
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 19
 pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 4
 ```
 
-- Deterministic suites: #92 **11** + #93 **14** + demo **4** = **29** (incl. a no-LLM reuse-path test).
+- Deterministic suites: #92 **11** + #93 **19** + demo **4** = **34** (incl. a no-LLM reuse-path test).
 - PR #3 CI green except the documented fork-only `agent-triage` token job.
 
 ## Recording notes

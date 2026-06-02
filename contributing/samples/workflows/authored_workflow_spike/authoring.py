@@ -24,12 +24,17 @@ A minimal, faithful implementation of the RFC's authoring layer:
 * ``SpecInterpreter`` — executes a validated spec on the real ADK Workflow
   engine via the #92 ``DynamicNodeSupervisor`` (step / fan_out / pipeline /
   branch / loop_until).
+* ``FrozenWorkflowRecord`` / ``export_plan`` / ``import_plan`` — the frozen spec
+  as a first-class, portable artifact (DESIGN.md §10): export to a JSON
+  envelope; import recomputes the hash and re-validates against the *current*
+  registry, never trusting the envelope's own ``validation``.
 
 This is a demand-gate artifact, not production code. See README.md.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -169,12 +174,14 @@ class Capability(BaseModel):
   )
   max_fan_out: int = 100
   side_effect: bool = False
+  version: str = "1"  # bumped when the capability's contract changes (drift)
 
 
 class CapabilityRegistry:
 
-  def __init__(self, capabilities: list[Capability]):
+  def __init__(self, capabilities: list[Capability], *, version: str = "1"):
     self._by_name = {c.name: c for c in capabilities}
+    self.version = version  # registry_version (coarse drift signal)
 
   def __contains__(self, name):
     return name in self._by_name
@@ -184,6 +191,16 @@ class CapabilityRegistry:
 
   def names(self) -> list[str]:
     return list(self._by_name)
+
+  def capability_versions(
+      self, only: Optional[set[str]] = None
+  ) -> dict[str, str]:
+    """name -> version for drift detection on import (optionally filtered)."""
+    return {
+        n: c.version
+        for n, c in self._by_name.items()
+        if only is None or n in only
+    }
 
   def open_map_warnings(self) -> list[str]:
     """Spike lesson: open-ended dict[str, X] output fields are a structured-
@@ -299,6 +316,172 @@ def _bindings(n) -> list[Binding]:
     if isinstance(b, Binding):
       out.append(b)
   return out
+
+
+# ----------------------------------------------------------- export / import
+#
+# DESIGN.md §10: the frozen spec is a first-class, exportable artifact. The
+# source of truth is the typed WorkflowSpec; the compiled Workflow is derived
+# and never stored. A single canonical hash definition keeps two exporters in
+# agreement, and import NEVER trusts the envelope's own `validation` — it
+# recomputes the hash and re-validates against the *current* registry.
+
+
+def canonical_json(value) -> str:
+  """The one fixed serialization for hashing (no whitespace/key-order drift)."""
+  return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_hex(value) -> str:
+  return hashlib.sha256(canonical_json(value).encode()).hexdigest()
+
+
+def referenced_capabilities(spec: WorkflowSpec) -> set[str]:
+  """Every capability name a spec composes (walks pipeline stages, branch
+  routes, and loop bodies — not just top-level steps)."""
+  found: set[str] = set()
+
+  def walk(nodes):
+    for n in nodes:
+      cap = getattr(n, "capability", None)
+      if cap:
+        found.add(cap)
+      for st in getattr(n, "stages", None) or []:
+        found.add(st.capability)
+      for route in getattr(n, "routes", None) or []:
+        walk(route.block)
+      if getattr(n, "until_capability", None):
+        found.add(n.until_capability)
+      if getattr(n, "body", None):
+        walk(n.body)
+
+  walk(spec.steps)
+  return found
+
+
+class ValidationResult(BaseModel):
+  passed: bool
+  warnings: list[str] = Field(default_factory=list)
+
+
+class FrozenWorkflowRecord(BaseModel):
+  """The single shape behind session state, the audit event, and the export
+  envelope (DESIGN.md §5) — v1 storage is never a weaker subset."""
+
+  schema_version: str = "v1"
+  spec: WorkflowSpec
+  spec_hash: str
+  planner_model: str
+  registry_version: str
+  capability_versions: dict[str, str]
+  validation: ValidationResult
+  created_at: str  # ISO-8601, stamped at freeze (caller supplies; not now())
+  task_input_schema: Optional[dict] = None
+  task_input_digest: Optional[str] = None
+
+  @classmethod
+  def freeze(
+      cls,
+      spec: WorkflowSpec,
+      *,
+      planner_model: str,
+      registry: CapabilityRegistry,
+      created_at: str,
+      task_input=None,
+      task_input_schema: Optional[dict] = None,
+  ) -> "FrozenWorkflowRecord":
+    """Validate + capture everything needed for replay and drift detection."""
+    warnings = WorkflowSpecValidator(registry).validate(spec)  # raises on hard
+    refs = referenced_capabilities(spec)
+    return cls(
+        spec=spec,
+        spec_hash=sha256_hex(spec.model_dump(mode="json")),
+        planner_model=planner_model,
+        registry_version=registry.version,
+        capability_versions=registry.capability_versions(only=refs),
+        validation=ValidationResult(passed=True, warnings=warnings),
+        created_at=created_at,
+        task_input_schema=task_input_schema,
+        task_input_digest=(
+            None if task_input is None else sha256_hex(task_input)
+        ),
+    )
+
+
+class PlanImportError(Exception):
+  """Raised when an exported plan fails integrity, drift, or input checks."""
+
+
+def export_plan(record: FrozenWorkflowRecord) -> dict:
+  """Serialize the §5 record to a portable JSON-able envelope."""
+  return record.model_dump(mode="json")
+
+
+def import_plan(
+    envelope: dict, registry: CapabilityRegistry, *, task_input=None
+) -> WorkflowSpec:
+  """Re-hydrate an exported plan, NEVER trusting the envelope's own checks.
+
+  Integrity + drift (DESIGN.md §10):
+    1. recompute sha256(canonical_json(spec)); REJECT if != envelope spec_hash;
+    2. re-run WorkflowSpecValidator against the CURRENT registry (catches a
+       dropped/renamed capability);
+    3. per-capability version drift vs the envelope -> fail loudly.
+  Execution-input contract:
+    * replay   (no schema): task_input digest MUST match the envelope's;
+    * template (schema):    task_input is validated against task_input_schema;
+    * neither: do NOT execute against arbitrary new input.
+  """
+  spec = WorkflowSpec.model_validate(envelope["spec"])
+
+  # 1. integrity — recompute, don't trust.
+  recomputed = sha256_hex(spec.model_dump(mode="json"))
+  if recomputed != envelope.get("spec_hash"):
+    raise PlanImportError(
+        "spec_hash mismatch: envelope has"
+        f" {envelope.get('spec_hash')!r}, recomputed {recomputed!r} — the spec"
+        " was tampered with or re-serialized under a different definition"
+    )
+
+  # 2. re-validate against the CURRENT registry (dropped capability fails here).
+  try:
+    WorkflowSpecValidator(registry).validate(spec)
+  except SpecValidationError as e:
+    raise PlanImportError(f"re-validation against current registry failed: {e}")
+
+  # 3. per-capability version drift.
+  current = registry.capability_versions(only=referenced_capabilities(spec))
+  recorded = envelope.get("capability_versions", {})
+  drifted = {
+      n: (recorded.get(n), current.get(n))
+      for n in current
+      if recorded.get(n) != current.get(n)
+  }
+  if drifted:
+    raise PlanImportError(
+        f"capability version drift (recorded vs current): {drifted} — promote"
+        " to a template with explicit migration before reuse"
+    )
+
+  # Execution-input contract.
+  if task_input is not None:
+    schema = envelope.get("task_input_schema")
+    if schema is not None:
+      missing = [k for k in schema.get("required", []) if k not in task_input]
+      if missing:
+        raise PlanImportError(
+            f"task input missing required keys {missing} for this template"
+        )
+    else:
+      digest = sha256_hex(task_input)
+      if digest != envelope.get("task_input_digest"):
+        raise PlanImportError(
+            "task_input digest mismatch and no task_input_schema captured:"
+            " this plan can only be REPLAYED on its original input (promote to"
+            " a template to reuse it on new input)"
+        )
+
+  return spec
 
 
 # ----------------------------------------------------------------- interpreter

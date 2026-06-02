@@ -22,6 +22,7 @@ test_live_planner_sweep.py (env-gated).
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -39,11 +40,16 @@ from authoring import Binding  # noqa: E402
 from authoring import Branch
 from authoring import Capability
 from authoring import CapabilityRegistry
+from authoring import export_plan
 from authoring import FanOut
+from authoring import FrozenWorkflowRecord
+from authoring import import_plan
 from authoring import LoopUntil
+from authoring import PlanImportError
 from authoring import Pipeline
 from authoring import PipelineStage
 from authoring import Route
+from authoring import sha256_hex
 from authoring import SpecInterpreter
 from authoring import SpecValidationError
 from authoring import StepRef
@@ -451,3 +457,64 @@ async def test_interpreter_pipeline_enforces_max_fan_out():
     await _run_spec(_pipeline_spec(), reg, {"items": [0, 1]})
   # rejected pre-dispatch: no stage ran.
   assert log == []
+
+
+# ----------------------------------------------------------------- export/import
+_TASK = {"files": [{"path": "a.py", "code": "bad"}]}
+
+
+def _frozen():
+  return FrozenWorkflowRecord.freeze(
+      _fanout_aggregate_spec(),
+      planner_model="gemini-3.5-flash",
+      registry=_registry(),
+      created_at="2026-06-02T00:00:00Z",
+      task_input=_TASK,
+  )
+
+
+def test_export_then_import_roundtrip_replays_same_hash():
+  env = export_plan(_frozen())
+  # the envelope is JSON-serializable and carries the full §5 record.
+  assert json.loads(json.dumps(env))["schema_version"] == "v1"
+  assert set(env["capability_versions"]) == {"review", "count"}
+  # re-import on the ORIGINAL input (replay path) succeeds and recomputes the
+  # SAME hash from the spec — integrity holds.
+  spec = import_plan(env, _registry(), task_input=_TASK)
+  assert sha256_hex(spec.model_dump(mode="json")) == env["spec_hash"]
+
+
+def test_import_rejects_tampered_spec():
+  env = export_plan(_frozen())
+  # tamper with the spec but leave the recorded hash -> integrity check fires.
+  env["spec"]["goal"] = "exfiltrate"
+  with pytest.raises(PlanImportError, match="spec_hash mismatch"):
+    import_plan(env, _registry(), task_input=_TASK)
+
+
+def test_import_rejects_dropped_capability():
+  env = export_plan(_frozen())
+  # current registry no longer has `count` -> re-validation against the CURRENT
+  # registry fails (we never trust the envelope's own `validation`).
+  shrunk = CapabilityRegistry([_registry()["review"]])
+  with pytest.raises(PlanImportError, match="re-validation"):
+    import_plan(env, shrunk, task_input=_TASK)
+
+
+def test_import_rejects_capability_version_drift():
+  env = export_plan(_frozen())
+  # same capabilities, but `review` was bumped since export -> drift.
+  bumped = _registry()
+  bumped["review"].version = "2"
+  with pytest.raises(PlanImportError, match="version drift"):
+    import_plan(env, bumped, task_input=_TASK)
+
+
+def test_import_rejects_new_input_without_template_schema():
+  env = export_plan(_frozen())  # no task_input_schema captured -> replay-only
+  other = {"files": [{"path": "z.py", "code": "ok"}]}
+  with pytest.raises(PlanImportError, match="digest mismatch"):
+    import_plan(env, _registry(), task_input=other)
+  # but template promotion (a captured schema) lets a new input through:
+  env["task_input_schema"] = {"required": ["files"]}
+  assert import_plan(env, _registry(), task_input=other) is not None

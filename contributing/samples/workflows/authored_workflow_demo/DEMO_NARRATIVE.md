@@ -56,14 +56,40 @@ Send: **"Plan and run a codebase security review."** The chat streams:
 ## Beat 3 — freeze (State tab)
 
 ```
-🔒 Frozen spec persisted to session state — hash 1f4c0883beb6.
+🔒 Frozen spec persisted to session state — hash 71997cdf0669.
    Re-send the prompt: it replays this exact plan, not a new one.
 ```
 
 > "Open the **State** tab: `authored_workflow:frozen_spec` and `…_hash`. The plan
 > is now durable data you can store, diff, and audit."
 
-*(Presenter note: this demo persists only `{spec, hash}` for readability. Production v1 stores the full `FrozenWorkflowRecord` — planner/registry/capability versions, validation, `task_input_schema`/`digest` — see `authored_workflow_spike/DESIGN.md` §5. The demo illustrates the behavior; it is not the canonical persistence contract.)*
+*(Presenter note: session **state** keeps a minimal `{spec, hash}` subset so the State tab stays readable. The **export** beat below serializes the full `FrozenWorkflowRecord`. Production v1 would persist the full record to state too — see `authored_workflow_spike/DESIGN.md` §5. The split here is presentational, not the canonical contract.)*
+
+## Beat 3b — export the plan (the enterprise artifact)
+
+```
+📦 Exported plan → security_audit_plan.json (full 71997cdf0669, schema v1,
+   planner gemini-3.5-flash). Re-imported OK — import recomputes the hash and
+   re-validates against the current registry, never trusting the envelope's own
+   validation. This is the reviewable / diffable / replayable audit artifact.
+```
+
+> "The frozen plan isn't just in-memory state — it serializes to a **portable
+> JSON envelope**: the spec, its `sha256`, the planner model, registry +
+> per-capability versions, the validation result, and a *digest* of the task
+> input (not the raw input). `cat security_audit_plan.json` — this is the thing
+> you check into a repo, diff in a PR, and hand to an auditor. And import is
+> **defensive**: it recomputes the hash (rejects a tampered spec), re-validates
+> against the *current* registry (rejects a dropped capability), and flags
+> per-capability version drift — it never trusts the envelope's own `validation`
+> stamp. That defensive import is exactly what makes a model-authored plan safe
+> to store and replay later."
+
+Show the file on camera:
+
+```bash
+cat security_audit_plan.json | jq '{schema_version, spec_hash, planner_model, capability_versions, validation}'
+```
 
 ## Beat 4 — execute (Events / trace tab)
 
@@ -83,7 +109,7 @@ Send: **"Plan and run a codebase security review."** The chat streams:
 ## Beat 5 — reproduce (re-send the same prompt)
 
 ```
-♻️ Reusing frozen plan from session state — hash 1f4c0883beb6.
+♻️ Reusing frozen plan from session state — hash 71997cdf0669.
    The model is NOT re-invoked; the exact prior plan is replayed.
 ✅ Validation passed. ...
 📄 Audit result: ...
@@ -97,22 +123,23 @@ Send: **"Plan and run a codebase security review."** The chat streams:
 
 | Run         | `reused` | `hash`         |
 | ----------- | -------- | -------------- |
-| 1 (author)  | `false`  | `1f4c0883beb6` |
-| 2 (re-send) | `true`   | `1f4c0883beb6` |
+| 1 (author)  | `false`  | `71997cdf0669` |
+| 2 (re-send) | `true`   | `71997cdf0669` |
 
 Same hash, `reused` flips to `true` — the model is not called the second time.
 
 ## Close (~20s)
 
 > "So: a model authored a typed, validated, capability-bounded plan; ADK executed
-> it on the real engine; and a re-send replayed the exact frozen plan. The
-> deterministic test suites — 11 (#92) + 14 (#93) + 4 (demo) — lock all of this
-> in CI, including a no-LLM test of this reuse path."
+> it on the real engine; the plan **exported** to a portable, defensively-imported
+> audit artifact; and a re-send replayed the exact frozen plan. The deterministic
+> test suites — 11 (#92) + 19 (#93) + 4 (demo) — lock all of this in CI, including
+> the no-LLM reuse path and the export round-trip / tamper / drift checks."
 
 ## Proof commands (terminal, ~60s)
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 14
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 19
 pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 4
 ```

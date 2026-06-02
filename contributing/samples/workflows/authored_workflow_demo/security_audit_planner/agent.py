@@ -31,7 +31,7 @@ Configure a model first (no hardcoded project):
 
 from __future__ import annotations
 
-import hashlib
+import datetime
 import json
 import os
 import sys
@@ -57,6 +57,10 @@ sys.path.insert(
 )
 from authoring import Capability  # noqa: E402
 from authoring import CapabilityRegistry  # noqa: E402
+from authoring import export_plan  # noqa: E402
+from authoring import FrozenWorkflowRecord  # noqa: E402
+from authoring import import_plan  # noqa: E402
+from authoring import sha256_hex  # noqa: E402
 from authoring import SpecInterpreter  # noqa: E402
 from authoring import WorkflowSpec  # noqa: E402
 from authoring import WorkflowSpecValidator  # noqa: E402
@@ -200,9 +204,13 @@ def _msg(text: str) -> Event:
 
 
 def _hash(spec: WorkflowSpec) -> str:
-  return hashlib.sha256(
-      json.dumps(spec.model_dump(), sort_keys=True).encode()
-  ).hexdigest()[:12]
+  # The one canonical hash definition (authored_workflow_spike/authoring.py),
+  # shown truncated; the full digest lives in the exported FrozenWorkflowRecord.
+  return sha256_hex(spec.model_dump(mode="json"))[:12]
+
+
+# Where the "Export plan" beat writes the portable envelope (cwd of `adk web`).
+_EXPORT_PATH = os.path.join(os.getcwd(), "security_audit_plan.json")
 
 
 @node(rerun_on_resume=True)
@@ -268,11 +276,12 @@ async def author_validate_execute(ctx: Context, node_input):
 
   # 3. FREEZE — persist spec + hash to session state on first author only
   # (visible in the State tab; reused runs already have it).
-  # NOTE: this demo persists only a minimal {spec, hash} subset to keep the
-  # walkthrough readable. Production v1 would store the full FrozenWorkflowRecord
-  # (planner/registry/capability versions, validation, task_input_schema/digest)
-  # — see authored_workflow_spike/DESIGN.md §5. The demo is illustrative, not the
-  # canonical persistence contract.
+  # NOTE: session state keeps a minimal {spec, hash} subset so the State tab
+  # stays readable for the resume/reuse beat. The EXPORT beat below serializes
+  # the full FrozenWorkflowRecord (planner/registry/capability versions,
+  # validation, task_input_digest) — see authored_workflow_spike/DESIGN.md §5/§10.
+  # Production v1 would persist that full record to state too; the split here is
+  # presentational, not the canonical contract.
   if not reused:
     ctx.state["authored_workflow:frozen_spec"] = spec.model_dump()
     ctx.state["authored_workflow:frozen_spec_hash"] = spec_hash
@@ -280,6 +289,35 @@ async def author_validate_execute(ctx: Context, node_input):
         f"🔒 **Frozen spec** persisted to session state — hash `{spec_hash}`. "
         "Re-send the prompt: it replays this exact plan, not a new one."
     )
+
+    # 3b. EXPORT — serialize the full FrozenWorkflowRecord to a portable JSON
+    # envelope (DESIGN.md §10), then prove the import contract by re-importing
+    # it: import_plan recomputes the hash and re-validates against the CURRENT
+    # registry — it never trusts the envelope's own `validation`.
+    record = FrozenWorkflowRecord.freeze(
+        spec,
+        planner_model=MODEL,
+        registry=reg,
+        created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        task_input={"files": FILES},
+    )
+    envelope = export_plan(record)
+    try:
+      with open(_EXPORT_PATH, "w") as f:
+        json.dump(envelope, f, indent=2)
+      import_plan(
+          envelope, reg, task_input={"files": FILES}
+      )  # re-hash+re-validate
+      yield _msg(
+          f"📦 **Exported plan** → `{os.path.basename(_EXPORT_PATH)}` "
+          f"(full `{record.spec_hash[:12]}`, schema `{record.schema_version}`, "
+          f"planner `{record.planner_model}`). Re-imported OK — import "
+          "recomputes the hash and re-validates against the current registry, "
+          "never trusting the envelope's own validation. This is the "
+          "reviewable / diffable / replayable audit artifact."
+      )
+    except OSError as e:
+      yield _msg(f"📦 Export skipped (filesystem): {e}")
 
   # 4. EXECUTE — run the validated plan on the real ADK engine (#92 supervisor).
   result = await SpecInterpreter(reg, ctx).execute(spec, {"files": FILES})

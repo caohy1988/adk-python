@@ -14,11 +14,11 @@ behind the RFC's "can a model author good plans?" question.
 
 ## Files
 
-| File                         | Purpose                                                                                                                                                                  |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `authoring.py`               | `WorkflowSpec` (plain `kind`-tagged recursive tree), `CapabilityRegistry`, `WorkflowSpecValidator`, `SpecInterpreter` (step / fan_out / pipeline / branch / loop_until). |
-| `test_authoring.py`          | Deterministic, CI-safe tests (no LLM). The trustworthy artifact.                                                                                                         |
-| `test_live_planner_sweep.py` | OPTIONAL env-gated live planner sweep across plan shapes.                                                                                                                |
+| File                         | Purpose                                                                                                                                                                                                                                                                          |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `authoring.py`               | `WorkflowSpec` (plain `kind`-tagged recursive tree), `CapabilityRegistry`, `WorkflowSpecValidator`, `SpecInterpreter` (step / fan_out / pipeline / branch / loop_until), and `FrozenWorkflowRecord` / `export_plan` / `import_plan` (portable plan envelope + defensive import). |
+| `test_authoring.py`          | Deterministic, CI-safe tests (no LLM). The trustworthy artifact.                                                                                                                                                                                                                 |
+| `test_live_planner_sweep.py` | OPTIONAL env-gated live planner sweep across plan shapes.                                                                                                                                                                                                                        |
 
 ## Deterministic tests (CI-safe, no network)
 
@@ -26,10 +26,12 @@ behind the RFC's "can a model author good plans?" question.
 pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q
 ```
 
-Expected: **14 passed** — `Binding` invariant, `max_iters>=1`, validator accepts a
+Expected: **19 passed** — `Binding` invariant, `max_iters>=1`, validator accepts a
 valid spec and rejects unknown capability / non-preceding binding / duplicate id,
 the open-map warning, and interpreter execution of fan_out→aggregate, **pipeline (barrier-free per-item review→verify, plus per-stage `max_fan_out` enforcement)**, branch
-(correct route), and loop_until (stops + correct output).
+(correct route), and loop_until (stops + correct output); plus **plan export/import**
+(round-trip replays the same hash; import rejects a tampered spec, a dropped
+capability, capability version drift, and a new input with no template schema).
 
 ## Live planner sweep (optional evidence)
 
