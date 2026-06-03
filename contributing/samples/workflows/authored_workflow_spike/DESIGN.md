@@ -189,7 +189,7 @@ Fully additive. New `authoring/` package + `AuthoredWorkflowAgent`; no change to
 1. **Discriminated unions are incompatible with Gemini `response_schema`** — `Field(discriminator="kind")` emits a `discriminator` keyword genai rejects (`Schema: extra_forbidden`). Use a plain `kind`-tagged union.
 1. **Planner quality vs capability quality are separable** — authoring/structure was reliably good; the residual variance was per-capability output quality (prompts/schemas/retries), proven via an intermediate-output diff (authored vs baseline findings were semantically identical). The strict `unmatched=fail` branch contract also caught a bad field-binding loudly instead of mis-routing.
 
-Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (25 deterministic tests + env-gated live sweep) and `authored_workflow_demo/` (ADK Web `root_agent` + 4 CI-safe tests incl. the no-LLM reuse path), in `caohy1988/adk-python` PR #3.
+Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (25 deterministic tests + env-gated live sweep) and `authored_workflow_demo/` (ADK Web `root_agent` + 5 CI-safe tests incl. the no-LLM reuse path), in `caohy1988/adk-python` PR #3.
 
 ## 10. Plan export & storage — the frozen spec as a durable artifact
 
@@ -251,10 +251,12 @@ A reviewer asked whether the planner should author ADK's existing **`AgentConfig
 | ----------------------------------------- | ---------------------------------------------------------------------- |
 | sequence                                  | lowers to `SequentialAgentConfig` (`sub_agents: list[AgentRefConfig]`) |
 | static parallel block                     | lowers to `ParallelAgentConfig` (static sub-agent list)                |
-| bounded loop                              | lowers to `LoopAgentConfig` (`max_iterations`)                         |
+| bounded loop                              | lowers `max_iterations` skeleton to `LoopAgentConfig`                  |
 | runtime `fan_out` / `pipeline` / `branch` | no direct config equivalent                                            |
 
-`ParallelAgentConfig` models a **static** set of parallel sub-agents, **not** data-mapping over a runtime list — so per-item `fan_out` sits in the "no equivalent" row, not the parallel row.
+`ParallelAgentConfig` models a **static** set of parallel sub-agents, **not** data-mapping over a runtime list — so per-item `fan_out` sits in the "no equivalent" row, not the parallel row. `LoopUntil` lowers only its **`max_iterations` skeleton**; the `until_capability` predicate has no `AgentConfig` field and is enforced by the interpreter.
+
+**Caveat (ADK source):** `AgentConfig` and the concrete config classes (`Sequential`/`Parallel`/`LoopAgentConfig`, `BaseAgentConfig`) are currently marked **`@deprecated` + `@experimental`** in this checkout (`agents/agent_config.py:72-73`, `sequential_agent_config.py:28`, `loop_agent_config.py:30`). So this is **convergence with the existing config *shape* for compatibility/illustration — not a long-term dependency** on (deprecated) YAML config. If the config surface stabilizes under a different shape, the lowering target moves with it; the `WorkflowSpec` authoring layer is unaffected.
 
 **Why the planner should not emit raw `AgentConfig`:**
 
