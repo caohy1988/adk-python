@@ -241,9 +241,40 @@ Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (21 deter
 
 Net: this turns the proposal from "a model can author plans" into "**model-authored plans become durable enterprise artifacts**" — without committing to durable generated code.
 
-## 11. Future (post-gate, NOT MVP)
+## 11. Convergence with ADK `AgentConfig` (+ storage, custom tools, observability)
+
+A reviewer asked whether the planner should author ADK's existing **`AgentConfig`** (the `root_agent.yaml` format) directly. Verified against source — `agents/agent_config.py`, `agents/base_agent_config.py`, `agents/{llm,sequential,parallel,loop}_agent_config.py`, `agents/common_configs.py`, `tools/_tool_configs.py` (names), and `agents/config_agent_utils.py`:
+
+**Lower to config where it fits.** ADK config already models the *static* shapes; `WorkflowSpec`'s static subset compiles to them rather than reinventing a parallel serialization:
+
+| `WorkflowSpec` block                            | Lowers to               | Notes                                                       |
+| ----------------------------------------------- | ----------------------- | ----------------------------------------------------------- |
+| sequence                                        | `SequentialAgentConfig` | `sub_agents: list[AgentRefConfig]`                          |
+| parallel-map (`fan_out` over a **static** list) | `ParallelAgentConfig`   | static sub-agent list                                       |
+| bounded loop                                    | `LoopAgentConfig`       | `max_iterations`                                            |
+| `branch` (route on a value)                     | —                       | **no config type** (`ConditionalAgent` doesn't exist)       |
+| `fan_out` over a **runtime** list               | —                       | `sub_agents` is resolved once at load; no runtime iteration |
+| `pipeline` (barrier-free per-item)              | —                       | requires #92 `ctx.pipeline`                                 |
+
+**Why the planner does not emit raw `AgentConfig`:**
+
+1. **Static graph, build-time only.** `config_agent_utils.from_config(path)` parses the YAML and resolves the *entire* `sub_agents` tree at load (`base_agent.__create_kwargs` → `resolve_agent_reference` per child), before any request. There is no runtime list iteration — so dynamic per-item fan-out and conditional branch cannot be expressed.
+1. **Not a clean `response_schema`.** `AgentConfig` is a `RootModel` over a `Discriminator(agent_config_discriminator)` union; Gemini's `response_schema` rejects the emitted `discriminator` keyword (`Schema: extra_forbidden` — the spike's §9 lesson). It also carries open `extra='allow'` maps (`ToolArgsConfig`, `BaseAgentConfig.model_extra`).
+1. **Code-bearing fields re-open the execution surface.** Tools/agents/callbacks are named by **fully-qualified importable path** — `CodeConfig.name`, `AgentRefConfig.code`, `LlmAgentConfig.tools[].name`, `*_callbacks` — resolved via `importlib.import_module` + `getattr` (`config_agent_utils.resolve_code_reference`) with **no allow-list**. A model authoring those would reintroduce exactly the arbitrary-import risk the declarative + allow-list model removes.
+
+**Direction:** keep `WorkflowSpec` as the thin **authoring** schema (closed, allow-listed, `response_schema`-safe). Compile its static subset to `AgentConfig` so those shapes share ADK's serialization and tooling; the `branch` / `fan_out` / `pipeline` types and capability allow-listing exist only for what config cannot express or cannot do safely. The compiled artifact is still an ordinary `Workflow` (§2).
+
+**Q1 — spec storage.** §5/§10: one `FrozenWorkflowRecord` in session State (`authored_workflow:frozen_record`, unprefixed/session-scoped; resume reuses, never re-plans), a state-only audit event, and a v1.1 export envelope. Compiled `Workflow` is derived, never canonical.
+
+**Q2 — custom tools.** A custom tool is a **registered capability** referenced by **registry name** (the registry is the allow-list), carrying per-capability policy (`max_calls`, `max_fan_out`, `side_effect`→approval, arg constraints) — §6. Deliberately *not* config's FQN `tools:` field: the model never names an import path.
+
+**Q3 — version control & observability.** Drift surface = `spec_hash` (sha256/canonical-JSON) + `planner_model` + `registry_version` + per-capability `capability_versions` in the record (§5); import hard-errors on schema-version, hash, registry-version, or capability-version drift (spike-enforced, §10). The export envelope is diffable for PR/audit review. Runtime observability is unchanged: the compiled `Workflow` runs on the real engine, so existing ADK tracing/events apply; the frozen record + hash anchor each run to its plan.
+
+## 12. Future (post-gate, NOT MVP)
 
 **Hierarchical / sub-plan authoring** — a registered capability that is itself an `AuthoredWorkflowAgent`, so a step can expand into its own authored sub-plan. This is the likely path to parity with Claude Code's unbounded orchestration (it lifts the single-response plan-size ceiling), but it is **out of MVP scope** and should be evaluated **only after the 3–5-task build gate**. MVP stays single-level: `WorkflowSpec` + validator + freeze/replay + export.
+
+**Upstream `AgentConfig` extension (optional).** If the dynamic constructs prove their value, the cleaner long-term home for `branch` / dynamic `fan_out` may be **new agent-config types upstream** (a conditional agent; a runtime-fan-out agent) plus an allow-listed capability-reference tool field — at which point authoring could converge fully onto an extended `AgentConfig`. Out of scope here; depends on upstream accepting new agent classes.
 
 ## References
 
