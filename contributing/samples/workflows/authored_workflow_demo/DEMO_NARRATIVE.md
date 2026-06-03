@@ -91,6 +91,27 @@ Show the file on camera:
 cat security_audit_plan.json | jq '{schema_version, spec_hash, planner_model, capability_versions, validation}'
 ```
 
+## Beat 3c — lower the static subset to AgentConfig
+
+```
+🧬 AgentConfig lowering (static subset) — 2/3 top-level steps project to ADK
+   config; dynamic blocks stay SpecInterpreter-only: ['pipeline'].
+   { "agent_class": "SequentialAgent", "name": "security_audit_planner",
+     "sub_agents": [
+       { "agent_class": "<no-AgentConfig-equivalent>", "workflowspec_kind": "pipeline", … },
+       { "agent_class": "LlmAgent", "name": "triage_step",  "capability": "triager" },
+       { "agent_class": "LlmAgent", "name": "format_step", "capability": "formatter" } ] }
+```
+
+> "This is the convergence with ADK config, made concrete. The plan's **static
+> skeleton** — the top-level sequence — projects onto `AgentConfig` shapes: a
+> `SequentialAgent` whose two leaf steps are `LlmAgent`s, referenced by
+> **capability name, not an importable FQN**. The `reviewer → verifier`
+> **pipeline** is flagged `<no-AgentConfig-equivalent>` — it's per-item over a
+> runtime list, which config can't express — rather than faked. Honest framing:
+> this is an *illustrative projection* (RFC #93 §11), not a loadable
+> `root_agent.yaml`; execution still runs through the interpreter."
+
 ## Beat 4 — execute (Events / trace tab)
 
 ```
@@ -133,25 +154,25 @@ Same hash, `reused` flips to `true` — the model is not called the second time.
 > "So: a model authored a typed, validated, capability-bounded plan; ADK executed
 > it on the real engine; the plan **exported** to a portable, defensively-imported
 > audit artifact; and a re-send replayed the exact frozen plan. The deterministic
-> test suites — 11 (#92) + 21 (#93) + 4 (demo) — lock all of this in CI, including
+> test suites — 11 (#92) + 25 (#93) + 5 (demo) — lock all of this in CI, including
 > the no-LLM reuse path and the export round-trip / tamper / drift checks."
 
-**Optional aside — convergence with ADK `AgentConfig`** (if a reviewer asks "why not author `root_agent.yaml`?"):
+**Convergence with ADK `AgentConfig`** — this is what Beat 3c shows, if a reviewer asks "why not author `root_agent.yaml`?":
 
-> "The static parts of a plan — this one's a top-level sequence of three steps —
-> are exactly what ADK config already models (`SequentialAgent`). The RFC's
-> direction is to **lower those to `AgentConfig`** rather than reinvent them. But
-> the `reviewer → verifier` **pipeline** is per-item over a *runtime* list, which
+> "The static parts of a plan are exactly what ADK config already models
+> (`SequentialAgent`), and Beat 3c projects them onto that shape. But the
+> `reviewer → verifier` **pipeline** is per-item over a *runtime* list, which
 > config can't express (`sub_agents` resolve once at load; there's no conditional
 > agent), and capabilities are referenced by **registry name, not importable
 > FQN** — so a model never names an import path. That dynamic + trust-boundary
-> delta is the only reason `WorkflowSpec` exists. (Direction, not shown here — the
-> demo runs via the interpreter; no `AgentConfig` compiler in the spike yet.)"
+> delta is the only reason `WorkflowSpec` exists. The lowering shown is an
+> *illustrative projection* (RFC #93 §11), not a loadable `root_agent.yaml`; a
+> full config compiler is future work."
 
 ## Proof commands (terminal, ~60s)
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 21
-pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 4
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 25
+pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 5
 ```

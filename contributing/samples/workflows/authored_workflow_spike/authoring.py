@@ -504,6 +504,100 @@ def import_plan(
   return spec
 
 
+# ------------------------------------------------- AgentConfig lowering (§11)
+# A STRUCTURAL PROJECTION of a WorkflowSpec's static skeleton onto ADK
+# `AgentConfig` shapes — the convergence direction from DESIGN §11, shown
+# concretely. It is deliberately NOT a loadable `root_agent.yaml`:
+#   * the static subset projects to SequentialAgent / LoopAgent / LlmAgent shapes;
+#   * leaf agents are referenced by ALLOW-LISTED capability name, never by an
+#     importable FQN (the trust-boundary point — a model never names an import);
+#   * the dynamic blocks (fan_out over a runtime list, pipeline, branch) have NO
+#     `AgentConfig` equivalent and are emitted as explicit `unsupported` markers,
+#     never fabricated as config.
+# A full loadable-config compiler (child YAML / an allow-listed capability-ref
+# field) is future work (DESIGN §12).
+
+AGENTCONFIG_UNSUPPORTED = "<no-AgentConfig-equivalent>"
+
+
+def _lower_block(node) -> dict:
+  if isinstance(node, StepRef):
+    return {
+        "agent_class": "LlmAgent",
+        "name": node.id,
+        "capability": node.capability,
+    }
+  if isinstance(node, LoopUntil):
+    return {
+        "agent_class": "LoopAgent",
+        "name": node.id,
+        "max_iterations": node.max_iters,
+        "sub_agents": [_lower_block(b) for b in node.body],
+        "_note": (
+            f"until-predicate ({node.until_capability}) has no AgentConfig"
+            " field; enforced by SpecInterpreter"
+        ),
+    }
+  if isinstance(node, FanOut):
+    return {
+        "agent_class": AGENTCONFIG_UNSUPPORTED,
+        "workflowspec_kind": "fan_out",
+        "name": node.id,
+        "capability": node.capability,
+        "reason": (
+            "per-item over a runtime list; AgentConfig sub_agents are static"
+        ),
+    }
+  if isinstance(node, Pipeline):
+    return {
+        "agent_class": AGENTCONFIG_UNSUPPORTED,
+        "workflowspec_kind": "pipeline",
+        "name": node.id,
+        "stages": [st.capability for st in node.stages],
+        "reason": "barrier-free per-item multi-stage; needs #92 ctx.pipeline",
+    }
+  if isinstance(node, Branch):
+    return {
+        "agent_class": AGENTCONFIG_UNSUPPORTED,
+        "workflowspec_kind": "branch",
+        "name": node.id,
+        "reason": "route-on-value; AgentConfig has no ConditionalAgent",
+    }
+  raise TypeError(f"unknown block: {type(node).__name__}")
+
+
+def lower_to_agent_config(
+    spec: WorkflowSpec, *, name: str = "authored_workflow"
+) -> dict:
+  """Project the static skeleton of `spec` onto an ADK `AgentConfig` shape.
+
+  Illustrative (see the module note above), not a loadable `root_agent.yaml`:
+  the ordered `steps` sequence projects to a `SequentialAgent`; leaf steps to
+  `LlmAgent` (by capability name, not FQN); dynamic blocks are flagged
+  `unsupported`, never fabricated.
+  """
+  return {
+      "agent_class": "SequentialAgent",
+      "name": name,
+      "sub_agents": [_lower_block(s) for s in spec.steps],
+  }
+
+
+def agent_config_coverage(spec: WorkflowSpec) -> dict:
+  """A quick 'X of N top-level blocks lower to config' number for the demo."""
+  lowered = lower_to_agent_config(spec)["sub_agents"]
+  dynamic = [
+      b["workflowspec_kind"]
+      for b in lowered
+      if b["agent_class"] == AGENTCONFIG_UNSUPPORTED
+  ]
+  return {
+      "total": len(lowered),
+      "lowerable": len(lowered) - len(dynamic),
+      "dynamic": dynamic,
+  }
+
+
 # ----------------------------------------------------------------- interpreter
 class SpecInterpreter:
   """Executes a validated WorkflowSpec on the real ADK engine via the #92

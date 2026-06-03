@@ -36,6 +36,8 @@ from pydantic import BaseModel
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from authoring import agent_config_coverage
+from authoring import AGENTCONFIG_UNSUPPORTED
 from authoring import Binding  # noqa: E402
 from authoring import Branch
 from authoring import Capability
@@ -45,6 +47,7 @@ from authoring import FanOut
 from authoring import FrozenWorkflowRecord
 from authoring import import_plan
 from authoring import LoopUntil
+from authoring import lower_to_agent_config
 from authoring import Pipeline
 from authoring import PipelineStage
 from authoring import PlanImportError
@@ -526,6 +529,94 @@ def test_import_rejects_registry_version_drift():
   )
   with pytest.raises(PlanImportError, match="registry_version"):
     import_plan(env, v2_registry, task_input=_TASK)
+
+
+def test_lower_static_sequence_to_sequential_agent():
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          StepRef(
+              kind="step",
+              id="c",
+              capability="classify",
+              input=Binding(source="task"),
+          ),
+          StepRef(
+              kind="step",
+              id="s",
+              capability="tech_summary",
+              input=Binding(source="step", step="c"),
+          ),
+      ],
+      output=Binding(source="step", step="s"),
+  )
+  cfg = lower_to_agent_config(spec)
+  assert cfg["agent_class"] == "SequentialAgent"
+  assert [s["agent_class"] for s in cfg["sub_agents"]] == [
+      "LlmAgent",
+      "LlmAgent",
+  ]
+  assert [s["capability"] for s in cfg["sub_agents"]] == [
+      "classify",
+      "tech_summary",
+  ]
+  assert AGENTCONFIG_UNSUPPORTED not in [
+      s["agent_class"] for s in cfg["sub_agents"]
+  ]
+
+
+def test_lower_loop_to_loop_agent():
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          LoopUntil(
+              kind="loop_until",
+              id="lp",
+              body=[
+                  StepRef(
+                      kind="step",
+                      id="d",
+                      capability="draft",
+                      input=Binding(source="task"),
+                  )
+              ],
+              until_capability="is_good",
+              until_input=Binding(source="step", step="d"),
+              max_iters=3,
+          )
+      ],
+      output=Binding(source="step", step="lp"),
+  )
+  loop = lower_to_agent_config(spec)["sub_agents"][0]
+  assert loop["agent_class"] == "LoopAgent"
+  assert loop["max_iterations"] == 3
+  assert loop["sub_agents"][0]["capability"] == "draft"
+
+
+def test_lower_marks_dynamic_blocks_unsupported():
+  # pipeline is per-item over a runtime list -> no AgentConfig equivalent.
+  cov = agent_config_coverage(_pipeline_spec())
+  assert cov == {"total": 1, "lowerable": 0, "dynamic": ["pipeline"]}
+
+
+def test_lower_never_emits_importable_fqn():
+  # leaves are referenced by allow-listed capability name, never by an
+  # importable path; the FQN-bearing keys ADK config would use are absent.
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          StepRef(
+              kind="step",
+              id="c",
+              capability="classify",
+              input=Binding(source="task"),
+          )
+      ],
+      output=Binding(source="step", step="c"),
+  )
+  blob = json.dumps(lower_to_agent_config(spec))
+  assert '"code"' not in blob and '"config_path"' not in blob
+  assert '"capability": "classify"' in blob
 
 
 def test_import_rejects_new_input_without_template_schema():

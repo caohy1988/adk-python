@@ -55,11 +55,13 @@ sys.path.insert(
         "authored_workflow_spike",
     ),
 )
+from authoring import agent_config_coverage  # noqa: E402
 from authoring import Capability  # noqa: E402
 from authoring import CapabilityRegistry  # noqa: E402
 from authoring import export_plan  # noqa: E402
 from authoring import FrozenWorkflowRecord  # noqa: E402
 from authoring import import_plan  # noqa: E402
+from authoring import lower_to_agent_config  # noqa: E402
 from authoring import sha256_hex  # noqa: E402
 from authoring import SpecInterpreter  # noqa: E402
 from authoring import WorkflowSpec  # noqa: E402
@@ -318,6 +320,22 @@ async def author_validate_execute(ctx: Context, node_input):
       )
     except OSError as e:
       yield _msg(f"📦 Export skipped (filesystem): {e}")
+
+    # 3c. LOWER — project the plan's STATIC subset onto ADK AgentConfig shapes
+    # (RFC #93 §11 convergence, shown concretely). Illustrative structural
+    # projection — NOT a loadable root_agent.yaml: leaves are referenced by
+    # allow-listed capability name (never an importable FQN), and dynamic blocks
+    # (pipeline/fan_out/branch) are flagged unsupported, never fabricated.
+    cov = agent_config_coverage(spec)
+    lowered = lower_to_agent_config(spec, name="security_audit_planner")
+    yield _msg(
+        "🧬 **AgentConfig lowering (static subset)** —"
+        f" {cov['lowerable']}/{cov['total']} top-level steps project to ADK"
+        " config; dynamic blocks stay SpecInterpreter-only:"
+        f" {cov['dynamic']}.\n```json\n{json.dumps(lowered, indent=1)}\n```\n_Illustrative"
+        " structural projection (RFC #93 §11) — leaves by capability name, not"
+        " an importable FQN; not a loadable `root_agent.yaml`._"
+    )
 
   # 4. EXECUTE — run the validated plan on the real ADK engine (#92 supervisor).
   result = await SpecInterpreter(reg, ctx).execute(spec, {"files": FILES})

@@ -189,7 +189,7 @@ Fully additive. New `authoring/` package + `AuthoredWorkflowAgent`; no change to
 1. **Discriminated unions are incompatible with Gemini `response_schema`** — `Field(discriminator="kind")` emits a `discriminator` keyword genai rejects (`Schema: extra_forbidden`). Use a plain `kind`-tagged union.
 1. **Planner quality vs capability quality are separable** — authoring/structure was reliably good; the residual variance was per-capability output quality (prompts/schemas/retries), proven via an intermediate-output diff (authored vs baseline findings were semantically identical). The strict `unmatched=fail` branch contract also caught a bad field-binding loudly instead of mis-routing.
 
-Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (21 deterministic tests + env-gated live sweep) and `authored_workflow_demo/` (ADK Web `root_agent` + 4 CI-safe tests incl. the no-LLM reuse path), in `caohy1988/adk-python` PR #3.
+Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (25 deterministic tests + env-gated live sweep) and `authored_workflow_demo/` (ADK Web `root_agent` + 4 CI-safe tests incl. the no-LLM reuse path), in `caohy1988/adk-python` PR #3.
 
 ## 10. Plan export & storage — the frozen spec as a durable artifact
 
@@ -245,7 +245,7 @@ Net: this turns the proposal from "a model can author plans" into "**model-autho
 
 A reviewer asked whether the planner should author ADK's existing **`AgentConfig`** (the `root_agent.yaml` format) directly. Verified against source — `agents/agent_config.py`, `agents/base_agent_config.py`, `agents/{llm,sequential,parallel,loop}_agent_config.py`, `agents/common_configs.py`, `tools/_tool_configs.py` (names), and `agents/config_agent_utils.py`:
 
-**Lower to config where it fits.** ADK config already models the *static* shapes, so the static subset **should lower to** them rather than reinvent a serialization. **This is a design direction — the spike does not yet implement an `AgentConfig`-lowering compiler.**
+**Lower to config where it fits.** ADK config already models the *static* shapes, so the static subset **should lower to** them rather than reinvent a serialization. The spike **demonstrates** this with an illustrative structural projection (`lower_to_agent_config` — `SequentialAgent`/`LoopAgent`/`LlmAgent` shapes, leaves by capability name, dynamic blocks flagged `<no-AgentConfig-equivalent>`); a **full loadable-`root_agent.yaml` compiler** (child YAML / an allow-listed capability-ref field) remains future work (§12).
 
 | `WorkflowSpec` block                      | ADK config relationship                                                |
 | ----------------------------------------- | ---------------------------------------------------------------------- |

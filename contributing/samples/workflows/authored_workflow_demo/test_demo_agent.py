@@ -22,6 +22,7 @@ is actually verified without calling Gemini.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -96,6 +97,26 @@ def test_demo_registry_is_clean():
 
 def test_demo_spec_validates():
   WorkflowSpecValidator(demo._registry()).validate(_demo_spec())  # no raise
+
+
+def test_demo_spec_agentconfig_lowering():
+  # The demo's plan (pipeline -> step -> step) is exactly the static/dynamic
+  # split RFC #93 §11 describes: the two trailing steps lower to LlmAgent under
+  # a SequentialAgent; the reviewer->verifier pipeline has no AgentConfig
+  # equivalent. (Illustrative projection — leaves by capability name, not FQN.)
+  from authoring import agent_config_coverage  # noqa: E402
+  from authoring import lower_to_agent_config  # noqa: E402
+
+  cfg = lower_to_agent_config(_demo_spec(), name="security_audit_planner")
+  assert cfg["agent_class"] == "SequentialAgent"
+  kinds = [s["agent_class"] for s in cfg["sub_agents"]]
+  assert kinds == ["<no-AgentConfig-equivalent>", "LlmAgent", "LlmAgent"]
+  assert agent_config_coverage(_demo_spec()) == {
+      "total": 3,
+      "lowerable": 2,
+      "dynamic": ["pipeline"],
+  }
+  assert '"code"' not in json.dumps(cfg)  # never an importable FQN
 
 
 def _stub_registry() -> CapabilityRegistry:

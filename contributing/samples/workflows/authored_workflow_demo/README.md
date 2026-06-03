@@ -40,6 +40,7 @@ Point at the ADK-native evidence as it streams:
 1. **Validation** — "Validation passed" + the capability list (all registered).
 1. **Frozen spec + hash** — open the **State** tab: `authored_workflow:frozen_spec` and `…_hash`.
 1. **Exported plan** — `📦 Exported plan → security_audit_plan.json`. The full `FrozenWorkflowRecord` (spec, `sha256`, planner model, registry + capability versions, validation, task-input digest) as a portable envelope; import recomputes the hash and re-validates against the current registry. `cat security_audit_plan.json | jq .` on camera.
+1. **AgentConfig lowering** — `🧬 AgentConfig lowering (static subset) — 2/3 …`. The plan's static skeleton projects onto ADK `AgentConfig` shapes (`SequentialAgent` + `LlmAgent` leaves by capability name); the `reviewer → verifier` pipeline is flagged **no-AgentConfig-equivalent**, not fabricated. An illustrative projection (RFC #93 §11) — see the talking point below.
 1. **Execution** — the **Events / trace** view shows `reviewer` and `verifier` interleaving **per file** (the barrier-free pipeline), then `triager`, then `formatter`.
 1. **Final output** — the triaged audit (1 CRITICAL + 2 HIGH + 1 MEDIUM across `auth.py`/`db.py`/`net.py`/`math.py`).
 
@@ -52,7 +53,9 @@ The RFC's direction is to **converge with ADK config** (RFC #93 → "Relationshi
 - the **top-level sequence** (`pipeline → triager → formatter`) is the kind of static composition that maps to a `SequentialAgent`;
 - the **`reviewer → verifier` pipeline** (per-item, barrier-free over a runtime list) is exactly what `AgentConfig` **can't** express — no `ConditionalAgent`, and `sub_agents` are resolved once at load — which is why `WorkflowSpec` exists.
 
-Honest scope: this is a **design direction**, not shown here — the demo executes via the `SpecInterpreter` on the real engine; it does **not** emit or lower to `AgentConfig` (no such compiler in the spike yet).
+The demo now **shows** this split: the 🧬 lowering beat prints the static skeleton projected onto `AgentConfig` shapes (2/3 of the demo plan), with the pipeline marked no-equivalent.
+
+Honest scope: it's an **illustrative structural projection** (leaves by capability name, dynamic blocks flagged) — **not** a loadable `root_agent.yaml`. Execution still runs via the `SpecInterpreter` on the real engine; a full loadable-config compiler (child YAML / an allow-listed capability-ref field) is future work (DESIGN §12).
 
 ## 3. Shape sweep — not a one-off (1–2 min)
 
@@ -67,11 +70,11 @@ Proof points: multi-stage `fan_out → step → step`; branch `step → branch`;
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 21
-pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 4
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 25
+pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 5
 ```
 
-- Deterministic suites: #92 **11** + #93 **21** + demo **4** = **36** (incl. a no-LLM reuse-path test).
+- Deterministic suites: #92 **11** + #93 **25** + demo **5** = **41** (incl. a no-LLM reuse-path test).
 - PR #3 CI green except the documented fork-only `agent-triage` token job.
 
 ## Recording notes
