@@ -167,7 +167,9 @@ Same hash, `reused` flips to `true` — the model is not called the second time.
 > FQN** — so a model never names an import path. That dynamic + trust-boundary
 > delta is the only reason `WorkflowSpec` exists. The lowering shown is an
 > *illustrative projection* (RFC #93 §11), not a loadable `root_agent.yaml`; a
-> full config compiler is future work."
+> full config compiler is future work. And note `AgentConfig` is currently
+> `@deprecated` + `@experimental` in ADK source — so this is convergence with
+> the config *shape* for compatibility, not a bet on deprecated YAML config."
 
 ## Proof commands (terminal, ~60s)
 

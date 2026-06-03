@@ -57,6 +57,8 @@ The demo now **shows** this split: the 🧬 lowering beat prints the static skel
 
 Honest scope: it's an **illustrative structural projection** (leaves by capability name, dynamic blocks flagged) — **not** a loadable `root_agent.yaml`. Execution still runs via the `SpecInterpreter` on the real engine; a full loadable-config compiler (child YAML / an allow-listed capability-ref field) is future work (DESIGN §12).
 
+> **If asked "why build on deprecated config?"** — `AgentConfig` and the concrete config classes are currently `@deprecated` + `@experimental` in ADK source, so this is convergence with the existing config **shape** for compatibility/illustration, **not** a long-term dependency on YAML config (RFC §11).
+
 ## 3. Shape sweep — not a one-off (1–2 min)
 
 ```bash
