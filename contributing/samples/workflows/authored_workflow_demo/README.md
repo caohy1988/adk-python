@@ -45,6 +45,15 @@ Point at the ADK-native evidence as it streams:
 
 (Re-send the same prompt to show resume reuses the frozen spec — same hash, not re-authored.)
 
+### Relationship to ADK `AgentConfig` (talking point)
+
+The RFC's direction is to **converge with ADK config** (RFC #93 → "Relationship to ADK `AgentConfig`"; DESIGN §11): the *static* shapes of an authored plan should lower to `Sequential`/`Parallel`/`LoopAgentConfig`, while the dynamic constructs stay `WorkflowSpec`-only. This demo's plan makes the split concrete:
+
+- the **top-level sequence** (`pipeline → triager → formatter`) is the kind of static composition that maps to a `SequentialAgent`;
+- the **`reviewer → verifier` pipeline** (per-item, barrier-free over a runtime list) is exactly what `AgentConfig` **can't** express — no `ConditionalAgent`, and `sub_agents` are resolved once at load — which is why `WorkflowSpec` exists.
+
+Honest scope: this is a **design direction**, not shown here — the demo executes via the `SpecInterpreter` on the real engine; it does **not** emit or lower to `AgentConfig` (no such compiler in the spike yet).
+
 ## 3. Shape sweep — not a one-off (1–2 min)
 
 ```bash

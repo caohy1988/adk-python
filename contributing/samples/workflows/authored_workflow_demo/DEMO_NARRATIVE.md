@@ -136,6 +136,18 @@ Same hash, `reused` flips to `true` — the model is not called the second time.
 > test suites — 11 (#92) + 21 (#93) + 4 (demo) — lock all of this in CI, including
 > the no-LLM reuse path and the export round-trip / tamper / drift checks."
 
+**Optional aside — convergence with ADK `AgentConfig`** (if a reviewer asks "why not author `root_agent.yaml`?"):
+
+> "The static parts of a plan — this one's a top-level sequence of three steps —
+> are exactly what ADK config already models (`SequentialAgent`). The RFC's
+> direction is to **lower those to `AgentConfig`** rather than reinvent them. But
+> the `reviewer → verifier` **pipeline** is per-item over a *runtime* list, which
+> config can't express (`sub_agents` resolve once at load; there's no conditional
+> agent), and capabilities are referenced by **registry name, not importable
+> FQN** — so a model never names an import path. That dynamic + trust-boundary
+> delta is the only reason `WorkflowSpec` exists. (Direction, not shown here — the
+> demo runs via the interpreter; no `AgentConfig` compiler in the spike yet.)"
+
 ## Proof commands (terminal, ~60s)
 
 ```bash
