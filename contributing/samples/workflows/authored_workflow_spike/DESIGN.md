@@ -245,24 +245,24 @@ Net: this turns the proposal from "a model can author plans" into "**model-autho
 
 A reviewer asked whether the planner should author ADK's existing **`AgentConfig`** (the `root_agent.yaml` format) directly. Verified against source — `agents/agent_config.py`, `agents/base_agent_config.py`, `agents/{llm,sequential,parallel,loop}_agent_config.py`, `agents/common_configs.py`, `tools/_tool_configs.py` (names), and `agents/config_agent_utils.py`:
 
-**Lower to config where it fits.** ADK config already models the *static* shapes; `WorkflowSpec`'s static subset compiles to them rather than reinventing a parallel serialization:
+**Lower to config where it fits.** ADK config already models the *static* shapes, so the static subset **should lower to** them rather than reinvent a serialization. **This is a design direction — the spike does not yet implement an `AgentConfig`-lowering compiler.**
 
-| `WorkflowSpec` block                            | Lowers to               | Notes                                                       |
-| ----------------------------------------------- | ----------------------- | ----------------------------------------------------------- |
-| sequence                                        | `SequentialAgentConfig` | `sub_agents: list[AgentRefConfig]`                          |
-| parallel-map (`fan_out` over a **static** list) | `ParallelAgentConfig`   | static sub-agent list                                       |
-| bounded loop                                    | `LoopAgentConfig`       | `max_iterations`                                            |
-| `branch` (route on a value)                     | —                       | **no config type** (`ConditionalAgent` doesn't exist)       |
-| `fan_out` over a **runtime** list               | —                       | `sub_agents` is resolved once at load; no runtime iteration |
-| `pipeline` (barrier-free per-item)              | —                       | requires #92 `ctx.pipeline`                                 |
+| `WorkflowSpec` block                      | ADK config relationship                                                |
+| ----------------------------------------- | ---------------------------------------------------------------------- |
+| sequence                                  | lowers to `SequentialAgentConfig` (`sub_agents: list[AgentRefConfig]`) |
+| static parallel block                     | lowers to `ParallelAgentConfig` (static sub-agent list)                |
+| bounded loop                              | lowers to `LoopAgentConfig` (`max_iterations`)                         |
+| runtime `fan_out` / `pipeline` / `branch` | no direct config equivalent                                            |
 
-**Why the planner does not emit raw `AgentConfig`:**
+`ParallelAgentConfig` models a **static** set of parallel sub-agents, **not** data-mapping over a runtime list — so per-item `fan_out` sits in the "no equivalent" row, not the parallel row.
 
-1. **Static graph, build-time only.** `config_agent_utils.from_config(path)` parses the YAML and resolves the *entire* `sub_agents` tree at load (`base_agent.__create_kwargs` → `resolve_agent_reference` per child), before any request. There is no runtime list iteration — so dynamic per-item fan-out and conditional branch cannot be expressed.
+**Why the planner should not emit raw `AgentConfig`:**
+
+1. **Static graph, build-time only.** `config_agent_utils.from_config(path)` parses the YAML and resolves the *entire* `sub_agents` tree at load (`base_agent.__create_kwargs` → `resolve_agent_reference` per child), before any request. There is no runtime list iteration — so per-item fan-out, pipeline, and conditional branch routing cannot be expressed.
 1. **Not a clean `response_schema`.** `AgentConfig` is a `RootModel` over a `Discriminator(agent_config_discriminator)` union; Gemini's `response_schema` rejects the emitted `discriminator` keyword (`Schema: extra_forbidden` — the spike's §9 lesson). It also carries open `extra='allow'` maps (`ToolArgsConfig`, `BaseAgentConfig.model_extra`).
-1. **Code-bearing fields re-open the execution surface.** Tools/agents/callbacks are named by **fully-qualified importable path** — `CodeConfig.name`, `AgentRefConfig.code`, `LlmAgentConfig.tools[].name`, `*_callbacks` — resolved via `importlib.import_module` + `getattr` (`config_agent_utils.resolve_code_reference`) with **no allow-list**. A model authoring those would reintroduce exactly the arbitrary-import risk the declarative + allow-list model removes.
+1. **Trust-boundary mismatch on tool/agent refs.** Tools/agents/callbacks are named by **fully-qualified importable path** — `CodeConfig.name`, `AgentRefConfig.code`, `LlmAgentConfig.tools[].name`, `*_callbacks` — resolved via `importlib.import_module` + `getattr` (`config_agent_utils.resolve_code_reference`). That FQN-import model is appropriate for **developer-authored** config; the concern is specifically letting a **model** author raw FQNs. For model-authored plans we want **capability allow-listing**, not arbitrary import paths — a trust-boundary difference, not a flaw in config.
 
-**Direction:** keep `WorkflowSpec` as the thin **authoring** schema (closed, allow-listed, `response_schema`-safe). Compile its static subset to `AgentConfig` so those shapes share ADK's serialization and tooling; the `branch` / `fan_out` / `pipeline` types and capability allow-listing exist only for what config cannot express or cannot do safely. The compiled artifact is still an ordinary `Workflow` (§2).
+**Direction:** keep `WorkflowSpec` as the thin **authoring** schema (closed, allow-listed, `response_schema`-safe); lower its static subset to `AgentConfig` so those shapes share ADK's serialization and tooling; keep `branch` / `fan_out` / `pipeline` + capability allow-listing as new surface only for the dynamic and trust-boundary pieces config doesn't cover. The compiled artifact is still an ordinary `Workflow` (§2).
 
 **Q1 — spec storage.** §5/§10: one `FrozenWorkflowRecord` in session State (`authored_workflow:frozen_record`, unprefixed/session-scoped; resume reuses, never re-plans), a state-only audit event, and a v1.1 export envelope. Compiled `Workflow` is derived, never canonical.
 
