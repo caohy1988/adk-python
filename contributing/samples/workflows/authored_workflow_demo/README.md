@@ -58,7 +58,7 @@ The demo now **shows** this split: the 🧬 lowering beat prints the static skel
 
 Honest scope: it's an **illustrative structural projection** (leaves by capability name, dynamic blocks flagged) — **not** a loadable `root_agent.yaml`. Execution still runs via the `SpecInterpreter` on the real engine; a full loadable-config compiler (Workflow YAML edges + child YAML + an allow-listed capability-ref field) is future work (DESIGN §12).
 
-> **If asked "why not just author `loop_config/root_agent.yaml`?"** — use that YAML shape as a lowering/export target for static graphs, not as the raw model output. The sample intentionally resolves Python function refs and child YAML refs; #93 needs a closed, response-schema-safe, capability-allow-listed authoring format first. Also, the current config loader path is `@deprecated` + `@experimental`, so this is convergence with the config **shape** for compatibility/illustration, not a long-term dependency on today's YAML loader (RFC §11).
+> **If asked "why not just author `loop_config/root_agent.yaml`?"** — use that YAML shape as a lowering/export target for static graphs, not as the raw model output. The sample intentionally resolves Python function refs and child YAML refs; #93 needs a closed, response-schema-safe, capability-allow-listed authoring format first. Also, `Workflow` itself is not deprecated, but the current config loader path and agent-config sugar classes are `@deprecated` + `@experimental`; this is convergence with the Workflow config **shape** for compatibility/illustration, not a long-term dependency on today's loader or deprecated sugar (RFC §11).
 
 ## 3. Shape sweep — not a one-off (1–2 min)
 

@@ -170,9 +170,11 @@ Same hash, `reused` flips to `true` — the model is not called the second time.
 > toward config. The `reviewer → verifier` pipeline stays a first-class
 > `WorkflowSpec` block because it dispatches per item over a runtime list; raw
 > YAML would need a wrapper. The lowering shown is illustrative, not a loadable
-> `root_agent.yaml`; a full config compiler is future work. Also, the current
-> config loader path is `@deprecated` + `@experimental`, so this is convergence
-> with the config *shape* for compatibility, not a bet on today's YAML loader."
+> `root_agent.yaml`; a full config compiler is future work. `Workflow` itself is
+> not deprecated, but the current config loader path and agent-config sugar
+> classes are `@deprecated` + `@experimental`, so this is convergence with the
+> Workflow config *shape* for compatibility, not a bet on today's loader or
+> deprecated sugar."
 
 ## Proof commands (terminal, ~60s)
 
