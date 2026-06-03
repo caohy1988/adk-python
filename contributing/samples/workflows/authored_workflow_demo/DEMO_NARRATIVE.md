@@ -91,10 +91,10 @@ Show the file on camera:
 cat security_audit_plan.json | jq '{schema_version, spec_hash, planner_model, capability_versions, validation}'
 ```
 
-## Beat 3c — lower the static subset to AgentConfig
+## Beat 3c — lower the static subset to ADK config
 
 ```
-🧬 AgentConfig lowering (static subset) — 2/3 top-level steps project to ADK
+🧬 ADK config lowering (static subset) — 2/3 top-level steps project to ADK
    config; dynamic blocks stay SpecInterpreter-only: ['pipeline'].
    { "agent_class": "SequentialAgent", "name": "security_audit_planner",
      "sub_agents": [
@@ -103,14 +103,16 @@ cat security_audit_plan.json | jq '{schema_version, spec_hash, planner_model, ca
        { "agent_class": "LlmAgent", "name": "format_step", "capability": "formatter" } ] }
 ```
 
-> "This is the convergence with ADK config, made concrete. The plan's **static
-> skeleton** — the top-level sequence — projects onto `AgentConfig` shapes: a
-> `SequentialAgent` whose two leaf steps are `LlmAgent`s, referenced by
-> **capability name, not an importable FQN**. The `reviewer → verifier`
-> **pipeline** is flagged `<no-AgentConfig-equivalent>` — it's per-item over a
-> runtime list, which config can't express — rather than faked. Honest framing:
-> this is an *illustrative projection* (RFC #93 §11), not a loadable
-> `root_agent.yaml`; execution still runs through the interpreter."
+> "This is the convergence with ADK config, made concrete. The static parts are
+> what the `loop_config/root_agent.yaml` style is good at: a known Workflow graph
+> and known child agents. This demo projects the top-level sequence onto that
+> family of config shapes, with leaves referenced by **capability name, not an
+> importable FQN**. The `reviewer → verifier` **pipeline** is flagged
+> `<no-AgentConfig-equivalent>` because it is per-item over a runtime list; raw
+> YAML would need a wrapper node, while `WorkflowSpec` keeps it typed and
+> policy-checked. Honest framing: this is an *illustrative projection* (RFC #93
+> §11), not a loadable `root_agent.yaml`; execution still runs through the
+> interpreter."
 
 ## Beat 4 — execute (Events / trace tab)
 
@@ -157,19 +159,20 @@ Same hash, `reused` flips to `true` — the model is not called the second time.
 > test suites — 11 (#92) + 25 (#93) + 5 (demo) — lock all of this in CI, including
 > the no-LLM reuse path and the export round-trip / tamper / drift checks."
 
-**Convergence with ADK `AgentConfig`** — this is what Beat 3c shows, if a reviewer asks "why not author `root_agent.yaml`?":
+**Convergence with ADK Workflow config / `root_agent.yaml`** — this is what Beat 3c shows, if a reviewer asks "why not author `loop_config/root_agent.yaml`?":
 
-> "The static parts of a plan are exactly what ADK config already models
-> (`SequentialAgent`), and Beat 3c projects them onto that shape. But the
-> `reviewer → verifier` **pipeline** is per-item over a *runtime* list, which
-> config can't express (`sub_agents` resolve once at load; there's no conditional
-> agent), and capabilities are referenced by **registry name, not importable
-> FQN** — so a model never names an import path. That dynamic + trust-boundary
-> delta is the only reason `WorkflowSpec` exists. The lowering shown is an
-> *illustrative projection* (RFC #93 §11), not a loadable `root_agent.yaml`; a
-> full config compiler is future work. And note `AgentConfig` is currently
-> `@deprecated` + `@experimental` in ADK source — so this is convergence with
-> the config *shape* for compatibility, not a bet on deprecated YAML config."
+> "`loop_config/root_agent.yaml` is a good **derived target** for static graph
+> structure: it has `agent_class: Workflow`, fixed `edges`, child YAML files, and
+> route functions like `.agent.route_headline`. It is not the right **raw model
+> output** because those refs are exactly what we don't want a model to invent:
+> Python functions, `_code` refs, child config paths, tools/callbacks, or FQNs.
+> #93 keeps the planner output closed and allow-listed, then lowers static parts
+> toward config. The `reviewer → verifier` pipeline stays a first-class
+> `WorkflowSpec` block because it dispatches per item over a runtime list; raw
+> YAML would need a wrapper. The lowering shown is illustrative, not a loadable
+> `root_agent.yaml`; a full config compiler is future work. Also, the current
+> config loader path is `@deprecated` + `@experimental`, so this is convergence
+> with the config *shape* for compatibility, not a bet on today's YAML loader."
 
 ## Proof commands (terminal, ~60s)
 

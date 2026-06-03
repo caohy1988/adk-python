@@ -40,24 +40,25 @@ Point at the ADK-native evidence as it streams:
 1. **Validation** — "Validation passed" + the capability list (all registered).
 1. **Frozen spec + hash** — open the **State** tab: `authored_workflow:frozen_spec` and `…_hash`.
 1. **Exported plan** — `📦 Exported plan → security_audit_plan.json`. The full `FrozenWorkflowRecord` (spec, `sha256`, planner model, registry + capability versions, validation, task-input digest) as a portable envelope; import recomputes the hash and re-validates against the current registry. `cat security_audit_plan.json | jq .` on camera.
-1. **AgentConfig lowering** — `🧬 AgentConfig lowering (static subset) — 2/3 …`. The plan's static skeleton projects onto ADK `AgentConfig` shapes (`SequentialAgent` + `LlmAgent` leaves by capability name); the `reviewer → verifier` pipeline is flagged **no-AgentConfig-equivalent**, not fabricated. An illustrative projection (RFC #93 §11) — see the talking point below.
+1. **ADK config lowering** — `🧬 ADK config lowering (static subset) — 2/3 …`. The plan's static skeleton projects toward ADK Workflow/agent config shapes (a static `Workflow`/`SequentialAgent` skeleton + `LlmAgent` leaves by capability name); the `reviewer → verifier` pipeline is flagged **no-AgentConfig-equivalent**, not fabricated. An illustrative projection (RFC #93 §11) — see the talking point below.
 1. **Execution** — the **Events / trace** view shows `reviewer` and `verifier` interleaving **per file** (the barrier-free pipeline), then `triager`, then `formatter`.
 1. **Final output** — the triaged audit (1 CRITICAL + 2 HIGH + 1 MEDIUM across `auth.py`/`db.py`/`net.py`/`math.py`).
 
 (Re-send the same prompt to show resume reuses the frozen spec — same hash, not re-authored.)
 
-### Relationship to ADK `AgentConfig` (talking point)
+### Relationship to ADK Workflow config / `root_agent.yaml` (talking point)
 
-The RFC's direction is to **converge with ADK config** (RFC #93 → "Relationship to ADK `AgentConfig`"; DESIGN §11): the *static* shapes of an authored plan should lower to `Sequential`/`Parallel`/`LoopAgentConfig`, while the dynamic constructs stay `WorkflowSpec`-only. This demo's plan makes the split concrete:
+The RFC's direction is to **converge with ADK config where it fits** (RFC #93 → "Relationship to ADK Workflow config / `root_agent.yaml`"; DESIGN §11). The linked `loop_config/root_agent.yaml` sample is the right mental model for the **static** portion: a human-authored `agent_class: Workflow` YAML graph with known `edges`, child YAML files, and function refs like `.agent.route_headline`. #93 should be able to lower/export static graph skeletons toward that style, while the model-facing format stays `WorkflowSpec`.
 
-- the **top-level sequence** (`pipeline → triager → formatter`) is the kind of static composition that maps to a `SequentialAgent`;
-- the **`reviewer → verifier` pipeline** (per-item, barrier-free over a runtime list) is exactly what `AgentConfig` **can't** express — no `ConditionalAgent`, and `sub_agents` are resolved once at load — which is why `WorkflowSpec` exists.
+- the **top-level sequence** (`pipeline → triager → formatter`) is the kind of static composition that can lower to a static Workflow/config skeleton;
+- the **`reviewer → verifier` pipeline** (per-item, barrier-free over a runtime list) is exactly what raw YAML **doesn't express directly** today; it would need a wrapper node, while `WorkflowSpec` can keep it typed and policy-checked as a first-class runtime block;
+- raw YAML can name function refs, `_code` refs, child YAML files, tools, callbacks, or importable FQNs; model-authored plans should reference only allow-listed capability names.
 
-The demo now **shows** this split: the 🧬 lowering beat prints the static skeleton projected onto `AgentConfig` shapes (2/3 of the demo plan), with the pipeline marked no-equivalent.
+The demo now **shows** this split: the 🧬 lowering beat prints the static skeleton projected onto ADK config shapes (2/3 of the demo plan), with the pipeline marked no-equivalent.
 
-Honest scope: it's an **illustrative structural projection** (leaves by capability name, dynamic blocks flagged) — **not** a loadable `root_agent.yaml`. Execution still runs via the `SpecInterpreter` on the real engine; a full loadable-config compiler (child YAML / an allow-listed capability-ref field) is future work (DESIGN §12).
+Honest scope: it's an **illustrative structural projection** (leaves by capability name, dynamic blocks flagged) — **not** a loadable `root_agent.yaml`. Execution still runs via the `SpecInterpreter` on the real engine; a full loadable-config compiler (Workflow YAML edges + child YAML + an allow-listed capability-ref field) is future work (DESIGN §12).
 
-> **If asked "why build on deprecated config?"** — `AgentConfig` and the concrete config classes are currently `@deprecated` + `@experimental` in ADK source, so this is convergence with the existing config **shape** for compatibility/illustration, **not** a long-term dependency on YAML config (RFC §11).
+> **If asked "why not just author `loop_config/root_agent.yaml`?"** — use that YAML shape as a lowering/export target for static graphs, not as the raw model output. The sample intentionally resolves Python function refs and child YAML refs; #93 needs a closed, response-schema-safe, capability-allow-listed authoring format first. Also, the current config loader path is `@deprecated` + `@experimental`, so this is convergence with the config **shape** for compatibility/illustration, not a long-term dependency on today's YAML loader (RFC §11).
 
 ## 3. Shape sweep — not a one-off (1–2 min)
 

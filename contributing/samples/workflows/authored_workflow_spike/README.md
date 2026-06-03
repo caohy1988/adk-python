@@ -32,7 +32,10 @@ the open-map warning, and interpreter execution of fan_out→aggregate, **pipeli
 (correct route), and loop_until (stops + correct output); plus **plan export/import**
 (round-trip replays the same hash; import rejects a tampered spec, a dropped
 capability, capability/registry version drift, an unsupported schema_version,
-and a new input with no template schema); plus **AgentConfig lowering** of the static subset (sequence→`SequentialAgent`, loop→`LoopAgent`, leaf→`LlmAgent` by capability name; dynamic blocks flagged no-equivalent).
+and a new input with no template schema); plus **ADK config lowering** of the
+static subset (an illustrative projection toward static Workflow/agent config
+shapes: sequence/loop/leaf by capability name; runtime fan_out/pipeline/branch
+flagged no-equivalent rather than fabricated).
 
 ## Live planner sweep (optional evidence)
 
