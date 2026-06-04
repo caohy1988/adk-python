@@ -332,9 +332,7 @@ async def author_validate_execute(ctx: Context, node_input):
         "🧬 **ADK config lowering (static subset)** —"
         f" {cov['lowerable']}/{cov['total']} top-level steps project to ADK"
         " config; dynamic blocks stay SpecInterpreter-only:"
-        f" {cov['dynamic']}.\n```json\n{json.dumps(lowered, indent=1)}\n```\n_Illustrative"
-        " structural projection (RFC #93 §11) — leaves by capability name, not"
-        " an importable FQN; not raw model-authored `root_agent.yaml`._"
+        f" {cov['dynamic']}.\n```json\n{json.dumps(lowered, indent=1)}\n```"
     )
 
   # 4. EXECUTE — run the validated plan on the real ADK engine (#92 supervisor).

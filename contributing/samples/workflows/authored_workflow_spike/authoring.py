@@ -544,9 +544,6 @@ def _lower_block(node) -> dict:
         "workflowspec_kind": "fan_out",
         "name": node.id,
         "capability": node.capability,
-        "reason": (
-            "per-item over a runtime list; AgentConfig sub_agents are static"
-        ),
     }
   if isinstance(node, Pipeline):
     return {
@@ -554,14 +551,12 @@ def _lower_block(node) -> dict:
         "workflowspec_kind": "pipeline",
         "name": node.id,
         "stages": [st.capability for st in node.stages],
-        "reason": "barrier-free per-item multi-stage; needs #92 ctx.pipeline",
     }
   if isinstance(node, Branch):
     return {
         "agent_class": AGENTCONFIG_UNSUPPORTED,
         "workflowspec_kind": "branch",
         "name": node.id,
-        "reason": "route-on-value; AgentConfig has no ConditionalAgent",
     }
   raise TypeError(f"unknown block: {type(node).__name__}")
 
