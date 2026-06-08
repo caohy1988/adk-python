@@ -8007,7 +8007,6 @@ class TestAgentResponseLogging:
     assert mock_write_client.append_rows.call_count == 0
 
 
-
 # -----------------------------------------------------------------------------
 # ADK 2.0 minimum producer cut (#293 v5)
 #
@@ -8346,10 +8345,11 @@ class TestC7ToolPauseAndComplete:
     rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
     pauses = [r for r in rows if r["event_type"] == "TOOL_PAUSED"]
     assert len(pauses) == 1
+    # C7 pair keys live UNDER ``attributes.adk`` so the consumer SQL on
+    # ``JSON_VALUE(attributes, '$.adk.function_call_id')`` resolves.
     adk = json.loads(pauses[0]["attributes"])["adk"]
-    extras = json.loads(pauses[0]["attributes"])
-    assert extras["pause_kind"] == "tool"
-    assert extras["function_call_id"] == "call-1"
+    assert adk["pause_kind"] == "tool"
+    assert adk["function_call_id"] == "call-1"
 
   @pytest.mark.asyncio
   async def test_tool_paused_hitl_pause_kind(
@@ -8379,9 +8379,9 @@ class TestC7ToolPauseAndComplete:
     rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
     pauses = [r for r in rows if r["event_type"] == "TOOL_PAUSED"]
     assert len(pauses) == 1
-    extras = json.loads(pauses[0]["attributes"])
-    assert extras["pause_kind"] == "hitl_confirmation"
-    assert extras["function_call_id"] == "call-hitl-1"
+    adk = json.loads(pauses[0]["attributes"])["adk"]
+    assert adk["pause_kind"] == "hitl_confirmation"
+    assert adk["function_call_id"] == "call-hitl-1"
 
   @pytest.mark.asyncio
   async def test_user_message_function_response_emits_tool_completed(
@@ -8407,9 +8407,9 @@ class TestC7ToolPauseAndComplete:
     rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
     completed = [r for r in rows if r["event_type"] == "TOOL_COMPLETED"]
     assert len(completed) == 1
-    extras = json.loads(completed[0]["attributes"])
-    assert extras["pause_kind"] == "tool"
-    assert extras["function_call_id"] == "call-1"
+    adk = json.loads(completed[0]["attributes"])["adk"]
+    assert adk["pause_kind"] == "tool"
+    assert adk["function_call_id"] == "call-1"
 
   @pytest.mark.asyncio
   async def test_hitl_user_message_does_not_emit_tool_completed(

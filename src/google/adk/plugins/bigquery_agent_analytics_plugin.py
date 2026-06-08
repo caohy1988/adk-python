@@ -2020,6 +2020,12 @@ class EventData:
   # an Event — the envelope helper writes those attributes as null
   # rather than synthesizing fake identity (per #293 v5 A3 contract).
   source_event: Optional["Event"] = None
+  # Producer-supplied extras that belong INSIDE ``attributes.adk`` (not
+  # at the top level of ``attributes``). C7's pair keys
+  # (``pause_kind`` / ``function_call_id``) ride here so consumer SQL
+  # like ``JSON_VALUE(attributes, '$.adk.function_call_id')`` lands at
+  # the right JSON path per #293 v5.
+  adk_extras: dict[str, Any] = field(default_factory=dict)
 
 
 class BigQueryAgentAnalyticsPlugin(BasePlugin):
@@ -2923,9 +2929,17 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         A new dict ready for JSON serialization into the attributes column.
     """
     attrs: dict[str, Any] = dict(event_data.extra_attributes)
-    attrs["adk"] = self._build_adk_envelope(
+    adk_envelope = self._build_adk_envelope(
         callback_context, event_data.source_event
     )
+    # Merge producer-supplied adk_extras (#293 v5 C7 pair keys etc.)
+    # INTO the adk envelope so consumer SQL on
+    # ``$.adk.pause_kind`` / ``$.adk.function_call_id`` resolves.
+    # adk_envelope wins on key conflict — producer-derived envelope
+    # is the source of truth for identity fields like source_event_id.
+    for k, v in event_data.adk_extras.items():
+      adk_envelope.setdefault(k, v)
+    attrs["adk"] = adk_envelope
 
     attrs["root_agent_name"] = TraceManager.get_root_agent_name()
     if event_data.model:
@@ -3136,7 +3150,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
               raw_content=content_dict,
               is_truncated=is_truncated,
               event_data=EventData(
-                  extra_attributes={
+                  adk_extras={
                       "pause_kind": "tool",
                       "function_call_id": part.function_response.id,
                   },
@@ -3304,7 +3318,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
                 is_truncated=is_truncated,
                 event_data=EventData(
                     source_event=event,
-                    extra_attributes={
+                    adk_extras={
                         "pause_kind": pause_kind,
                         "function_call_id": part.function_call.id,
                     },
