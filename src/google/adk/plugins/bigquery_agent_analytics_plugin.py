@@ -97,9 +97,9 @@ _HITL_EVENT_MAP = MappingProxyType({
     "adk_request_input": "HITL_INPUT_REQUEST",
 })
 
-# Reverse of _HITL_EVENT_MAP for the C7 pause_kind discriminator. The
-# id→name lookup in #199/#293 v5 routes ``adk_request_credential`` →
-# ``hitl_credential`` etc.; everything else is ``tool``.
+# Reverse of _HITL_EVENT_MAP for the long-running-tool pause_kind
+# discriminator. The id→name lookup routes ``adk_request_credential``
+# → ``hitl_credential`` etc.; everything else is ``tool``.
 _HITL_PAUSE_KIND_MAP = MappingProxyType({
     "adk_request_credential": "hitl_credential",
     "adk_request_confirmation": "hitl_confirmation",
@@ -110,7 +110,7 @@ _HITL_PAUSE_KIND_MAP = MappingProxyType({
 def _derive_scope(
     isolation_scope: Optional[str],
 ) -> Optional[dict[str, str]]:
-  """Derives ``attributes.adk.scope`` per the #198 / #293 v5 rule.
+  """Derives ``attributes.adk.scope`` from an Event's isolation_scope.
 
   Order is fixed: (1) None → null; (2) node-shape (``name@run_id`` or
   ``parent/name@run_id``) → ``node_run``; (3) any other non-empty
@@ -2018,7 +2018,7 @@ class EventData:
   # so ``_log_event`` can stamp ``attributes.adk.{source_event_id, node,
   # branch, scope, ...}``. Leave None for rows that don't originate from
   # an Event — the envelope helper omits those keys rather than
-  # synthesizing fake identity (per #293 v5 A3 contract). Because the
+  # synthesizing fake identity. Because the
   # surrounding column is BigQuery JSON, an omitted key resolves to SQL
   # NULL via ``JSON_VALUE(attributes, '$.adk.<field>')``, so consumer
   # gating with ``... IS NOT NULL`` works without explicit JSON nulls.
@@ -2027,7 +2027,7 @@ class EventData:
   # at the top level of ``attributes``). C7's pair keys
   # (``pause_kind`` / ``function_call_id``) ride here so consumer SQL
   # like ``JSON_VALUE(attributes, '$.adk.function_call_id')`` lands at
-  # the right JSON path per #293 v5.
+  # the right JSON path.
   adk_extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -2820,7 +2820,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       callback_context: CallbackContext,
       source_event: Optional["Event"],
   ) -> dict[str, Any]:
-    """Builds the ``attributes.adk`` envelope per #293 v5.
+    """Builds the ``attributes.adk`` envelope.
 
     A1 / A2 (``schema_version``, ``app_name``) stamp on every ADK-enriched
     row regardless of origin. A3 / C1 / C2 / C3 (``source_event_id``,
@@ -2883,7 +2883,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     except Exception:
       pass
 
-    # C3: scope shape derivation (per #190 v5 / #198). Order matters:
+    # Scope shape derivation. Order matters:
     # node-shape patterns must be checked before falling through to
     # function_call so bare ``name@run_id`` doesn't misclassify.
     try:
@@ -2892,7 +2892,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     except Exception:
       pass
 
-    # C8: raw EventActions mirror (flat under attributes.adk per #203).
+    # Raw EventActions mirror (flat under attributes.adk).
     # Stamp only when actually set so JSON doesn't bloat with nulls.
     try:
       actions = getattr(source_event, "actions", None)
@@ -2931,7 +2931,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
     Reads ``model``, ``model_version``, and ``usage_metadata`` from
     *event_data*, copies ``extra_attributes``, then adds session metadata
-    and custom tags. Also stamps the ``adk`` envelope (#293 v5).
+    and custom tags. Also stamps the ``adk`` envelope.
 
     Returns:
         A new dict ready for JSON serialization into the attributes column.
@@ -2940,7 +2940,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     adk_envelope = self._build_adk_envelope(
         callback_context, event_data.source_event
     )
-    # Merge producer-supplied adk_extras (#293 v5 C7 pair keys etc.)
+    # Merge producer-supplied adk_extras (long-running pair keys etc.)
     # INTO the adk envelope so consumer SQL on
     # ``$.adk.pause_kind`` / ``$.adk.function_call_id`` resolves.
     # adk_envelope wins on key conflict — producer-derived envelope
@@ -3107,7 +3107,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       are the long-running tool completions for tools that paused via
       ``TOOL_PAUSED``. Emitted as ``TOOL_COMPLETED`` with
       ``pause_kind = 'tool'`` and ``function_call_id`` so the customer
-      can join the pair from BigQuery (#293 v5 C7 pair-key subset).
+      can join the pair from BigQuery.
 
     Args:
         invocation_context: The context of the current invocation.
@@ -3137,7 +3137,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         }
         if hitl_event:
           # HITL completions stay on the HITL_*_COMPLETED stream — they
-          # MUST NOT also emit TOOL_COMPLETED (per #293 v5 C7).
+          # MUST NOT also emit TOOL_COMPLETED.
           await self._log_event(
               hitl_event + "_COMPLETED",
               callback_ctx,
@@ -3150,8 +3150,8 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           # tool calls complete inside the agent run via
           # after_tool_callback, so a function_response inside a user
           # message is the resume side of a previously-paused tool.
-          # Stamp the pair keys; pause_orphan / registry semantics are
-          # deferred to #206.
+          # Stamp the pair keys; pause_orphan / registry semantics
+          # are intentionally deferred.
           await self._log_event(
               "TOOL_COMPLETED",
               callback_ctx,
@@ -3211,10 +3211,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           ),
       )
 
-    # --- AGENT_TRANSFER (C4 / #200) ---
+    # --- AGENT_TRANSFER ---
     # actions.transfer_to_agent stores the *target* agent only
     # (events/event_actions.py:75); from_agent is pinned to event.author
-    # per #293 v5 C4. Never fabricate authors on non-Event paths.
+    # by contract. Never fabricate authors on non-Event paths.
     if event.actions.transfer_to_agent:
       await self._log_event(
           "AGENT_TRANSFER",
@@ -3226,7 +3226,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           event_data=EventData(source_event=event),
       )
 
-    # --- EVENT_COMPACTION (C5 / #201) ---
+    # --- EVENT_COMPACTION ---
     # EventCompaction.start_timestamp / end_timestamp are float epoch
     # seconds. Preserve fractional precision here; consumer view
     # conversion is deferred.
@@ -3247,7 +3247,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           event_data=EventData(source_event=event),
       )
 
-    # --- AGENT_STATE_CHECKPOINT (C6 / #202) ---
+    # --- AGENT_STATE_CHECKPOINT ---
     # Fires when *either* agent_state is set or end_of_agent is True;
     # supports {agent_state: None, end_of_agent: True} payloads.
     # Inline payload only — oversized-state GCS offload deferred.
@@ -3274,7 +3274,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           event_data=EventData(source_event=event),
       )
 
-    # --- HITL + TOOL_PAUSED (C7 / #199 — pair-key subset) + per-part
+    # --- HITL + TOOL_PAUSED (pair-key emit) + per-part
     #     iteration over event.content.parts ---
     # TOOL_PAUSED fires per long_running_tool_id; pause_kind is derived
     # via the id→name lookup against _HITL_PAUSE_KIND_MAP, so a HITL
@@ -3305,9 +3305,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
                 is_truncated=is_truncated,
                 event_data=EventData(source_event=event),
             )
-          # C7: per-id TOOL_PAUSED emit. pause_kind derives from the
-          # function_call NAME (#199 / #293 v5) — looking it up against
-          # the id value would misclassify every HITL pause as 'tool'.
+          # Per-id TOOL_PAUSED emit. pause_kind derives from the
+          # function_call NAME — looking it up against the id value
+          # would misclassify every HITL pause as 'tool'.
           if part.function_call.id in long_running_ids:
             pause_kind = _HITL_PAUSE_KIND_MAP.get(
                 part.function_call.name, "tool"
@@ -3334,7 +3334,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             )
         # Detect HITL function responses (completion events). HITL
         # function responses route ONLY here, never to TOOL_COMPLETED
-        # (per #293 v5 C7 / verified at this file's HITL test suite).
+        # (verified by this file's HITL test suite).
         if part.function_response:
           hitl_event = _HITL_EVENT_MAP.get(part.function_response.name)
           if hitl_event:

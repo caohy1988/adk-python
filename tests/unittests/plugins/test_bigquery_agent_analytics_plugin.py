@@ -8008,7 +8008,7 @@ class TestAgentResponseLogging:
 
 
 # -----------------------------------------------------------------------------
-# ADK 2.0 minimum producer cut (#293 v5)
+# ADK 2.0 minimum producer cut
 #
 # Coverage matrix:
 #   A1 / A2  attributes.adk.{schema_version, app_name} on every row
@@ -8451,7 +8451,7 @@ class TestC8ActionAttributes:
       invocation_context,
       dummy_arrow_schema,
   ):
-    """C8 (#203): route / rewind_before_invocation_id mirror under
+    """C8: route / rewind_before_invocation_id mirror under
     attributes.adk.* (flat-with-prefix, NOT nested under .actions.)."""
     event = event_lib.Event(
         author="agent",
@@ -8470,7 +8470,7 @@ class TestC8ActionAttributes:
         mock_write_client, dummy_arrow_schema
     )
     adk = json.loads(log_entry["attributes"])["adk"]
-    # Flat-with-prefix per #203 / #293 v5.
+    # Flat-with-prefix mirror under attributes.adk.*.
     assert adk["route"] == "branch_b"
     assert adk["rewind_before_invocation_id"] == "inv-earlier"
     # Not nested under .actions.
