@@ -2823,8 +2823,13 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     row regardless of origin. A3 / C1 / C2 / C3 (``source_event_id``,
     ``node``, ``branch``, ``scope``) and C8 (``route``,
     ``render_ui_widgets``, ``rewind_before_invocation_id``) only stamp
-    when a source Event is provided — callback-only rows leave them
-    JSON null rather than synthesizing fake identity.
+    when a source Event is provided — callback-only rows **omit** those
+    keys from the envelope rather than synthesizing fake identity. Since
+    the surrounding column is BigQuery JSON, an omitted key resolves to
+    SQL NULL via ``JSON_VALUE(attributes, '$.adk.<field>')``; consumers
+    using ``JSON_VALUE(...) IS NOT NULL`` to gate on Event-originating
+    rows therefore work correctly without the producer writing explicit
+    JSON nulls.
     """
     adk: dict[str, Any] = {
         "schema_version": _ADK_ENVELOPE_SCHEMA_VERSION,
