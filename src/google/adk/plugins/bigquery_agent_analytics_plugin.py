@@ -2017,8 +2017,11 @@ class EventData:
   # ADK 2.0 envelope: callbacks that hold the source Event pass it here
   # so ``_log_event`` can stamp ``attributes.adk.{source_event_id, node,
   # branch, scope, ...}``. Leave None for rows that don't originate from
-  # an Event — the envelope helper writes those attributes as null
-  # rather than synthesizing fake identity (per #293 v5 A3 contract).
+  # an Event — the envelope helper omits those keys rather than
+  # synthesizing fake identity (per #293 v5 A3 contract). Because the
+  # surrounding column is BigQuery JSON, an omitted key resolves to SQL
+  # NULL via ``JSON_VALUE(attributes, '$.adk.<field>')``, so consumer
+  # gating with ``... IS NOT NULL`` works without explicit JSON nulls.
   source_event: Optional["Event"] = None
   # Producer-supplied extras that belong INSIDE ``attributes.adk`` (not
   # at the top level of ``attributes``). C7's pair keys
