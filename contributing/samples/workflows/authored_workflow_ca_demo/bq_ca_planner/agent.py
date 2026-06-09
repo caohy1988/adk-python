@@ -190,6 +190,65 @@ def _verdict_of(v) -> dict:
   return {"insight": str(v), "refuted": False}
 
 
+_VEGA_MARK = {"bar": "bar", "line": "line", "scatter": "point", "pie": "arc"}
+
+
+def _ascii_bars(rows, width: int = 24) -> str:
+  """A Unicode bar preview of (label, value) rows — renders in the chat."""
+  pts = []
+  for r in rows or []:
+    if not isinstance(r, dict):
+      continue
+    label = next((str(v) for v in r.values() if isinstance(v, str)), "?")
+    num = next(
+        (float(v) for v in r.values() if isinstance(v, (int, float))), 0.0
+    )
+    pts.append((label, num))
+  if not pts:
+    return "(no rows)"
+  mx = max(n for _, n in pts) or 1.0
+  lw = max(len(label) for label, _ in pts)
+  return "\n".join(
+      f"{label:<{lw}}  {'█' * max(1, round(n / mx * width)):<{width}} "
+      f" {n:>14,.2f}"
+      for label, n in pts
+  )
+
+
+def _render_chart(v) -> dict:
+  """Build a chart from whatever the authored binding hands over: query
+  output (dict with rows), raw rows (list of dicts), a tournament winner
+  (list with one chart-type string), or a bare chart-type string. Emits the
+  Conversational-Analytics-style artifact: a Vega-Lite spec + a text
+  preview the chat can render."""
+  chart_type, rows = "bar", _CANNED_ROWS
+  obj = _obj_of(v)
+  if isinstance(obj, dict):
+    rows = obj.get("rows", rows)
+    if str(obj.get("chart_type", "")) in _VEGA_MARK:
+      chart_type = str(obj["chart_type"])
+  elif isinstance(obj, list) and obj:
+    if isinstance(obj[0], dict):
+      rows = obj
+    elif str(obj[0]) in _VEGA_MARK:
+      chart_type = str(obj[0])
+  elif isinstance(v, str) and v in _VEGA_MARK:
+    chart_type = v
+  return {
+      "chart_type": chart_type,
+      "ascii": _ascii_bars(rows),
+      "vega_lite": {
+          "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+          "mark": _VEGA_MARK[chart_type],
+          "data": {"values": rows},
+          "encoding": {
+              "x": {"field": "region", "type": "nominal"},
+              "y": {"field": "revenue", "type": "quantitative"},
+          },
+      },
+  }
+
+
 def _stub(name, fn):
   def build():
     @node(name=name)
@@ -355,6 +414,12 @@ def _registry() -> CapabilityRegistry:
           ),
       ),
       Capability(
+          name="render_chart",
+          input_kind="item",
+          serialize_input=False,
+          build=_stub("render_chart", _render_chart),
+      ),
+      Capability(
           name="keep_verified",
           input_kind="list",
           serialize_input=False,
@@ -424,19 +489,21 @@ _CAPS_BLURB = (
     # "<curly>identifier<curly>" in instructions as session-state injection
     # and raises KeyError on unknown variables.
     "nl2sql (item: a question object -> Sql with field sql),"
-    " draft_or_repair_sql (item: a question plus optional prior sql and"
-    " error -> Sql), summarize_insight (item: rows or stats JSON -> Insight"
-    " with field insight), classify_question (item: a question -> Category"
-    " with field category equal to 'data' or 'schema'), skeptic (item: one"
-    " insight -> Verdict with fields insight and refuted), dry_run (item:"
-    " Sql -> object with sql, valid, error), flaky_dry_run (same as dry_run"
-    " but may fail transiently), sql_ok (item: dry-run output -> bool),"
-    " run_query (item: validated sql -> object with rows), profile_table"
-    " (item: a table name -> stats object), quality_report (LIST of stats"
-    " -> report object), describe_schema (item: a question -> object with"
-    " answer), keep_verified (LIST of Verdicts -> object with verified and"
-    " rejected), pair_charts (LIST -> list of pairs), judge_chart (item: a"
-    " pair -> the winner), single_chart (LIST -> bool)."
+    " draft_or_repair_sql (item: a question plus optional prior sql and error"
+    " -> Sql), summarize_insight (item: rows or stats JSON -> Insight with"
+    " field insight), classify_question (item: a question -> Category with"
+    " field category equal to 'data' or 'schema'), skeptic (item: one insight"
+    " -> Verdict with fields insight and refuted), dry_run (item: Sql -> object"
+    " with sql, valid, error), flaky_dry_run (same as dry_run but may fail"
+    " transiently), sql_ok (item: dry-run output -> bool), run_query (item:"
+    " validated sql -> object with rows), profile_table (item: a table name ->"
+    " stats object), quality_report (LIST of stats -> report object),"
+    " describe_schema (item: a question -> object with answer), keep_verified"
+    " (LIST of Verdicts -> object with verified and rejected), render_chart"
+    " (item: query output with rows, or a chart-type winner -> a chart artifact"
+    " with chart_type, ascii preview, and a vega_lite spec), pair_charts (LIST"
+    " -> list of pairs), judge_chart (item: a pair -> the winner), single_chart"
+    " (LIST -> bool)."
 )
 
 _BINDING_RULES = (
@@ -452,14 +519,16 @@ def _scenario_defs():
   return {
       "sequence": dict(
           title="Ask a question (sequence)",
-          shape="step → step → step → step",
+          shape="step → step → step → render_chart + step",
           triggers=("revenue by region", "sequence"),
           task={"question": q_region},
           recipe=(
               "Author, in order: (1) a step running nl2sql on the task;"
               " (2) a step running dry_run on it; (3) a step running"
-              " run_query on that; (4) a step running summarize_insight on"
-              " the rows. Output = the summarize step."
+              " run_query on that; (4) a step running render_chart on the"
+              " run_query step's output; (5) a step running"
+              " summarize_insight on the run_query step's output. Output ="
+              " the summarize step."
           ),
       ),
       "fanout": dict(
@@ -541,7 +610,10 @@ def _scenario_defs():
       ),
       "tournament": dict(
           title="Pick the best chart (tournament)",
-          shape="loop_until(init=task.chart_options, body=[pair, fan_out])",
+          shape=(
+              "loop_until(init=task.chart_options, body=[pair, fan_out])"
+              " → render_chart"
+          ),
           triggers=("best chart", "tournament"),
           task={"chart_options": ["pie", "bar", "line", "scatter"]},
           recipe=(
@@ -551,7 +623,9 @@ def _scenario_defs():
               " loop's own id>); (b) a fan_out over (a) running judge_chart"
               " per pair]; until_capability = single_chart with until_input"
               " = Binding(source='step', step=<the (b) fan_out>); max_iters"
-              " = 3. Output = the loop."
+              " = 3. Then (2) a step running render_chart on the loop's"
+              " output (the winning chart type). Output = the render_chart"
+              " step."
           ),
       ),
   }
@@ -704,8 +778,24 @@ async def plan_and_run(ctx: Context, node_input):
   interp = SpecInterpreter(reg, ctx)
   result = await interp.execute(spec, task)
   elapsed = time.perf_counter() - t0
+  for chart in (
+      v
+      for v in interp.state.values()
+      if isinstance(v, dict) and "vega_lite" in v
+  ):
+    yield _msg(
+        f"📈 **Chart ({chart['chart_type']})** — the"
+        " Conversational-Analytics-style artifact (text preview + Vega-Lite"
+        f" spec):\n```\n{chart['ascii']}\n```\n```json\n"
+        f"{json.dumps(chart['vega_lite'], indent=1)}\n```"
+    )
+  display = (
+      {k: v for k, v in result.items() if k != "vega_lite"}
+      if isinstance(result, dict)
+      else result
+  )
   yield _msg(
-      f"📄 **Result:**\n```json\n{json.dumps(result, indent=1, default=str)}"
+      f"📄 **Result:**\n```json\n{json.dumps(display, indent=1, default=str)}"
       f"\n```\n📊 **Cost:** {interp.dispatch_count} capability dispatches in"
       f" {elapsed:.1f}s + "
       + ("0 planner calls (frozen replay)." if reused else "1 planner call.")

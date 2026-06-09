@@ -168,6 +168,12 @@ def _expected_spec(key: str) -> WorkflowSpec:
             ),
             StepRef(
                 kind="step",
+                id="chart",
+                capability="render_chart",
+                input=Binding(source="step", step="rows"),
+            ),
+            StepRef(
+                kind="step",
                 id="sum",
                 capability="summarize_insight",
                 input=Binding(source="step", step="rows"),
@@ -350,8 +356,14 @@ def _expected_spec(key: str) -> WorkflowSpec:
                 until_input=Binding(source="step", step="winners"),
                 max_iters=3,
             ),
+            StepRef(
+                kind="step",
+                id="viz",
+                capability="render_chart",
+                input=Binding(source="step", step="bracket"),
+            ),
         ],
-        output=Binding(source="step", step="bracket"),
+        output=Binding(source="step", step="viz"),
     )
   raise KeyError(key)
 
@@ -399,6 +411,25 @@ def test_stubs_tolerate_authored_binding_shapes():
   demo._FLAKY_CALLS["n"] = 1  # next call is even -> passes
   out = demo._flaky_dry_run(raw_sql)  # raw string input must not crash
   assert out["valid"] is True and out["sql"] == raw_sql
+
+
+def test_render_chart_accepts_authored_binding_shapes():
+  # query output (dict with rows) -> bar over those rows
+  ch = demo._render_chart({"rows": demo._CANNED_ROWS_YEAR})
+  assert ch["chart_type"] == "bar"
+  assert "1,648,140.00" in ch["ascii"]
+  assert ch["vega_lite"]["data"]["values"] == demo._CANNED_ROWS_YEAR
+  # tournament winner (list with one chart type) -> that mark, canned rows
+  ch = demo._render_chart(["pie"])
+  assert ch["chart_type"] == "pie"
+  assert ch["vega_lite"]["mark"] == "arc"
+  # bare chart-type string and raw rows list
+  assert demo._render_chart("scatter")["vega_lite"]["mark"] == "point"
+  ch = demo._render_chart(demo._CANNED_ROWS)
+  assert "US-West" in ch["ascii"]
+  # ascii preview: one bar line per region, longest bar for the leader
+  lines = demo._render_chart({"rows": demo._CANNED_ROWS})["ascii"].splitlines()
+  assert len(lines) == 4 and lines[0].count("█") > lines[-1].count("█")
 
 
 def test_rows_track_the_sql_window():
@@ -553,4 +584,7 @@ async def test_tournament_picks_best_chart_no_llm_needed():
       demo._registry(),
       demo.SCENARIOS["tournament"]["task"],
   )
-  assert out == ["bar"]
+  # bracket converges to bar; the winner is rendered as a chart artifact.
+  assert out["chart_type"] == "bar"
+  assert out["vega_lite"]["mark"] == "bar"
+  assert "US-West" in out["ascii"]
