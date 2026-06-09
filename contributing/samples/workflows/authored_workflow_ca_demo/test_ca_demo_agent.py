@@ -401,6 +401,40 @@ def test_stubs_tolerate_authored_binding_shapes():
   assert out["valid"] is True and out["sql"] == raw_sql
 
 
+def test_rows_track_the_sql_window():
+  # The mock executor returns a DIFFERENT canned set for a year-scale
+  # window, so the demo output visibly tracks the question.
+  q_sql = "SELECT ... WHERE created_at >= INTERVAL 1 QUARTER"
+  y_sql = "SELECT ... WHERE created_at >= INTERVAL 1 YEAR"
+  assert demo._rows_for(q_sql) == demo._CANNED_ROWS
+  assert demo._rows_for(y_sql) == demo._CANNED_ROWS_YEAR
+  assert demo._rows_for({"sql": y_sql}) == demo._CANNED_ROWS_YEAR
+
+
+def test_text_of_extracts_user_message():
+  assert demo._text_of("plain text") == "plain text"
+  content = types.Content(
+      role="user", parts=[types.Part(text="last year please")]
+  )
+  assert demo._text_of(content) == "last year please"
+
+  class Wrapped:
+    pass
+
+  w = Wrapped()
+  w.content = content
+  assert demo._text_of(w) == "last year please"
+
+
+def test_sequence_takes_live_question_others_stay_canned():
+  q = "What was revenue by region last year?"
+  assert demo._task_for("sequence", q) == {"question": q}
+  # empty/whitespace falls back to the canned question
+  assert demo._task_for("sequence", "  ") == demo.SCENARIOS["sequence"]["task"]
+  # mode-selector scenarios keep their canned inputs
+  assert demo._task_for("fanout", q) == demo.SCENARIOS["fanout"]["task"]
+
+
 def test_root_agent_importable_and_named():
   assert isinstance(demo.root_agent, Workflow)
   assert demo.root_agent.name == "bq_ca_planner"

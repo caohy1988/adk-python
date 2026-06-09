@@ -33,15 +33,15 @@ adk web contributing/samples/workflows/authored_workflow_ca_demo --port 8001
 Open the UI, pick `bq_ca_planner`, and send the prompts below — **one
 scenario per prompt**, each authoring a different coordination shape:
 
-| #   | Send this prompt                                             | Shape authored                                       | CA story                                                         |
-| --- | ------------------------------------------------------------ | ---------------------------------------------------- | ---------------------------------------------------------------- |
-| 1   | `What was revenue by region last quarter?`                   | sequence: `nl2sql → dry_run → run_query → summarize` | the basic ask-a-question flow                                    |
-| 2   | `Profile data quality across the dataset tables.`            | fan-out → synthesize                                 | per-table profiling in parallel, one report                      |
-| 3   | `Build a dashboard for these three questions.`               | pipeline(`nl2sql → dry_run`) per item                | each panel translated + validated barrier-free                   |
-| 4   | `Route my question: what does order status 'Complete' mean?` | classify & route (branch)                            | metadata questions skip SQL entirely                             |
-| 5   | `Answer with SQL self-repair — the dry run is unreliable.`   | loop_until + **loop-carried `init`**                 | draft → failed dry run → repair using the error                  |
-| 6   | `Audit these insights — verify each one independently.`      | adversarial verification                             | independent skeptics per insight; the $1M AOV claim gets refuted |
-| 7   | `Pick the best chart for revenue by region.`                 | tournament                                           | pairwise chart judging to a single winner                        |
+| #   | Send this prompt                                             | Shape authored                                       | CA story                                                                   |
+| --- | ------------------------------------------------------------ | ---------------------------------------------------- | -------------------------------------------------------------------------- |
+| 1   | `What was revenue by region last quarter?`                   | sequence: `nl2sql → dry_run → run_query → summarize` | the basic ask-a-question flow — **your actual question is the task input** |
+| 2   | `Profile data quality across the dataset tables.`            | fan-out → synthesize                                 | per-table profiling in parallel, one report                                |
+| 3   | `Build a dashboard for these three questions.`               | pipeline(`nl2sql → dry_run`) per item                | each panel translated + validated barrier-free                             |
+| 4   | `Route my question: what does order status 'Complete' mean?` | classify & route (branch)                            | metadata questions skip SQL entirely                                       |
+| 5   | `Answer with SQL self-repair — the dry run is unreliable.`   | loop_until + **loop-carried `init`**                 | draft → failed dry run → repair using the error                            |
+| 6   | `Audit these insights — verify each one independently.`      | adversarial verification                             | independent skeptics per insight; the $1M AOV claim gets refuted           |
+| 7   | `Pick the best chart for revenue by region.`                 | tournament                                           | pairwise chart judging to a single winner                                  |
 
 What to point at as each one streams:
 
@@ -49,6 +49,7 @@ What to point at as each one streams:
 - **📋 authored plan** — a *different* typed `WorkflowSpec` per prompt; same closed vocabulary every time.
 - **✅ + 🧪 validation & independence lints** — every scenario lints clean; the provenance facts are statically provable from the bindings.
 - **🔒 freeze (per-scenario key)** — **re-send any prompt**: same hash, `0 planner calls (frozen replay)`. Seven independent frozen plans in one session.
+- **template reuse (scenario 1)** — after the first ask, send a *different* question (`What was revenue by region last year?`): the frozen plan is reused unchanged, your new question flows through it as new task input, and the mock rows change with the window (quarter vs year canned sets). Same plan, new data — the RFC's replay-vs-template distinction, live.
 - **📄 result + 📊 cost** — real execution on the #92 supervisor; the repair scenario shows exactly one repair iteration (`Table not found … did you mean orders?` → fixed), the audit scenario rejects the implausible insight, the tournament returns `["bar"]`.
 
 Talking point for scenario 5 (the differentiated one): *the repair loop needs
@@ -60,7 +61,7 @@ replayable — a turn-by-turn agent retry never is.*
 ## 2. Correctness proof (no LLM, no BigQuery)
 
 ```bash
-pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 12
+pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 15
 ```
 
 All seven expected shapes are built by hand, validated + lint-checked against
@@ -81,3 +82,7 @@ against the **live** registry (their capabilities are deterministic mocks).
   repair loop behaves identically on every run and in CI.
 - Frozen plans are per-scenario (`authored_workflow:ca:<scenario>`), so all
   seven replay independently within a session.
+- Scenario 1 takes your live message as the question; the other six prompts
+  are mode selectors with canned task inputs (their results don't change
+  with your wording). All query results are canned either way — quarter vs
+  year selects between two mock row sets; there is no BigQuery behind it.

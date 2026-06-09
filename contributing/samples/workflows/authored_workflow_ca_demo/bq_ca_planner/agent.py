@@ -96,6 +96,16 @@ _CANNED_ROWS = [
     {"region": "APAC", "revenue": 188777.75},
 ]
 
+# A year-scale window returns a different canned set, so the demo output
+# visibly TRACKS the input: ask "last quarter" vs "last year" and the rows
+# change (still mocks — no BigQuery behind them).
+_CANNED_ROWS_YEAR = [
+    {"region": "US-West", "revenue": 1648140.00},
+    {"region": "US-East", "revenue": 1571980.40},
+    {"region": "EMEA", "revenue": 1180510.90},
+    {"region": "APAC", "revenue": 760222.15},
+]
+
 _CANNED_PROFILES = {
     "orders": {"table": "orders", "row_count": 125210, "null_pct": 0.2},
     "order_items": {
@@ -306,7 +316,7 @@ def _registry() -> CapabilityRegistry:
           name="run_query",
           input_kind="item",
           serialize_input=False,
-          build=_stub("run_query", lambda s: {"rows": _CANNED_ROWS}),
+          build=_stub("run_query", lambda s: {"rows": _rows_for(s)}),
       ),
       Capability(
           name="profile_table",
@@ -550,6 +560,34 @@ def _scenario_defs():
 SCENARIOS = _scenario_defs()
 
 
+def _rows_for(value) -> list:
+  """Canned rows; a year-scale window in the SQL selects the year set."""
+  return _CANNED_ROWS_YEAR if "year" in _sql_of(value).lower() else _CANNED_ROWS
+
+
+def _text_of(node_input) -> str:
+  """The user's message text, whatever shape the node input arrives in."""
+  if isinstance(node_input, str):
+    return node_input
+  for holder in (node_input, getattr(node_input, "content", None)):
+    parts = getattr(holder, "parts", None)
+    if parts:
+      return " ".join(p.text for p in parts if getattr(p, "text", None))
+  return str(node_input or "")
+
+
+def _task_for(key: str, text: str) -> dict:
+  """The scenario's task input. The ask-a-question scenario takes the LIVE
+  user message as the question — so a re-send with a different question is
+  TEMPLATE REUSE: the frozen plan unchanged, new task input flowing through
+  it. Other scenarios keep their canned inputs (their prompts are mode
+  selectors, not questions)."""
+  task = dict(SCENARIOS[key]["task"])
+  if key == "sequence" and text.strip():
+    task = {"question": text.strip()}
+  return task
+
+
 def _scenario_for(text: str) -> str:
   t = (text or "").lower()
   for key, sc in SCENARIOS.items():
@@ -583,14 +621,17 @@ def _hash(spec: WorkflowSpec) -> str:
 @node(rerun_on_resume=True)
 async def plan_and_run(ctx: Context, node_input):
   reg = _registry()
-  key = _scenario_for(str(node_input or ""))
+  text = _text_of(node_input)
+  key = _scenario_for(text)
   sc = SCENARIOS[key]
+  task = _task_for(key, text)
   state_key = f"authored_workflow:ca:{key}"
 
+  task_note = f' — question: "{task["question"]}"' if key == "sequence" else ""
   yield _msg(
       f"🗂️ **Scenario: {sc['title']}** — expected shape `{sc['shape']}`,"
       " over mock `thelook_ecommerce`"
-      f" ({', '.join(TABLES)})."
+      f" ({', '.join(TABLES)}){task_note}."
   )
 
   # 1. LOAD-OR-AUTHOR (per-scenario frozen key: each shape replays
@@ -600,9 +641,16 @@ async def plan_and_run(ctx: Context, node_input):
     spec = WorkflowSpec.model_validate(existing)
     spec_hash = _hash(spec)
     reused = True
+    fresh_input = task != sc["task"]
     yield _msg(
         f"♻️ **Reusing frozen plan** for `{key}` — hash `{spec_hash}`. The"
-        " model is NOT re-invoked; the exact prior plan is replayed."
+        " model is NOT re-invoked; the exact prior plan is replayed"
+        + (
+            " — with your NEW question as the task input (**template"
+            " reuse**: same plan, new data flowing through it)."
+            if fresh_input
+            else "."
+        )
     )
   else:
     reused = False
@@ -614,7 +662,7 @@ async def plan_and_run(ctx: Context, node_input):
         instruction=_planner_instruction(sc),
     )
     raw = await ctx.run_node(
-        planner, node_input=json.dumps(sc["task"]), run_id=f"plan_{key}"
+        planner, node_input=json.dumps(task), run_id=f"plan_{key}"
     )
     spec = WorkflowSpec.model_validate(raw)
     spec_hash = _hash(spec)
@@ -645,7 +693,7 @@ async def plan_and_run(ctx: Context, node_input):
   # 4. EXECUTE on the real engine via the #92 supervisor.
   t0 = time.perf_counter()
   interp = SpecInterpreter(reg, ctx)
-  result = await interp.execute(spec, sc["task"])
+  result = await interp.execute(spec, task)
   elapsed = time.perf_counter() - t0
   yield _msg(
       f"📄 **Result:**\n```json\n{json.dumps(result, indent=1, default=str)}"
