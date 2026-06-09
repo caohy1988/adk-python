@@ -141,6 +141,45 @@ class Verdict(BaseModel):
   refuted: bool
 
 
+def _obj_of(v):
+  """Accept a dict, a JSON-encoded dict/list string, or return None."""
+  if isinstance(v, (dict, list)):
+    return v
+  if isinstance(v, str):
+    try:
+      parsed = json.loads(v)
+      if isinstance(parsed, (dict, list)):
+        return parsed
+    except (ValueError, TypeError):
+      pass
+  return None
+
+
+def _sql_of(v) -> str:
+  """The SQL text from an Sql dict, a JSON string, or a raw SQL string."""
+  obj = _obj_of(v)
+  if isinstance(obj, dict):
+    return str(obj.get("sql", ""))
+  return v if isinstance(v, str) else ""
+
+
+def _field_of(v, key, default=None):
+  obj = _obj_of(v)
+  if isinstance(obj, dict):
+    return obj.get(key, default)
+  return default
+
+
+def _verdict_of(v) -> dict:
+  obj = _obj_of(v)
+  if isinstance(obj, dict) and "insight" in obj:
+    return {
+        "insight": str(obj["insight"]),
+        "refuted": bool(obj.get("refuted")),
+    }
+  return {"insight": str(v), "refuted": False}
+
+
 def _stub(name, fn):
   def build():
     @node(name=name)
@@ -240,8 +279,8 @@ def _registry() -> CapabilityRegistry:
           build=_stub(
               "dry_run",
               lambda s: {
-                  "sql": (s or {}).get("sql", ""),
-                  "valid": "select" in str((s or {}).get("sql", "")).lower(),
+                  "sql": _sql_of(s),
+                  "valid": "select" in _sql_of(s).lower(),
                   "error": None,
               },
           ),
@@ -256,7 +295,12 @@ def _registry() -> CapabilityRegistry:
           name="sql_ok",
           input_kind="item",
           serialize_input=False,
-          build=_stub("sql_ok", lambda s: bool((s or {}).get("valid"))),
+          build=_stub(
+              "sql_ok",
+              lambda s: bool(
+                  _field_of(s, "valid", s if s is not None else False)
+              ),
+          ),
       ),
       Capability(
           name="run_query",
@@ -308,9 +352,15 @@ def _registry() -> CapabilityRegistry:
               "keep_verified",
               lambda vs: {
                   "verified": [
-                      v["insight"] for v in vs if not v.get("refuted")
+                      v["insight"]
+                      for v in map(_verdict_of, vs or [])
+                      if not v["refuted"]
                   ],
-                  "rejected": [v["insight"] for v in vs if v.get("refuted")],
+                  "rejected": [
+                      v["insight"]
+                      for v in map(_verdict_of, vs or [])
+                      if v["refuted"]
+                  ],
               },
           ),
       ),
@@ -345,14 +395,14 @@ def _flaky_dry_run(s):
   _FLAKY_CALLS["n"] += 1
   if _FLAKY_CALLS["n"] % 2 == 1:  # every odd call fails -> 1 repair per run
     return {
-        "question": (s or {}).get("question", ""),
-        "sql": (s or {}).get("sql", ""),
+        "question": str(_field_of(s, "question", "") or ""),
+        "sql": _sql_of(s),
         "valid": False,
         "error": "Table not found: `thelook.order` (did you mean orders?)",
     }
   return {
-      "question": (s or {}).get("question", ""),
-      "sql": (s or {}).get("sql", ""),
+      "question": str(_field_of(s, "question", "") or ""),
+      "sql": _sql_of(s),
       "valid": True,
       "error": None,
   }

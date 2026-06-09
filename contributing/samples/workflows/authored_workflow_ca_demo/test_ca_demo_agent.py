@@ -380,6 +380,27 @@ async def _run(spec, registry, task_input):
 
 
 # ----------------------------------------------------- tests
+def test_stubs_tolerate_authored_binding_shapes():
+  # The plan is MODEL-authored: a binding may hand a stub the whole step
+  # output (dict), a dotted path into it (raw string), or a JSON-encoded
+  # payload. The live error this pins: nl2sql -> dry_run with path='sql'
+  # passed a raw SQL string and the stub assumed a dict.
+  raw_sql = "SELECT region FROM order_items"
+  assert demo._sql_of({"sql": raw_sql}) == raw_sql
+  assert demo._sql_of(json.dumps({"sql": raw_sql})) == raw_sql
+  assert demo._sql_of(raw_sql) == raw_sql
+  assert demo._field_of({"valid": True}, "valid") is True
+  assert demo._field_of(json.dumps({"valid": True}), "valid") is True
+  assert demo._verdict_of(json.dumps({"insight": "x", "refuted": True})) == {
+      "insight": "x",
+      "refuted": True,
+  }
+  assert demo._verdict_of("just text")["refuted"] is False
+  demo._FLAKY_CALLS["n"] = 1  # next call is even -> passes
+  out = demo._flaky_dry_run(raw_sql)  # raw string input must not crash
+  assert out["valid"] is True and out["sql"] == raw_sql
+
+
 def test_root_agent_importable_and_named():
   assert isinstance(demo.root_agent, Workflow)
   assert demo.root_agent.name == "bq_ca_planner"
