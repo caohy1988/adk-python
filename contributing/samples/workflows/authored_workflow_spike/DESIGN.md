@@ -64,6 +64,11 @@ class LoopUntil(BaseModel):
   until_capability: str                # MUST declare a STRICT-bool output schema
   until_input: Binding                 # predicate input (validated vs until_capability.input_schema)
   max_iters: int = Field(ge=1)         # REQUIRED, >= 1
+  init: Binding | None = None          # LOOP-CARRIED seed: a body step may bind the loop's OWN id to
+                                       # read the prior iteration's body output (`init` on round 0).
+                                       # Surfaced by the tournament pattern (pairs recomputed per round
+                                       # from prior winners); required for any accumulate-and-refine loop.
+                                       # Binding the loop's id in the body WITHOUT init = validation error.
 
 # PLAIN union, each member carrying a `kind` Literal (structurally-tagged) — NOT
 # Annotated[..., Field(discriminator="kind")]: the discriminated form emits a
@@ -115,11 +120,18 @@ class AuthoredWorkflowAgent(BaseAgent):
 - `FanOut.over` resolves to a list; the fan-out capability takes an item;
 - `Branch.on` is string/str-enum-typed; route blocks share a compatible last-node output schema; non-exhaustive enum domain is flagged (unmatched at runtime fails);
 - `Pipeline`: `over` resolves to a list; every stage `capability` is registered and takes an item; stage[0] input defaults to the per-item element, stage[n] to stage[n-1]'s output; the last stage's output type defines the pipeline output (validated for downstream bindings);
-- `LoopUntil`: strict-bool `until_capability`, present/compatible `until_input`, `max_iters >= 1`;
+- `LoopUntil`: strict-bool `until_capability`, present/compatible `until_input`, `max_iters >= 1`; a body binding to the loop's own id requires `init`;
 - globally-unique `id`s; binding-scope (no non-preceding / cross-route references);
 - registry-version match vs a frozen spec (drift = hard error).
 
 Then **`Graph.validate_graph()`** (reused) handles duplicate names, `START`/reachability, duplicate edges, unconditional cycles on the compiled graph.
+
+**Plan-quality lints (soft warnings).** Multi-agent quality rests on isolation — it mitigates the documented single-agent failure modes (*agentic laziness*, *self-preferential bias*, *goal drift*; see [Dynamic Workflows: scaling complex work](https://aipractitioner.substack.com/p/claude-dynamic-workflows-scaling)). Because dataflow is typed `Binding`s, independence is **statically checkable** — something model-authored orchestration *code* cannot offer — and the validator lints two violations:
+
+- **self-review**: a node (or pipeline stage) consuming output produced by the *same capability* — same-capability review cannot provide independent verification;
+- **unsynthesized fan-out**: the terminal output binds a bare per-item `fan_out` never combined or verified downstream.
+
+The complementary positive facts (`independence_facts`) are derivable from the frozen spec — e.g. *"stage `verifier` sees ONLY stage `reviewer`'s per-item output"* — which is what lets the frozen record **prove** structural bias controls to an auditor, not just assert them.
 
 ## 4. Semantics
 
@@ -181,6 +193,8 @@ Fully additive. New `authoring/` package + `AuthoredWorkflowAgent`; no change to
 - **`AuthoredWorkflowAgent`:** malformed planner output → bounded re-plan → fail past `max_replans`.
 - **Determinism:** frozen spec replays identically, resumes exactly-once (inherits #92).
 - **Two gates:** *planning* (valid + sensible + executable + structurally matches a hand-wired baseline) and *output-quality* (intermediate outputs match, capability invariants hold, one repair retry).
+- **Pattern coverage:** the six empirically common coordination patterns (classify-route, fan-out/synthesize, generate-filter, loop-until-done, adversarial verification, tournament) all author + validate + execute. The two non-obvious shapes have explicit deterministic tests; tournament exercises loop-carried state.
+- **Plan-quality lints:** same-capability self-review and unsynthesized fan-out warn; an independent (different-capability) verification plan lints clean.
 
 ## 9. Empirical findings (from the demand-gate spike on `gemini-3.5-flash`)
 
@@ -188,8 +202,9 @@ Fully additive. New `authoring/` package + `AuthoredWorkflowAgent`; no change to
 1. **Open-`dict[str, X]` maps are a structured-output reliability hazard** — hit twice: a capability's `counts: dict[str,int]` came back empty, and the spec's own `Branch.routes` (an open map) came back empty. **Both fixed by enumerated/list structures** (`Branch.routes` → `list[Route]`; capability outputs use fixed fields). The validator warns on open-map capability outputs.
 1. **Discriminated unions are incompatible with Gemini `response_schema`** — `Field(discriminator="kind")` emits a `discriminator` keyword genai rejects (`Schema: extra_forbidden`). Use a plain `kind`-tagged union.
 1. **Planner quality vs capability quality are separable** — authoring/structure was reliably good; the residual variance was per-capability output quality (prompts/schemas/retries), proven via an intermediate-output diff (authored vs baseline findings were semantically identical). The strict `unmatched=fail` branch contract also caught a bad field-binding loudly instead of mis-routing.
+1. **The pattern-coverage sweep surfaced a real vocabulary gap** — the tournament shape (pairs recomputed per round from the prior round's winners) is inexpressible without **loop-carried state**: a body step must read the previous iteration's output, which the binding-scope rules statically forbid. Fixed with `LoopUntil.init` (seed binding) + the rule that a body binding to the loop's own id reads the carried value. Pattern-driven gate-task selection finds these gaps; single ad-hoc tasks don't.
 
-Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (25 deterministic tests + env-gated live sweep) and `authored_workflow_demo/` (ADK Web `root_agent` + 5 CI-safe tests incl. the no-LLM reuse path), in `caohy1988/adk-python` PR #3.
+Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (31 deterministic tests + env-gated live sweep) and `authored_workflow_demo/` (ADK Web `root_agent` + 6 CI-safe tests incl. the no-LLM reuse path), in `caohy1988/adk-python` PR #3.
 
 ## 10. Plan export & storage — the frozen spec as a durable artifact
 
@@ -278,8 +293,13 @@ A reviewer asked whether the planner should author ADK's existing **YAML config*
 
 **Upstream config extension (optional).** If the dynamic constructs prove their value, the cleaner long-term home for runtime `fan_out` / `pipeline` may be **new Workflow YAML block types upstream** plus an allow-listed capability-reference field — at which point authoring could converge more fully onto an extended ADK config shape. Out of scope here; depends on upstream accepting those config/compiler extensions.
 
+**Budget as a bindable runtime value (v1.1-sized).** #92 caps *bound* spend, but a plan cannot *react* to it. Allowing `until_input` (or any `Binding`) to source a runtime-provided budget struct — e.g. `Binding(source="runtime", path="budget.remaining_tokens")` — makes loop-until-budget expressible declaratively, with no new node kind.
+
+**A "no-plan" escape hatch.** Each orchestration level adds overhead; small, linear tasks are solved more efficiently by a single agent. Letting the planner's output schema include a degenerate direct-execution variant (a single `StepRef`, or an explicit `kind: "direct"`) lets trivial inputs skip orchestration — classify-and-route applied to the meta-decision of whether to orchestrate at all.
+
 ## References
 
 - #92 — supervised concurrent dynamic dispatch + `ctx.pipeline` (executor).
 - Claude Code Dynamic Workflows — https://code.claude.com/docs/en/workflows
+- Empirical patterns & failure modes: *Claude Dynamic Workflows: Scaling Complex Work* — https://aipractitioner.substack.com/p/claude-dynamic-workflows-scaling
 - ADK: `Workflow`/`Graph` (`src/google/adk/workflow/_graph.py`), `LlmAgent.output_schema` / `validate_schema`, `BaseAgent.run_async`, `_session_util.extract_state_delta`, `NodeRunner._track_event_in_context`.

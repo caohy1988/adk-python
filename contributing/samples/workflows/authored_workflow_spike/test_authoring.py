@@ -627,3 +627,199 @@ def test_import_rejects_new_input_without_template_schema():
   # but template promotion (a captured schema) lets a new input through:
   env["task_input_schema"] = {"required": ["files"]}
   assert import_plan(env, _registry(), task_input=other) is not None
+
+
+# ------------------------------------------------------------ pattern coverage
+# The six empirically common coordination patterns (classify-route, fan-out/
+# synthesize, generate-filter, loop-until-done, adversarial verification,
+# tournament) must all be expressible in the v1 vocabulary. Four are already
+# exercised above (branch test = classify-route; fanout_then_aggregate =
+# fan-out/synthesize AND generate-filter; loop test = loop-until-done). The two
+# non-obvious shapes get explicit tests here. Tournament is the one that
+# surfaced a vocabulary gap: data-dependent pairing needs LOOP-CARRIED state
+# (`LoopUntil.init` + body bindings to the loop's own id).
+
+
+def _pattern_registry():
+  return CapabilityRegistry([
+      Capability(
+          name="pair_maker",
+          build=_cap_node(
+              "pair_maker",
+              lambda lst: [lst[i : i + 2] for i in range(0, len(lst), 2)],
+          ),
+          input_kind="list",
+          serialize_input=False,
+      ),
+      Capability(
+          name="judge",
+          build=_cap_node("judge", lambda pair: min(pair)),
+          input_kind="item",
+          serialize_input=False,
+      ),
+      Capability(
+          name="single_winner",
+          build=_cap_node("single_winner", lambda lst: len(lst) == 1),
+          input_kind="list",
+          serialize_input=False,
+      ),
+      Capability(
+          name="skeptic",
+          build=_cap_node(
+              "skeptic",
+              lambda f: {"claim": f["claim"], "refuted": not f["evidence"]},
+          ),
+          input_kind="item",
+          serialize_input=False,
+      ),
+      Capability(
+          name="keep_unrefuted",
+          build=_cap_node(
+              "keep_unrefuted",
+              lambda vs: [v["claim"] for v in vs if not v["refuted"]],
+          ),
+          input_kind="list",
+          serialize_input=False,
+      ),
+  ])
+
+
+def _tournament_spec():
+  return WorkflowSpec(
+      goal="single elimination",
+      steps=[
+          LoopUntil(
+              kind="loop_until",
+              id="tourney",
+              init=Binding(source="task", path="candidates"),
+              body=[
+                  StepRef(
+                      kind="step",
+                      id="pairs",
+                      capability="pair_maker",
+                      # reads the LOOP-CARRIED value: the candidates on round 0,
+                      # the prior round's winners afterwards.
+                      input=Binding(source="step", step="tourney"),
+                  ),
+                  FanOut(
+                      kind="fan_out",
+                      id="round_winners",
+                      over=Binding(source="step", step="pairs"),
+                      capability="judge",
+                  ),
+              ],
+              until_capability="single_winner",
+              until_input=Binding(source="step", step="round_winners"),
+              max_iters=4,
+          ),
+      ],
+      output=Binding(source="step", step="tourney"),
+  )
+
+
+@pytest.mark.asyncio
+async def test_pattern_tournament_loop_carried():
+  reg = _pattern_registry()
+  assert WorkflowSpecValidator(reg).validate(_tournament_spec()) == []
+  out = await _run_spec(
+      _tournament_spec(),
+      reg,
+      {"candidates": ["delta", "bravo", "charlie", "alpha"]},
+  )
+  # round 1: (delta,bravo)->bravo, (charlie,alpha)->alpha; round 2: -> alpha.
+  assert out == ["alpha"]
+
+
+def test_validator_rejects_loop_carried_read_without_init():
+  spec = _tournament_spec()
+  spec.steps[0].init = None  # body still binds the loop's own id
+  with pytest.raises(SpecValidationError, match="init"):
+    WorkflowSpecValidator(_pattern_registry()).validate(spec)
+
+
+@pytest.mark.asyncio
+async def test_pattern_adversarial_verification():
+  # Independent skeptics per finding (fan_out) + a threshold/filter step:
+  # only evidence-backed claims survive. No new vocabulary needed.
+  spec = WorkflowSpec(
+      goal="verify findings adversarially",
+      steps=[
+          FanOut(
+              kind="fan_out",
+              id="verdicts",
+              over=Binding(source="task", path="findings"),
+              capability="skeptic",
+          ),
+          StepRef(
+              kind="step",
+              id="confirmed",
+              capability="keep_unrefuted",
+              input=Binding(source="step", step="verdicts"),
+          ),
+      ],
+      output=Binding(source="step", step="confirmed"),
+  )
+  reg = _pattern_registry()
+  assert WorkflowSpecValidator(reg).validate(spec) == []
+  out = await _run_spec(
+      spec,
+      reg,
+      {
+          "findings": [
+              {"claim": "A", "evidence": True},
+              {"claim": "B", "evidence": False},
+              {"claim": "C", "evidence": True},
+          ]
+      },
+  )
+  assert out == ["A", "C"]
+
+
+# ------------------------------------------------------------ quality lints
+def test_lint_warns_on_same_capability_review():
+  # classify reviewing classify's own output cannot be independent.
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          StepRef(
+              kind="step",
+              id="a",
+              capability="classify",
+              input=Binding(source="task"),
+          ),
+          StepRef(
+              kind="step",
+              id="b",
+              capability="classify",
+              input=Binding(source="step", step="a"),
+          ),
+      ],
+      output=Binding(source="step", step="b"),
+  )
+  warnings = WorkflowSpecValidator(_registry()).validate(spec)
+  assert any("same capability 'classify'" in w for w in warnings)
+
+
+def test_lint_warns_on_unsynthesized_fanout():
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          FanOut(
+              kind="fan_out",
+              id="rev",
+              over=Binding(source="task", path="files"),
+              capability="review",
+          ),
+      ],
+      output=Binding(source="step", step="rev"),
+  )
+  warnings = WorkflowSpecValidator(_registry()).validate(spec)
+  assert any("no downstream synthesis" in w for w in warnings)
+
+
+def test_lints_clean_on_independent_plan():
+  # review -> count: different capabilities, fan_out is synthesized. Clean.
+  assert (
+      WorkflowSpecValidator(_registry()).validate(_fanout_aggregate_spec())
+      == []
+  )

@@ -26,7 +26,7 @@ behind the RFC's "can a model author good plans?" question.
 pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q
 ```
 
-Expected: **25 passed** — `Binding` invariant, `max_iters>=1`, validator accepts a
+Expected: **31 passed** — `Binding` invariant, `max_iters>=1`, validator accepts a
 valid spec and rejects unknown capability / non-preceding binding / duplicate id,
 the open-map warning, and interpreter execution of fan_out→aggregate, **pipeline (barrier-free per-item review→verify, plus per-stage `max_fan_out` enforcement)**, branch
 (correct route), and loop_until (stops + correct output); plus **plan export/import**
@@ -35,7 +35,25 @@ capability, capability/registry version drift, an unsupported schema_version,
 and a new input with no template schema); plus **ADK config lowering** of the
 static subset (an illustrative projection toward static Workflow/agent config
 shapes: sequence/loop/leaf by capability name; runtime fan_out/pipeline/branch
-flagged no-equivalent rather than fabricated).
+flagged no-equivalent rather than fabricated); plus **pattern coverage**
+(adversarial verification and tournament via loop-carried `init`, incl. the
+no-`init` validation error) and **plan-quality lints** (same-capability
+self-review and unsynthesized fan-out warn; an independent plan lints clean).
+
+## Pattern coverage — the six coordination shapes
+
+The six empirically common coordination patterns ([Dynamic Workflows: scaling
+complex work](https://aipractitioner.substack.com/p/claude-dynamic-workflows-scaling))
+are all expressible in the v1 vocabulary, with deterministic tests:
+
+| Pattern | `WorkflowSpec` expression | Test |
+|---|---|---|
+| classify & route | `StepRef(classifier)` → `Branch` | `test_interpreter_branch_takes_correct_route` |
+| fan-out / synthesize | `FanOut` → `StepRef(synthesizer)` | `test_interpreter_fanout_then_aggregate` |
+| generate & filter | `FanOut(generate)` → `StepRef(filter)` | same shape as above |
+| loop until done | `LoopUntil` + `until_capability` | `test_interpreter_loop_until_stops_and_outputs` |
+| adversarial verification | `FanOut(skeptics)` → threshold/filter step | `test_pattern_adversarial_verification` |
+| tournament | `LoopUntil(init=…, body=[pair_maker, FanOut(judge)])` | `test_pattern_tournament_loop_carried` |
 
 ## Live planner sweep (optional evidence)
 
@@ -82,5 +100,18 @@ three shapes:
 1. **Planning vs capability quality are separable** — authoring/structure was
    reliably good; the residual variance was per-capability output quality
    (prompts/schemas/retries), not planning.
+1. **The pattern-coverage sweep surfaced a real vocabulary gap.** The tournament
+   shape (pairs recomputed each round from the prior round's winners) needs
+   **loop-carried state**, which the binding-scope rules statically forbade.
+   Fixed with `LoopUntil.init` + the rule that a body binding to the loop's own
+   id reads the carried value (validation error without `init`). This is why
+   gate tasks should be selected per coordination pattern, not ad hoc — single
+   tasks don't find these gaps.
+1. **Typed bindings make agent independence statically checkable.** The
+   validator now lints same-capability self-review (self-preferential bias)
+   and unsynthesized fan-out; `independence_facts()` derives the positive
+   provenance statements (e.g. *"stage `verifier` sees ONLY stage `reviewer`'s
+   per-item output"*) the frozen record can prove to an auditor. Model-authored
+   orchestration *code* cannot be checked this way.
 
 This is a demand-gate artifact, not production code.

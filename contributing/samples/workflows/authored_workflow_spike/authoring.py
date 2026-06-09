@@ -130,6 +130,12 @@ class LoopUntil(BaseModel):
   until_capability: str
   until_input: Binding
   max_iters: int = Field(ge=1)
+  # Loop-carried state (optional): seeds the value a body step reads when it
+  # binds the loop's OWN id; after each iteration the carried value becomes the
+  # body's last-node output. Surfaced by the pattern-coverage sweep: a
+  # tournament (pairs recomputed each round from the prior round's winners)
+  # is inexpressible without it — every other accumulate-and-refine loop too.
+  init: Optional[Binding] = None
 
 
 # NOTE: a PLAIN union, not Pydantic's Field(discriminator="kind"). The discriminated
@@ -242,7 +248,101 @@ class WorkflowSpecValidator:
       raise SpecValidationError(
           f"output references unknown step {spec.output.step!r}"
       )
-    return self.registry.open_map_warnings()
+    return self.registry.open_map_warnings() + self.quality_lints(spec)
+
+  def quality_lints(self, spec: WorkflowSpec) -> list[str]:
+    """Plan-quality lints (soft warnings, never hard errors).
+
+    Multi-agent quality rests on isolation: it is what mitigates
+    self-preferential bias (an agent grading its own output) and goal drift.
+    Typed bindings make two such properties STATICALLY checkable — something
+    model-authored orchestration *code* cannot offer:
+
+    * self-review: a node consuming output produced by the SAME capability
+      cannot provide independent verification;
+    * unsynthesized fan-out: a plan whose terminal output is a bare per-item
+      fan_out never combined or verified by a downstream capability.
+    """
+    lints: list[str] = []
+    producer_cap: dict[str, str] = {}  # node id -> capability producing output
+    consumed: set[str] = set()  # step ids some other node reads from
+
+    def walk(nodes):
+      for n in nodes:
+        if isinstance(n, (StepRef, FanOut)):
+          producer_cap[n.id] = n.capability
+        elif isinstance(n, Pipeline):
+          producer_cap[n.id] = n.stages[-1].capability if n.stages else ""
+        for b in _bindings(n):
+          if b.source == "step":
+            consumed.add(b.step)
+        if isinstance(n, Pipeline):
+          for prev, st in zip(n.stages, n.stages[1:]):
+            if st.input is not None and st.input.source == "step":
+              consumed.add(st.input.step)
+            if st.capability == prev.capability and st.input is None:
+              lints.append(
+                  f"plan-quality: pipeline {n.id!r} stage"
+                  f" {st.capability!r} re-checks its own capability's output —"
+                  " same-capability review cannot provide independent"
+                  " verification (self-preferential bias)"
+              )
+        if isinstance(n, Branch):
+          for route in n.routes:
+            walk(route.block)
+        if isinstance(n, LoopUntil):
+          walk(n.body)
+
+    walk(spec.steps)
+
+    def walk_consumers(nodes):
+      for n in nodes:
+        my_cap = getattr(n, "capability", None)
+        b = getattr(n, "input", None) or getattr(n, "over", None)
+        if (
+            my_cap
+            and isinstance(b, Binding)
+            and b.source == "step"
+            and producer_cap.get(b.step) == my_cap
+        ):
+          lints.append(
+              f"plan-quality: {n.id!r} consumes the output of {b.step!r} via"
+              f" the same capability {my_cap!r} — same-capability review"
+              " cannot provide independent verification (self-preferential"
+              " bias)"
+          )
+        for route in getattr(n, "routes", None) or []:
+          walk_consumers(route.block)
+        if getattr(n, "body", None):
+          walk_consumers(n.body)
+
+    walk_consumers(spec.steps)
+
+    if spec.output.source == "step":
+      terminal = spec.output.step
+
+      def find(nodes):
+        for n in nodes:
+          if n.id == terminal:
+            return n
+          for route in getattr(n, "routes", None) or []:
+            hit = find(route.block)
+            if hit is not None:
+              return hit
+          if getattr(n, "body", None):
+            hit = find(n.body)
+            if hit is not None:
+              return hit
+        return None
+
+      node_ = find(spec.steps)
+      if isinstance(node_, FanOut) and terminal not in consumed:
+        lints.append(
+            f"plan-quality: output binds directly to fan_out {terminal!r}"
+            " with no downstream synthesis or verification step — parallel"
+            " findings are never combined or independently checked"
+        )
+    return lints
 
   def _walk(self, nodes, preceding: set[str], ids: set[str]) -> set[str]:
     preceding = set(preceding)
@@ -256,8 +356,8 @@ class WorkflowSpecValidator:
         raise SpecValidationError(
             f"unknown until_capability {n.until_capability!r}"
         )
-      # Entry bindings (input/over/on) reference a PRIOR step on this path.
-      for f in ("input", "over", "on"):
+      # Entry bindings (input/over/on/init) reference a PRIOR step on this path.
+      for f in ("input", "over", "on", "init"):
         b = getattr(n, f, None)
         if (
             isinstance(b, Binding)
@@ -294,6 +394,13 @@ class WorkflowSpecValidator:
                 f" {st.input.step!r}"
             )
       if isinstance(n, LoopUntil):
+        # A body step may bind the loop's OWN id to read the loop-carried
+        # value — but only if `init` seeds it (else iteration 0 has nothing).
+        if n.init is None and _references_step(n.body, n.id):
+          raise SpecValidationError(
+              f"loop {n.id}: body reads the loop-carried value (binds the"
+              " loop's own id) but no `init` binding seeds it"
+          )
         # body executes in-scope; until_input may reference a body step.
         body_scope = self._walk(n.body, preceding | {n.id}, ids)
         ui = n.until_input
@@ -311,11 +418,27 @@ class WorkflowSpecValidator:
 
 def _bindings(n) -> list[Binding]:
   out = []
-  for f in ("input", "over", "on", "until_input"):
+  for f in ("input", "over", "on", "until_input", "init"):
     b = getattr(n, f, None)
     if isinstance(b, Binding):
       out.append(b)
+  for st in getattr(n, "stages", None) or []:
+    if isinstance(st.input, Binding):
+      out.append(st.input)
   return out
+
+
+def _references_step(nodes, step_id: str) -> bool:
+  """True if any binding in `nodes` (recursively) reads `step_id`."""
+  for n in nodes:
+    if any(b.source == "step" and b.step == step_id for b in _bindings(n)):
+      return True
+    for route in getattr(n, "routes", None) or []:
+      if _references_step(route.block, step_id):
+        return True
+    if getattr(n, "body", None) and _references_step(n.body, step_id):
+      return True
+  return False
 
 
 # ----------------------------------------------------------- export / import
@@ -357,6 +480,44 @@ def referenced_capabilities(spec: WorkflowSpec) -> set[str]:
 
   walk(spec.steps)
   return found
+
+
+def independence_facts(spec: WorkflowSpec) -> list[str]:
+  """Human-readable provenance facts derivable STATICALLY from the bindings.
+
+  Each fact states what a step can possibly see — its only input is a typed
+  binding, so isolation (no shared context, no inherited reasoning) is a
+  checkable property of the frozen plan, not a runtime hope. This is what
+  makes structural bias controls auditable: the record proves a verifier saw
+  only the producer's output and that synthesis traces back to the task input.
+  """
+  facts: list[str] = []
+
+  def walk(nodes):
+    for n in nodes:
+      if isinstance(n, Pipeline):
+        for prev, st in zip(n.stages, n.stages[1:]):
+          if st.input is None and st.capability != prev.capability:
+            facts.append(
+                f"pipeline {n.id!r}: stage {st.capability!r} sees ONLY stage"
+                f" {prev.capability!r}'s per-item output — independent"
+                " verification, per item"
+            )
+      b = getattr(n, "input", None) or getattr(n, "over", None)
+      if isinstance(b, Binding):
+        src = (
+            "the task input"
+            if b.source == "task"
+            else f"the typed output of {b.step!r}"
+        )
+        facts.append(f"{n.id!r} consumes ONLY {src}")
+      for route in getattr(n, "routes", None) or []:
+        walk(route.block)
+      if getattr(n, "body", None):
+        walk(n.body)
+
+  walk(spec.steps)
+  return facts
 
 
 class ValidationResult(BaseModel):
@@ -603,6 +764,7 @@ class SpecInterpreter:
     self.ctx = ctx
     self.sup = DynamicNodeSupervisor(ctx, gate=gate)
     self.state: dict[str, Any] = {}
+    self.dispatch_count = 0  # capability dispatches — cheap cost visibility
 
   def _resolve(self, binding: Binding, task_input):
     base = task_input if binding.source == "task" else self.state[binding.step]
@@ -616,11 +778,14 @@ class SpecInterpreter:
   def _arg(self, cap: Capability, value):
     return json.dumps(value, default=str) if cap.serialize_input else value
 
-  async def _dispatch(self, cap_name: str, value, run_id: str):
-    cap = self.registry[cap_name]
-    return await self.sup.dispatch(
+  def _dispatch_cap(self, cap: Capability, value, run_id: str):
+    self.dispatch_count += 1
+    return self.sup.dispatch(
         cap.build(), node_input=self._arg(cap, value), run_id=run_id
     )
+
+  async def _dispatch(self, cap_name: str, value, run_id: str):
+    return await self._dispatch_cap(self.registry[cap_name], value, run_id)
 
   async def execute(self, spec: WorkflowSpec, task_input) -> Any:
     await self._run_block(spec.steps, task_input, prefix="")
@@ -645,8 +810,8 @@ class SpecInterpreter:
         self.state[n.id] = await self.sup.pipeline(
             items,
             (
-                lambda _p, it, i, c=cap, rid=rid: self.sup.dispatch(
-                    c.build(), node_input=self._arg(c, it), run_id=f"{rid}_{i}"
+                lambda _p, it, i, c=cap, rid=rid: self._dispatch_cap(
+                    c, it, f"{rid}_{i}"
                 )
             ),
         )
@@ -675,11 +840,7 @@ class SpecInterpreter:
                 if st.input is not None
                 else (it if si == 0 else prev)
             )
-            return self.sup.dispatch(
-                cap.build(),
-                node_input=self._arg(cap, value),
-                run_id=f"{rid}_{i}_{si}",
-            )
+            return self._dispatch_cap(cap, value, f"{rid}_{i}_{si}")
 
           stage_fns.append(stage)
         self.state[n.id] = await self.sup.pipeline(items, *stage_fns)
@@ -696,9 +857,16 @@ class SpecInterpreter:
         )
         self.state[n.id] = out
       elif isinstance(n, LoopUntil):
+        # Loop-carried state: `init` seeds state[loop.id]; after every
+        # iteration the carried value becomes the body's last-node output, so
+        # a body step binding the loop's own id reads the PRIOR round's result
+        # (tournament: pairs recomputed each round from the prior winners).
+        if n.init is not None:
+          self.state[n.id] = self._resolve(n.init, task_input)
         out = None
         for i in range(n.max_iters):
           out = await self._run_block(n.body, task_input, prefix=f"{rid}_i{i}_")
+          self.state[n.id] = out
           verdict = await self._dispatch(
               n.until_capability,
               self._resolve(n.until_input, task_input),
