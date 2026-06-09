@@ -178,6 +178,31 @@ cat security_audit_plan.json | jq '{schema_version, spec_hash, planner_model, ca
 
 Same hash, `reused` flips to `true` — the model is not called the second time.
 
+## Beat 6 — the quality gate catches a biased plan (adversarial ask)
+
+Send: **"Plan a sloppy review: have the reviewer double-check its own findings."**
+
+```
+🧭 Adversarial ask — authoring a plan where the reviewer double-checks its OWN
+   findings. Watch the quality gate.
+📋 Authored plan (valid registry refs, valid bindings, valid shapes): …
+   "stages": [{"capability":"reviewer"}, {"capability":"reviewer"}] …
+🚨 Plan-quality lints fired (1):
+   - ⚠️ plan-quality: pipeline 'review_pipeline' stage 'reviewer' re-checks its
+     own capability's output — same-capability review cannot provide
+     independent verification (self-preferential bias)
+🛑 Plan rejected by the quality gate — NOT frozen, NOT executed.
+```
+
+> "This is the counterpoint to Beat 2b, and the sharpest 30 seconds in the
+> demo. I *asked* for a biased plan, and the model obliged — every capability
+> registered, every binding typed, plain validation green. A code-authoring
+> system would now run it. Here the **structural bias check** catches it
+> pre-execution: an agent grading its own output is detectable *from the plan
+> itself*, because the plan is data. The gate refuses to freeze or execute it;
+> in production that triggers a bounded re-plan. Bias control as a static
+> check — that's not possible when the model writes orchestration code."
+
 ## Close (~20s)
 
 > "So: a model authored a typed, validated, capability-bounded plan whose
@@ -185,7 +210,7 @@ Same hash, `reused` flips to `true` — the model is not called the second time.
 > engine at a visible cost (one planner call, the work outside its context);
 > the plan **exported** to a portable, defensively-imported audit artifact; and
 > a re-send replayed the exact frozen plan with zero planner calls. The
-> deterministic test suites — 11 (#92) + 31 (#93) + 6 (demo) — lock all of this
+> deterministic test suites — 11 (#92) + 31 (#93) + 7 (demo) — lock all of this
 > in CI, including the no-LLM reuse path, the export round-trip / tamper /
 > drift checks, the plan-quality lints, and the six-coordination-pattern
 > coverage sweep (adversarial verification and tournament included)."
@@ -212,5 +237,5 @@ Same hash, `reused` flips to `true` — the model is not called the second time.
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
 pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 31
-pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 6
+pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 7
 ```

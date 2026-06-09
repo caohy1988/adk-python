@@ -47,6 +47,14 @@ Point at the ADK-native evidence as it streams:
 
 (Re-send the same prompt to show resume reuses the frozen spec — same hash, not re-authored.)
 
+Then run the **quality-gate beat** — send:
+
+```text
+Plan a sloppy review: have the reviewer double-check its own findings.
+```
+
+The planner authors a *valid* plan (registered capabilities, typed bindings) whose pipeline is `reviewer → reviewer` — and the **plan-quality lint fires on camera**: `🚨 plan-quality: pipeline 'rev' stage 'reviewer' re-checks its own capability's output — same-capability review cannot provide independent verification (self-preferential bias)`, followed by `🛑 Plan rejected by the quality gate — NOT frozen, NOT executed`. Talking point: *plain validation passes; only the structural bias check catches it — before anything runs, and provably.*
+
 ### Relationship to ADK Workflow config / `root_agent.yaml` (talking point)
 
 The RFC's direction is to **converge with ADK config where it fits** (RFC #93 → "Relationship to ADK Workflow config / `root_agent.yaml`"; DESIGN §11). The linked `loop_config/root_agent.yaml` sample is the right mental model for the **static** portion: a human-authored `agent_class: Workflow` YAML graph with known `edges`, child YAML files, and function refs like `.agent.route_headline`. #93 should be able to lower/export static graph skeletons toward that style, while the model-facing format stays `WorkflowSpec`.
@@ -75,10 +83,10 @@ Proof points: multi-stage `fan_out → step → step`; branch `step → branch`;
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
 pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 31
-pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 6
+pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 7
 ```
 
-- Deterministic suites: #92 **11** + #93 **31** + demo **6** = **48** (incl. a no-LLM reuse-path test, the six-pattern coverage sweep — adversarial verification + tournament via loop-carried `init` — and the plan-quality lints).
+- Deterministic suites: #92 **11** + #93 **31** + demo **7** = **49** (incl. a no-LLM reuse-path test, the six-pattern coverage sweep — adversarial verification + tournament via loop-carried `init` — and the plan-quality lints).
 - PR #3 CI green except the documented fork-only `agent-triage` token job.
 
 ## Recording notes

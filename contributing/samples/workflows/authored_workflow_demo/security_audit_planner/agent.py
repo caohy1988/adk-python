@@ -201,6 +201,27 @@ _PLANNER_INSTR = (
 )
 
 
+# The QUALITY-GATE beat: a deliberately biased ask — the reviewer
+# double-checking its OWN findings. Registry/bindings/shapes are all valid, so
+# plain validation passes; only the plan-quality lints catch the structural
+# self-review bias, and the demo rejects the plan before freezing or running.
+_SLOPPY_TRIGGERS = ("sloppy", "self-review", "own findings", "double-check")
+_SLOPPY_PLANNER_INSTR = (
+    "Author a WorkflowSpec using ONLY these capabilities: "
+    + _REGISTRY_DESC
+    + " The task input has a 'files' list of objects with path and code."
+    " Author, in order:"
+    " (1) a pipeline over task.files with two stages, reviewer then reviewer"
+    " AGAIN — the reviewer double-checks its own findings per item;"
+    " (2) a step running triager on the pipeline output;"
+    " (3) a step running formatter on the report."
+    " Use Binding(source='task', path='files') for the pipeline's over, and"
+    " Binding(source='step', step=<id>) to chain steps. A pipeline stage takes"
+    " its input from the previous stage automatically, so stages need no input"
+    " binding. Set output to the formatter step."
+)
+
+
 def _msg(text: str) -> Event:
   return Event(
       content=types.Content(role="model", parts=[types.Part(text=text)])
@@ -220,6 +241,53 @@ _EXPORT_PATH = os.path.join(os.getcwd(), "security_audit_plan.json")
 @node(rerun_on_resume=True)
 async def author_validate_execute(ctx: Context, node_input):
   reg = _registry()
+
+  # 0. QUALITY-GATE path (checked before load-or-author so it works in any
+  # session): an adversarial ask makes the planner author a structurally
+  # biased plan; the lints catch it and the gate rejects it pre-execution.
+  if any(k in str(node_input or "").lower() for k in _SLOPPY_TRIGGERS):
+    yield _msg(
+        "🧭 **Adversarial ask** — authoring a plan where the reviewer"
+        " double-checks its OWN findings. Watch the quality gate."
+    )
+    sloppy = Agent(
+        name="planner",
+        model=MODEL,
+        output_schema=WorkflowSpec,
+        generate_content_config=DET,
+        instruction=_SLOPPY_PLANNER_INSTR,
+    )
+    raw = await ctx.run_node(
+        sloppy,
+        node_input=f"Audit these files: {[f['path'] for f in FILES]}.",
+        run_id="plan_sloppy",
+    )
+    spec = WorkflowSpec.model_validate(raw)
+    yield _msg(
+        "📋 **Authored plan** (valid registry refs, valid bindings, valid"
+        f" shapes):\n```json\n{json.dumps(spec.model_dump(), indent=1)}\n```"
+    )
+    lints = [
+        w
+        for w in WorkflowSpecValidator(reg).validate(spec)
+        if w.startswith("plan-quality")
+    ]
+    if lints:
+      fired = "\n".join(f"   - ⚠️ {w}" for w in lints)
+      yield _msg(
+          f"🚨 **Plan-quality lints fired ({len(lints)}):**\n{fired}\n\n🛑"
+          " **Plan rejected by the quality gate** — NOT frozen, NOT executed."
+          " Plain validation passed (every capability is registered, every"
+          " binding is typed); only the structural bias check caught it. In"
+          " production this triggers a bounded re-plan (`max_replans`)."
+      )
+    else:
+      yield _msg(
+          "ℹ️ The planner did not author the biased shape this time —"
+          " re-send the prompt to retry the adversarial ask."
+      )
+    yield Event(output={"rejected": bool(lints), "lints": len(lints)})
+    return
 
   # 1. LOAD-OR-AUTHOR. If a frozen spec exists in this session, REUSE it (do not
   # re-author) — this is the resume/reproducibility claim. Otherwise the model

@@ -99,6 +99,43 @@ def test_demo_spec_validates():
   WorkflowSpecValidator(demo._registry()).validate(_demo_spec())  # no raise
 
 
+def test_quality_gate_rejects_self_review_plan():
+  # The adversarial-ask beat: reviewer double-checking its OWN findings is a
+  # VALID plan (registry, bindings, shapes) — only the plan-quality lint
+  # catches the structural bias. This pins the shape the live beat relies on.
+  sloppy = WorkflowSpec(
+      goal="audit",
+      steps=[
+          Pipeline(
+              kind="pipeline",
+              id="rev",
+              over=Binding(source="task", path="files"),
+              stages=[
+                  PipelineStage(capability="reviewer"),
+                  PipelineStage(capability="reviewer"),  # self-review
+              ],
+          ),
+          StepRef(
+              kind="step",
+              id="tri",
+              capability="triager",
+              input=Binding(source="step", step="rev"),
+          ),
+          StepRef(
+              kind="step",
+              id="fmt",
+              capability="formatter",
+              input=Binding(source="step", step="tri"),
+          ),
+      ],
+      output=Binding(source="step", step="fmt"),
+  )
+  warnings = WorkflowSpecValidator(demo._registry()).validate(sloppy)
+  lints = [w for w in warnings if w.startswith("plan-quality")]
+  assert len(lints) == 1
+  assert "re-checks its own capability's output" in lints[0]
+
+
 def test_demo_spec_quality_lints_clean_and_independent():
   # Zero plan-quality lints: verification is by a DIFFERENT capability
   # (reviewer -> verifier), and the fan-out is synthesized (triager).
