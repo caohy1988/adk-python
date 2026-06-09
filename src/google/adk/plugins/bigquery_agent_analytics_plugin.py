@@ -1974,6 +1974,46 @@ _EVENT_VIEW_DEFS: dict[str, list[str]] = {
             " '$.source_event_branch') AS source_event_branch"
         ),
     ],
+    "AGENT_TRANSFER": [
+        "JSON_VALUE(content, '$.from_agent') AS from_agent",
+        "JSON_VALUE(content, '$.to_agent') AS to_agent",
+        "JSON_VALUE(attributes, '$.adk.source_event_id') AS source_event_id",
+    ],
+    "EVENT_COMPACTION": [
+        (
+            "CAST(JSON_VALUE(content,"
+            " '$.start_timestamp') AS FLOAT64) AS start_seconds"
+        ),
+        (
+            "CAST(JSON_VALUE(content,"
+            " '$.end_timestamp') AS FLOAT64) AS end_seconds"
+        ),
+        (
+            "TIMESTAMP_MICROS(CAST(CAST(JSON_VALUE(content,"
+            " '$.start_timestamp') AS FLOAT64) * 1000000 AS INT64))"
+            " AS window_start"
+        ),
+        (
+            "TIMESTAMP_MICROS(CAST(CAST(JSON_VALUE(content,"
+            " '$.end_timestamp') AS FLOAT64) * 1000000 AS INT64))"
+            " AS window_end"
+        ),
+        "JSON_QUERY(content, '$.compacted_content') AS compacted_content",
+    ],
+    "AGENT_STATE_CHECKPOINT": [
+        "JSON_QUERY(content, '$.agent_state') AS agent_state",
+        (
+            "SAFE_CAST(JSON_VALUE(content,"
+            " '$.end_of_agent') AS BOOL) AS end_of_agent"
+        ),
+        "JSON_VALUE(attributes, '$.adk.source_event_id') AS source_event_id",
+    ],
+    "TOOL_PAUSED": [
+        "JSON_VALUE(content, '$.tool') AS tool_name",
+        "JSON_QUERY(content, '$.args') AS tool_args",
+        "JSON_VALUE(attributes, '$.adk.pause_kind') AS pause_kind",
+        "JSON_VALUE(attributes, '$.adk.function_call_id') AS function_call_id",
+    ],
 }
 
 _VIEW_SQL_TEMPLATE = """\
@@ -3152,6 +3192,13 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           # message is the resume side of a previously-paused tool.
           # Stamp the pair keys; pause_orphan / registry semantics
           # are intentionally deferred.
+          if not part.function_response.id:
+            logger.debug(
+                "User-message function_response for tool %s has no id;"
+                " the resulting TOOL_COMPLETED row cannot pair with a"
+                " TOOL_PAUSED row.",
+                part.function_response.name,
+            )
           await self._log_event(
               "TOOL_COMPLETED",
               callback_ctx,
@@ -3284,6 +3331,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # Use getattr so the existing Mock-based HITL test fixtures still
     # work — they construct events without setting long_running_tool_ids.
     long_running_ids = set(getattr(event, "long_running_tool_ids", None) or ())
+    paused_ids_emitted: set[str] = set()
     if event.content and event.content.parts:
       for part in event.content.parts:
         # Detect HITL function calls (request events).
@@ -3309,6 +3357,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           # function_call NAME — looking it up against the id value
           # would misclassify every HITL pause as 'tool'.
           if part.function_call.id in long_running_ids:
+            paused_ids_emitted.add(part.function_call.id)
             pause_kind = _HITL_PAUSE_KIND_MAP.get(
                 part.function_call.name, "tool"
             )
@@ -3353,6 +3402,30 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
                 is_truncated=is_truncated,
                 event_data=EventData(source_event=event),
             )
+
+    # Fallback: a long_running_tool_id with no matching function_call
+    # part (possible after after_model_callback content rewrites) still
+    # gets a pairable TOOL_PAUSED row. Without the name we cannot derive
+    # an HITL pause_kind, so default to 'tool' and warn.
+    for orphan_pause_id in long_running_ids - paused_ids_emitted:
+      logger.warning(
+          "long_running_tool_id %s has no matching function_call part in"
+          " event %s; emitting TOOL_PAUSED with pause_kind='tool'.",
+          orphan_pause_id,
+          getattr(event, "id", None),
+      )
+      await self._log_event(
+          "TOOL_PAUSED",
+          callback_ctx,
+          raw_content={"tool": None, "args": None},
+          event_data=EventData(
+              source_event=event,
+              adk_extras={
+                  "pause_kind": "tool",
+                  "function_call_id": orphan_pause_id,
+              },
+          ),
+      )
 
     # --- A2A interaction logging ---
     # RemoteA2aAgent attaches cross-reference metadata to events:

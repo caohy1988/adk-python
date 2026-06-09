@@ -7874,8 +7874,13 @@ class TestAgentResponseLogging:
       bq_plugin_inst,
       mock_write_client,
       invocation_context,
+      dummy_arrow_schema,
   ):
-    """Long-running tool events are not logged as AGENT_RESPONSE."""
+    """Long-running tool events are not logged as AGENT_RESPONSE.
+
+    They DO emit TOOL_PAUSED — here via the unmatched-id fallback, since
+    the function_call part has no id matching the long_running_tool_id.
+    """
     fc = types.FunctionCall(name="long_tool", args={})
     event = event_lib.Event(
         author="agent",
@@ -7883,11 +7888,16 @@ class TestAgentResponseLogging:
         long_running_tool_ids={"call-1"},
     )
 
+    bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
     await bq_plugin_inst.on_event_callback(
         invocation_context=invocation_context, event=event
     )
     await asyncio.sleep(0.05)
-    assert mock_write_client.append_rows.call_count == 0
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    types_emitted = [r["event_type"] for r in rows]
+    assert "AGENT_RESPONSE" not in types_emitted
+    # The pause is still observable via the fallback TOOL_PAUSED row.
+    assert types_emitted == ["TOOL_PAUSED"]
 
   @pytest.mark.asyncio
   async def test_skips_thought_only_events(
@@ -8475,3 +8485,101 @@ class TestC8ActionAttributes:
     assert adk["rewind_before_invocation_id"] == "inv-earlier"
     # Not nested under .actions.
     assert "actions" not in adk
+
+
+class TestViewDefsRegistration:
+  """The plugin's own per-event-type view defs cover the new types."""
+
+  def test_new_event_types_registered_in_view_defs(self):
+    defs = bigquery_agent_analytics_plugin._EVENT_VIEW_DEFS
+    for event_type in (
+        "AGENT_TRANSFER",
+        "EVENT_COMPACTION",
+        "AGENT_STATE_CHECKPOINT",
+        "TOOL_PAUSED",
+    ):
+      assert event_type in defs, f"{event_type} missing from _EVENT_VIEW_DEFS"
+      assert isinstance(defs[event_type], list)
+
+  def test_tool_paused_view_extracts_pair_keys(self):
+    cols = "\n".join(
+        bigquery_agent_analytics_plugin._EVENT_VIEW_DEFS["TOOL_PAUSED"]
+    )
+    assert "$.adk.pause_kind" in cols
+    assert "$.adk.function_call_id" in cols
+
+  def test_compaction_view_preserves_float_and_widens(self):
+    cols = "\n".join(
+        bigquery_agent_analytics_plugin._EVENT_VIEW_DEFS["EVENT_COMPACTION"]
+    )
+    # Float passthrough for diagnostics + TIMESTAMP_MICROS widening
+    # (TIMESTAMP_SECONDS would truncate fractional windows).
+    assert "AS FLOAT64) AS start_seconds" in cols
+    assert "TIMESTAMP_MICROS" in cols
+    assert "TIMESTAMP_SECONDS" not in cols
+
+
+class TestUnmatchedLongRunningIdFallback:
+
+  @pytest.mark.asyncio
+  async def test_unmatched_long_running_id_emits_tool_paused(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+      caplog,
+  ):
+    """A long_running_tool_id with no matching function_call part still
+    emits a pairable TOOL_PAUSED row with pause_kind='tool' + warning."""
+    event = event_lib.Event(
+        author="agent",
+        content=types.Content(
+            role="model", parts=[types.Part(text="thinking...")]
+        ),
+        long_running_tool_ids={"orphan-pause-1"},
+        actions=event_actions_lib.EventActions(),
+    )
+    bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+    with caplog.at_level("WARNING"):
+      await bq_plugin_inst.on_event_callback(
+          invocation_context=invocation_context, event=event
+      )
+    await asyncio.sleep(0.01)
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    pauses = [r for r in rows if r["event_type"] == "TOOL_PAUSED"]
+    assert len(pauses) == 1
+    adk = json.loads(pauses[0]["attributes"])["adk"]
+    assert adk["pause_kind"] == "tool"
+    assert adk["function_call_id"] == "orphan-pause-1"
+    assert any(
+        "no matching function_call part" in rec.message
+        for rec in caplog.records
+    )
+
+  @pytest.mark.asyncio
+  async def test_matched_id_not_double_emitted_by_fallback(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """An id with a matching part emits exactly one TOOL_PAUSED row."""
+    fc = types.FunctionCall(id="call-1", name="long_search", args={})
+    event = event_lib.Event(
+        author="agent",
+        content=types.Content(
+            role="model", parts=[types.Part(function_call=fc)]
+        ),
+        long_running_tool_ids={"call-1"},
+        actions=event_actions_lib.EventActions(),
+    )
+    bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=invocation_context, event=event
+    )
+    await asyncio.sleep(0.01)
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    pauses = [r for r in rows if r["event_type"] == "TOOL_PAUSED"]
+    assert len(pauses) == 1
