@@ -8518,6 +8518,25 @@ class TestViewDefsRegistration:
     assert "TIMESTAMP_MICROS" in cols
     assert "TIMESTAMP_SECONDS" not in cols
 
+  def test_tool_completed_view_exposes_pair_keys(self):
+    """v_tool_completed can do the pause/completion join end-to-end."""
+    cols = "\n".join(
+        bigquery_agent_analytics_plugin._EVENT_VIEW_DEFS["TOOL_COMPLETED"]
+    )
+    assert "$.adk.pause_kind" in cols
+    assert "$.adk.function_call_id" in cols
+
+  def test_checkpoint_view_exposes_agent_state_type(self):
+    """v_agent_state_checkpoint discriminates explicit JSON null from
+    object-valued agent_state via JSON_TYPE(JSON_QUERY(...))."""
+    cols = "\n".join(
+        bigquery_agent_analytics_plugin._EVENT_VIEW_DEFS[
+            "AGENT_STATE_CHECKPOINT"
+        ]
+    )
+    assert "JSON_TYPE(JSON_QUERY(content," in cols
+    assert "AS agent_state_type" in cols
+
 
 class TestUnmatchedLongRunningIdFallback:
 

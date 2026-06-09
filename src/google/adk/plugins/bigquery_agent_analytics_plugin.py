@@ -1913,6 +1913,11 @@ _EVENT_VIEW_DEFS: dict[str, list[str]] = {
         "JSON_QUERY(content, '$.result') AS tool_result",
         "JSON_VALUE(content, '$.tool_origin') AS tool_origin",
         "CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64) AS total_ms",
+        # Long-running pair keys: null for ordinary completions,
+        # populated on the user-message resume path so typed views can
+        # do the TOOL_PAUSED ↔ TOOL_COMPLETED join end-to-end.
+        "JSON_VALUE(attributes, '$.adk.pause_kind') AS pause_kind",
+        "JSON_VALUE(attributes, '$.adk.function_call_id') AS function_call_id",
     ],
     "TOOL_ERROR": [
         "JSON_VALUE(content, '$.tool') AS tool_name",
@@ -2002,6 +2007,12 @@ _EVENT_VIEW_DEFS: dict[str, list[str]] = {
     ],
     "AGENT_STATE_CHECKPOINT": [
         "JSON_QUERY(content, '$.agent_state') AS agent_state",
+        # Presence discriminator. JSON_QUERY on an explicit JSON null
+        # returns JSON null (not SQL NULL), so consumers must check
+        # JSON_TYPE: SQL NULL = key absent, 'null' = explicit JSON
+        # null (the {agent_state: null, end_of_agent: true} shape),
+        # anything else = a real state object.
+        "JSON_TYPE(JSON_QUERY(content, '$.agent_state')) AS agent_state_type",
         (
             "SAFE_CAST(JSON_VALUE(content,"
             " '$.end_of_agent') AS BOOL) AS end_of_agent"
