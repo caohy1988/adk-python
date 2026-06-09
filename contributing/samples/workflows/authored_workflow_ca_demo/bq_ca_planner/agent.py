@@ -360,17 +360,23 @@ def _flaky_dry_run(s):
 
 # ------------------------------------------------- scenarios
 _CAPS_BLURB = (
-    "nl2sql (item: {question} -> Sql), draft_or_repair_sql (item: {question,"
-    " sql?, error?} -> Sql), summarize_insight (item: rows/stats JSON ->"
-    " Insight), classify_question (item: {question} -> Category with"
-    " category 'data'|'schema'), skeptic (item: one insight -> Verdict),"
-    " dry_run (item: Sql -> {sql, valid, error}), flaky_dry_run (same, may"
-    " fail transiently), sql_ok (item: dry-run output -> bool), run_query"
-    " (item: validated sql -> {rows}), profile_table (item: table name ->"
-    " stats), quality_report (LIST of stats -> report), describe_schema"
-    " (item: {question} -> {answer}), keep_verified (LIST of Verdicts ->"
-    " {verified, rejected}), pair_charts (LIST -> list of pairs),"
-    " judge_chart (item: pair -> winner), single_chart (LIST -> bool)."
+    # NOTE: instruction strings must stay BRACE-FREE — ADK templates
+    # "<curly>identifier<curly>" in instructions as session-state injection
+    # and raises KeyError on unknown variables.
+    "nl2sql (item: a question object -> Sql with field sql),"
+    " draft_or_repair_sql (item: a question plus optional prior sql and"
+    " error -> Sql), summarize_insight (item: rows or stats JSON -> Insight"
+    " with field insight), classify_question (item: a question -> Category"
+    " with field category equal to 'data' or 'schema'), skeptic (item: one"
+    " insight -> Verdict with fields insight and refuted), dry_run (item:"
+    " Sql -> object with sql, valid, error), flaky_dry_run (same as dry_run"
+    " but may fail transiently), sql_ok (item: dry-run output -> bool),"
+    " run_query (item: validated sql -> object with rows), profile_table"
+    " (item: a table name -> stats object), quality_report (LIST of stats"
+    " -> report object), describe_schema (item: a question -> object with"
+    " answer), keep_verified (LIST of Verdicts -> object with verified and"
+    " rejected), pair_charts (LIST -> list of pairs), judge_chart (item: a"
+    " pair -> the winner), single_chart (LIST -> bool)."
 )
 
 _BINDING_RULES = (
@@ -503,10 +509,12 @@ def _scenario_for(text: str) -> str:
 
 
 def _planner_instruction(sc) -> str:
+  keys = ", ".join(f"'{k}'" for k in sc["task"])
   return (
       "Author a WorkflowSpec using ONLY these capabilities: "
       + _CAPS_BLURB
-      + f" Task input: {json.dumps(sc['task'])}. "
+      + " The task input JSON arrives as your input message; its keys:"
+      f" {keys}. "
       + sc["recipe"]
       + _BINDING_RULES
   )
