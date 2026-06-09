@@ -830,6 +830,38 @@ def test_lint_waiver_suppresses_and_is_recorded():
   assert export_plan(rec)["lint_waivers"] == waivers
 
 
+def test_import_rejects_missing_contract_hashes():
+  # Review finding (High): stripping capability_contract_hashes from the
+  # envelope must NOT bypass drift detection. Exact reproduction: export,
+  # delete the field, change a capability's output schema without bumping
+  # the manual version — import must fail closed on the missing hashes.
+  env = export_plan(_frozen())
+  del env["capability_contract_hashes"]
+
+  class NewCountReport(BaseModel):
+    n: int
+
+  changed = _registry()
+  changed["count"].output_model = NewCountReport  # version string unchanged
+  with pytest.raises(PlanImportError, match="missing contract hashes"):
+    import_plan(env, changed, task_input=_TASK)
+  # fail closed even with NO drift at all — the field itself is required:
+  env2 = export_plan(_frozen())
+  del env2["capability_contract_hashes"]
+  with pytest.raises(PlanImportError, match="missing contract hashes"):
+    import_plan(env2, _registry(), task_input=_TASK)
+
+
+def test_import_rejects_partial_contract_hashes():
+  # Dropping a SINGLE capability's hash must fail closed too.
+  env = export_plan(_frozen())
+  del env["capability_contract_hashes"]["count"]
+  with pytest.raises(
+      PlanImportError, match=r"missing contract hashes for \['count'\]"
+  ):
+    import_plan(env, _registry(), task_input=_TASK)
+
+
 def test_import_rejects_contract_hash_drift():
   # The DERIVED drift signal: change a capability's declared contract (here,
   # its output schema) WITHOUT bumping the manual version — manual-version

@@ -208,7 +208,7 @@ Fully additive. New `authoring/` package + `AuthoredWorkflowAgent`; no change to
 1. **Planner quality vs capability quality are separable** — authoring/structure was reliably good; the residual variance was per-capability output quality (prompts/schemas/retries), proven via an intermediate-output diff (authored vs baseline findings were semantically identical). The strict `unmatched=fail` branch contract also caught a bad field-binding loudly instead of mis-routing.
 1. **The pattern-coverage sweep surfaced a real vocabulary gap** — the tournament shape (pairs recomputed per round from the prior round's winners) is inexpressible without **loop-carried state**: a body step must read the previous iteration's output, which the binding-scope rules statically forbid. Fixed with `LoopUntil.init` (seed binding) + the rule that a body binding to the loop's own id reads the carried value. Pattern-driven gate-task selection finds these gaps; single ad-hoc tasks don't.
 
-Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (31 deterministic tests + env-gated live sweep) and `authored_workflow_demo/` (ADK Web `root_agent` + 6 CI-safe tests incl. the no-LLM reuse path), in `caohy1988/adk-python` PR #3.
+Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (36 deterministic tests + env-gated live sweep) and `authored_workflow_demo/` (ADK Web `root_agent` + 8 CI-safe tests incl. the no-LLM reuse path), in `caohy1988/adk-python` PR #3.
 
 ## 10. Plan export & storage — the frozen spec as a durable artifact
 
@@ -250,7 +250,9 @@ Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (31 deter
     #   3. registry/capability drift -> fail loudly (or explicit migration);
     #      capability drift = manual version (secondary) AND derived contract
     #      hash sha256(input_kind + output schema) (primary — catches schema
-    #      changes nobody versioned)
+    #      changes nobody versioned). FAIL CLOSED: a v1 envelope must carry a
+    #      contract hash for EVERY referenced capability — a stripped field or
+    #      entry is a hard import error, never a silent bypass.
     # EXECUTION-INPUT:
     #   replay   : task_input digest must match envelope["task_input_digest"] (else audit-only)
     #   template : task_input validated against envelope["task_input_schema"] before execution
@@ -258,6 +260,8 @@ Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (31 deter
   ```
 
 - **v2 (optional) — promote an exported plan to a reusable template.** A human approves a spec and saves it as a template. **On import, ADK MUST re-validate against the *current* registry**; registry/capability drift **fails loudly or requires explicit migration** — never a silent run against a changed capability set. (The envelope's `registry_version` / `capability_versions` are what make drift detectable.)
+
+- **Deferred — envelope-level integrity beyond `spec_hash`.** `spec_hash` protects the *plan*; envelope metadata (`task_input_schema`, `created_at`, …) is re-checked against the current registry where possible but not integrity-protected — a tampered `task_input_schema` could turn a replay-only plan into a template. Production v1.1 should sign or hash the full serialized record.
 
 - **Deferred — compiled `Workflow`/graph (or generated Python) as the source of truth.** The compiled `Workflow` is regenerated from the spec on demand; it is **not** stored as canonical, because compiler behavior and ADK internals evolve. Persisting generated code or a compiled graph is explicitly out of scope.
 

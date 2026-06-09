@@ -727,14 +727,25 @@ def import_plan(
 
   # 3c. per-capability CONTRACT drift (primary, derived signal): catches a
   # changed input_kind / output schema even when nobody bumped a version.
+  # FAIL CLOSED: a v1 envelope MUST record a contract hash for every
+  # referenced capability — otherwise stripping the field (or one entry)
+  # from the envelope would silently bypass drift detection.
   current_ch = registry.capability_contract_hashes(
       only=referenced_capabilities(spec)
   )
   recorded_ch = envelope.get("capability_contract_hashes") or {}
+  missing_ch = sorted(n for n in current_ch if n not in recorded_ch)
+  if missing_ch:
+    raise PlanImportError(
+        f"envelope is missing contract hashes for {missing_ch} — a v1"
+        " envelope must record a contract hash for every referenced"
+        " capability (fail closed: a stripped field must not bypass drift"
+        " detection)"
+    )
   contract_drift = {
       n: (recorded_ch[n], current_ch[n])
       for n in current_ch
-      if n in recorded_ch and recorded_ch[n] != current_ch[n]
+      if recorded_ch[n] != current_ch[n]
   }
   if contract_drift:
     raise PlanImportError(

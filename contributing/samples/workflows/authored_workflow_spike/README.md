@@ -26,7 +26,7 @@ behind the RFC's "can a model author good plans?" question.
 pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q
 ```
 
-Expected: **34 passed** — `Binding` invariant, `max_iters>=1`, validator accepts a
+Expected: **36 passed** — `Binding` invariant, `max_iters>=1`, validator accepts a
 valid spec and rejects unknown capability / non-preceding binding / duplicate id,
 the open-map warning, and interpreter execution of fan_out→aggregate, **pipeline (barrier-free per-item review→verify, plus per-stage `max_fan_out` enforcement)**, branch
 (correct route), and loop_until (stops + correct output); plus **plan export/import**
@@ -41,7 +41,8 @@ no-`init` validation error) and **plan-quality lints** (same-capability
 self-review and unsynthesized fan-out warn; an independent plan lints clean;
 `allow_self_chain` policy and recorded per-plan waivers suppress auditably);
 plus **contract-hash drift** (import rejects a changed capability schema even
-when the manual version string was never bumped).
+when the manual version string was never bumped, and **fails closed** when the
+envelope's contract hashes are stripped entirely or partially).
 
 ## Pattern coverage — the six coordination shapes
 

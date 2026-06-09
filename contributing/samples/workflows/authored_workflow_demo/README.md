@@ -90,11 +90,11 @@ Proof points: multi-stage `fan_out → step → step`; branch `step → branch`;
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 34
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 36
 pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 8
 ```
 
-- Deterministic suites: #92 **11** + #93 **34** + demo **8** = **53** (incl. a no-LLM reuse-path test, the six-pattern coverage sweep — adversarial verification + tournament via loop-carried `init` — the plan-quality lints with `allow_self_chain` policy + recorded waivers, contract-hash drift rejection, and the recipe-free free-authoring instruction pin).
+- Deterministic suites: #92 **11** + #93 **36** + demo **8** = **55** (incl. a no-LLM reuse-path test, the six-pattern coverage sweep — adversarial verification + tournament via loop-carried `init` — the plan-quality lints with `allow_self_chain` policy + recorded waivers, contract-hash drift rejection (fail-closed on stripped hashes), and the recipe-free free-authoring instruction pin).
 - PR #3 CI green except the documented fork-only `agent-triage` token job.
 
 ## Recording notes

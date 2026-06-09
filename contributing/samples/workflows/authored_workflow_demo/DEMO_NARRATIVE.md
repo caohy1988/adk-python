@@ -227,7 +227,7 @@ Send: **"Plan a sloppy review: have the reviewer double-check its own findings."
 > engine at a visible cost (one planner call, the work outside its context);
 > the plan **exported** to a portable, defensively-imported audit artifact; and
 > a re-send replayed the exact frozen plan with zero planner calls. The
-> deterministic test suites — 11 (#92) + 34 (#93) + 8 (demo) — lock all of this
+> deterministic test suites — 11 (#92) + 36 (#93) + 8 (demo) — lock all of this
 > in CI, including the no-LLM reuse path, the export round-trip / tamper /
 > drift checks, the plan-quality lints, and the six-coordination-pattern
 > coverage sweep (adversarial verification and tournament included)."
@@ -253,6 +253,6 @@ Send: **"Plan a sloppy review: have the reviewer double-check its own findings."
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 34
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 36
 pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 8
 ```
