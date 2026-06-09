@@ -35,6 +35,7 @@ import datetime
 import json
 import os
 import sys
+import time
 from typing import Literal
 
 from google.adk import Agent
@@ -61,6 +62,7 @@ from authoring import CapabilityRegistry  # noqa: E402
 from authoring import export_plan  # noqa: E402
 from authoring import FrozenWorkflowRecord  # noqa: E402
 from authoring import import_plan  # noqa: E402
+from authoring import independence_facts  # noqa: E402
 from authoring import lower_to_agent_config  # noqa: E402
 from authoring import sha256_hex  # noqa: E402
 from authoring import SpecInterpreter  # noqa: E402
@@ -276,6 +278,19 @@ async def author_validate_execute(ctx: Context, node_input):
       + (f"\n⚠️ warnings: {warnings}" if warnings else "")
   )
 
+  # 2b. INDEPENDENCE — the quality argument, made static. Isolation is what
+  # mitigates self-preferential bias and goal drift in multi-agent work; with
+  # typed bindings it is a checkable property of the frozen plan (the validator
+  # lints same-capability self-review and unsynthesized fan-out), not a runtime
+  # hope. Model-authored orchestration *code* cannot be checked this way.
+  lints = [w for w in warnings if w.startswith("plan-quality")]
+  facts = "\n".join(f"   - {f}" for f in independence_facts(spec))
+  yield _msg(
+      f"🧪 **Plan-quality lints: {len(lints)} warnings.** Agent independence"
+      " is statically checkable from the typed bindings — the frozen record"
+      f" *proves* it to an auditor:\n{facts}"
+  )
+
   # 3. FREEZE — persist spec + hash to session state on first author only
   # (visible in the State tab; reused runs already have it).
   # NOTE: session state keeps a minimal {spec, hash} subset so the State tab
@@ -336,10 +351,24 @@ async def author_validate_execute(ctx: Context, node_input):
     )
 
   # 4. EXECUTE — run the validated plan on the real ADK engine (#92 supervisor).
-  result = await SpecInterpreter(reg, ctx).execute(spec, {"files": FILES})
+  t0 = time.perf_counter()
+  interp = SpecInterpreter(reg, ctx)
+  result = await interp.execute(spec, {"files": FILES})
+  elapsed = time.perf_counter() - t0
   yield _msg(
       "📄 **Audit result:**"
       f" {result.get('note') if isinstance(result, dict) else result}"
+  )
+  # 4b. COST — cheap visibility into what the orchestration spent. The planner
+  # was invoked at most once (zero on frozen replay); every capability dispatch
+  # ran OUTSIDE the planner's context.
+  planner_cost = (
+      "0 planner calls (frozen replay)" if reused else "1 planner call"
+  )
+  yield _msg(
+      f"📊 **Cost:** {interp.dispatch_count} capability dispatches in"
+      f" {elapsed:.1f}s + {planner_cost} — per-step work runs outside the"
+      " planner's context."
   )
   yield Event(
       output={
@@ -347,6 +376,7 @@ async def author_validate_execute(ctx: Context, node_input):
           "result": result,
           "capabilities": caps,
           "reused": reused,
+          "dispatches": interp.dispatch_count,
       }
   )
 

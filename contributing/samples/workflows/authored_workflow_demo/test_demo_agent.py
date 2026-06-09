@@ -99,6 +99,22 @@ def test_demo_spec_validates():
   WorkflowSpecValidator(demo._registry()).validate(_demo_spec())  # no raise
 
 
+def test_demo_spec_quality_lints_clean_and_independent():
+  # Zero plan-quality lints: verification is by a DIFFERENT capability
+  # (reviewer -> verifier), and the fan-out is synthesized (triager).
+  warnings = WorkflowSpecValidator(demo._registry()).validate(_demo_spec())
+  assert [w for w in warnings if w.startswith("plan-quality")] == []
+  # The independence facts the demo shows on camera are derivable statically:
+  # the verifier stage provably sees only the reviewer's per-item output, and
+  # each downstream step provably consumes only its upstream's typed output.
+  from authoring import independence_facts  # noqa: E402
+
+  facts = "\n".join(independence_facts(_demo_spec()))
+  assert "stage 'verifier' sees ONLY stage 'reviewer'" in facts
+  assert "'tri' consumes ONLY the typed output of 'rev'" in facts
+  assert "'fmt' consumes ONLY the typed output of 'tri'" in facts
+
+
 def test_demo_spec_agentconfig_lowering():
   # The demo's plan (pipeline -> step -> step) is exactly the static/dynamic
   # split RFC #93 §11 describes: the two trailing steps lower to LlmAgent under
@@ -216,3 +232,5 @@ async def test_reuse_path_no_llm(monkeypatch):
       "formatter",
   }
   assert out["result"]["note"].startswith("audited")
+  # cost visibility: 4 files x 2 pipeline stages + triager + formatter = 10.
+  assert out["dispatches"] == 10

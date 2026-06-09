@@ -53,6 +53,29 @@ Send: **"Plan and run a codebase security review."** The chat streams:
 > model can only compose pre-approved capabilities — no arbitrary calls, no code
 > execution. That's the security model: capability allow-listing, not a sandbox."
 
+## Beat 2b — independence lints (the quality argument, made static)
+
+```
+🧪 Plan-quality lints: 0 warnings. Agent independence is statically checkable
+   from the typed bindings — the frozen record *proves* it to an auditor:
+   - pipeline 'review_pipeline': stage 'verifier' sees ONLY stage 'reviewer''s
+     per-item output — independent verification, per item
+   - 'review_pipeline' consumes ONLY the task input
+   - 'triage_step' consumes ONLY the typed output of 'review_pipeline'
+   - 'format_step' consumes ONLY the typed output of 'triage_step'
+```
+
+> "This is the multi-agent quality argument, made structural. Isolation is what
+> mitigates the documented single-agent failure modes — an agent grading its own
+> output (self-preferential bias) and requirements decaying through layers of
+> summarization (goal drift). Because every step's only input is a typed
+> binding, those properties are **statically checkable**: the validator warns
+> if a plan has a step reviewing its own capability's output, or a fan-out
+> that's never synthesized. Here it's clean — and the frozen record *proves*
+> the verifier saw only the reviewer's output. You can't prove that about
+> model-written orchestration code; you can about a typed plan. For a regulated
+> audience, that's the sharpest line in the demo."
+
 ## Beat 3 — freeze (State tab)
 
 ```
@@ -119,6 +142,8 @@ cat security_audit_plan.json | jq '{schema_version, spec_hash, planner_model, ca
 ```
 📄 Audit result: Identified 4 vulnerabilities: 1 critical (command injection),
    2 high (hardcoded credentials and SQL injection), and 1 medium (division by zero).
+📊 Cost: 10 capability dispatches in 8.2s + 1 planner call — per-step work runs
+   outside the planner's context.
 ```
 
 > "Open **Events**: ADK runs the plan on the real engine via the #92 supervisor.
@@ -127,7 +152,9 @@ cat security_audit_plan.json | jq '{schema_version, spec_hash, planner_model, ca
 > the barrier-free pipeline, not two separate fan-out waves. Then `triager` over
 > all verified findings, then `formatter`. The findings are real: a CRITICAL
 > `os.system` injection, HIGH hardcoded creds and SQL injection, and a MEDIUM
-> divide-by-zero."
+> divide-by-zero. And note the cost line: **one** planner call, ten capability
+> dispatches — the plan is authored once, the work scales outside the planner's
+> context. On the replay beat it'll say **zero** planner calls."
 
 ## Beat 5 — reproduce (re-send the same prompt)
 
@@ -153,11 +180,15 @@ Same hash, `reused` flips to `true` — the model is not called the second time.
 
 ## Close (~20s)
 
-> "So: a model authored a typed, validated, capability-bounded plan; ADK executed
-> it on the real engine; the plan **exported** to a portable, defensively-imported
-> audit artifact; and a re-send replayed the exact frozen plan. The deterministic
-> test suites — 11 (#92) + 25 (#93) + 5 (demo) — lock all of this in CI, including
-> the no-LLM reuse path and the export round-trip / tamper / drift checks."
+> "So: a model authored a typed, validated, capability-bounded plan whose
+> **agent independence is statically proven**; ADK executed it on the real
+> engine at a visible cost (one planner call, the work outside its context);
+> the plan **exported** to a portable, defensively-imported audit artifact; and
+> a re-send replayed the exact frozen plan with zero planner calls. The
+> deterministic test suites — 11 (#92) + 31 (#93) + 6 (demo) — lock all of this
+> in CI, including the no-LLM reuse path, the export round-trip / tamper /
+> drift checks, the plan-quality lints, and the six-coordination-pattern
+> coverage sweep (adversarial verification and tournament included)."
 
 **Convergence with ADK Workflow config / `root_agent.yaml`** — this is what Beat 3c shows, if a reviewer asks "why not author `loop_config/root_agent.yaml`?":
 
@@ -180,6 +211,6 @@ Same hash, `reused` flips to `true` — the model is not called the second time.
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 25
-pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 5
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 31
+pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 6
 ```
