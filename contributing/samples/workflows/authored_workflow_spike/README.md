@@ -46,14 +46,14 @@ The six empirically common coordination patterns ([Dynamic Workflows: scaling
 complex work](https://aipractitioner.substack.com/p/claude-dynamic-workflows-scaling))
 are all expressible in the v1 vocabulary, with deterministic tests:
 
-| Pattern | `WorkflowSpec` expression | Test |
-|---|---|---|
-| classify & route | `StepRef(classifier)` → `Branch` | `test_interpreter_branch_takes_correct_route` |
-| fan-out / synthesize | `FanOut` → `StepRef(synthesizer)` | `test_interpreter_fanout_then_aggregate` |
-| generate & filter | `FanOut(generate)` → `StepRef(filter)` | same shape as above |
-| loop until done | `LoopUntil` + `until_capability` | `test_interpreter_loop_until_stops_and_outputs` |
-| adversarial verification | `FanOut(skeptics)` → threshold/filter step | `test_pattern_adversarial_verification` |
-| tournament | `LoopUntil(init=…, body=[pair_maker, FanOut(judge)])` | `test_pattern_tournament_loop_carried` |
+| Pattern                  | `WorkflowSpec` expression                             | Test                                            |
+| ------------------------ | ----------------------------------------------------- | ----------------------------------------------- |
+| classify & route         | `StepRef(classifier)` → `Branch`                      | `test_interpreter_branch_takes_correct_route`   |
+| fan-out / synthesize     | `FanOut` → `StepRef(synthesizer)`                     | `test_interpreter_fanout_then_aggregate`        |
+| generate & filter        | `FanOut(generate)` → `StepRef(filter)`                | same shape as above                             |
+| loop until done          | `LoopUntil` + `until_capability`                      | `test_interpreter_loop_until_stops_and_outputs` |
+| adversarial verification | `FanOut(skeptics)` → threshold/filter step            | `test_pattern_adversarial_verification`         |
+| tournament               | `LoopUntil(init=…, body=[pair_maker, FanOut(judge)])` | `test_pattern_tournament_loop_carried`          |
 
 ## Live planner sweep (optional evidence)
 
