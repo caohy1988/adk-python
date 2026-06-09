@@ -456,6 +456,20 @@ def test_scenario_routing():
   assert demo._scenario_for("audit these insights") == "adversarial"
   assert demo._scenario_for("pick the best chart") == "tournament"
   assert demo._scenario_for("hello") == "sequence"  # default
+  # overlapping triggers: specialized intent must beat the generic fallback
+  # ("revenue by region" is a sequence trigger, but these aren't questions).
+  assert (
+      demo._scenario_for("Pick the best chart for revenue by region.")
+      == "tournament"
+  )
+  assert (
+      demo._scenario_for("give me the best chart for revenue by region")
+      == "tournament"
+  )
+  assert (
+      demo._scenario_for("Profile data quality for revenue by region")
+      == "fanout"
+  )
 
 
 def test_all_seven_shapes_validate_and_lint_clean():

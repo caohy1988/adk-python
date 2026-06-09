@@ -589,8 +589,17 @@ def _task_for(key: str, text: str) -> dict:
 
 
 def _scenario_for(text: str) -> str:
+  """Specialized scenarios win over the generic ask-a-question fallback.
+
+  'sequence' is the default for ANY question, so its triggers must never
+  shadow a specialized intent — e.g. "best chart for revenue by region"
+  contains both a tournament trigger and a sequence trigger and must route
+  to the tournament.
+  """
   t = (text or "").lower()
   for key, sc in SCENARIOS.items():
+    if key == "sequence":
+      continue  # fallback only — checked last by construction
     if any(trigger in t for trigger in sc["triggers"]):
       return key
   return "sequence"
