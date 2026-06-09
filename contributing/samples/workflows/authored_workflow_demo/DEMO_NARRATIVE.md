@@ -42,6 +42,23 @@ Send: **"Plan and run a codebase security review."** The chat streams:
 > construct that lets each file flow review→verify independently — item A can be
 > verifying while item B is still being reviewed."
 
+## Beat 1b — free authoring (the honest "model-authored" claim)
+
+In a new session, send: **"Freely plan a security review of the files — decompose it yourself."**
+
+```
+🧭 Free authoring — the planner receives ONLY the goal + capability
+   descriptions (reviewer, verifier, triager, formatter); no plan recipe.
+   The shape below is the model's own decomposition (it may differ run to
+   run — and the freeze beat then makes THIS run replayable).
+```
+
+> "Beat 1 was instruction-guided so the recording is reproducible — the model
+> filled in a known shape. This beat is the real claim: goal + capabilities
+> in, plan out, no recipe. Whatever it authors, the same validator, lints,
+> freeze, and replay machinery apply — free authoring composes with
+> everything you're about to see, and the frozen hash pins *this* run."
+
 ## Beat 2 — validate (capability allow-list)
 
 ```
@@ -210,7 +227,7 @@ Send: **"Plan a sloppy review: have the reviewer double-check its own findings."
 > engine at a visible cost (one planner call, the work outside its context);
 > the plan **exported** to a portable, defensively-imported audit artifact; and
 > a re-send replayed the exact frozen plan with zero planner calls. The
-> deterministic test suites — 11 (#92) + 31 (#93) + 7 (demo) — lock all of this
+> deterministic test suites — 11 (#92) + 34 (#93) + 8 (demo) — lock all of this
 > in CI, including the no-LLM reuse path, the export round-trip / tamper /
 > drift checks, the plan-quality lints, and the six-coordination-pattern
 > coverage sweep (adversarial verification and tournament included)."
@@ -236,6 +253,6 @@ Send: **"Plan a sloppy review: have the reviewer double-check its own findings."
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 31
-pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 7
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 34
+pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 8
 ```

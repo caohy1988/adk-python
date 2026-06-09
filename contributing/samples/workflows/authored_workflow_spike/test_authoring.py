@@ -776,9 +776,8 @@ async def test_pattern_adversarial_verification():
 
 
 # ------------------------------------------------------------ quality lints
-def test_lint_warns_on_same_capability_review():
-  # classify reviewing classify's own output cannot be independent.
-  spec = WorkflowSpec(
+def _self_review_spec():
+  return WorkflowSpec(
       goal="x",
       steps=[
           StepRef(
@@ -796,8 +795,54 @@ def test_lint_warns_on_same_capability_review():
       ],
       output=Binding(source="step", step="b"),
   )
-  warnings = WorkflowSpecValidator(_registry()).validate(spec)
+
+
+def test_lint_warns_on_same_capability_review():
+  # classify reviewing classify's own output cannot be independent.
+  warnings = WorkflowSpecValidator(_registry()).validate(_self_review_spec())
   assert any("same capability 'classify'" in w for w in warnings)
+
+
+def test_lint_self_chain_policy_suppresses():
+  # draft -> critique-own-draft -> redraft is legitimate refinement; a
+  # capability can opt out of the self-review lint via allow_self_chain.
+  reg = _registry()
+  reg["classify"].allow_self_chain = True
+  warnings = WorkflowSpecValidator(reg).validate(_self_review_spec())
+  assert [w for w in warnings if w.startswith("plan-quality")] == []
+
+
+def test_lint_waiver_suppresses_and_is_recorded():
+  # A per-plan waiver (node id -> justification) suppresses the lint AND is
+  # recorded in the frozen record — auditable suppression, not silence.
+  waivers = {"b": "intentional self-refinement pass"}
+  warnings = WorkflowSpecValidator(_registry()).validate(
+      _self_review_spec(), lint_waivers=waivers
+  )
+  assert [w for w in warnings if w.startswith("plan-quality")] == []
+  rec = FrozenWorkflowRecord.freeze(
+      _self_review_spec(),
+      planner_model="gemini-3.5-flash",
+      registry=_registry(),
+      created_at="2026-06-09T00:00:00Z",
+      lint_waivers=waivers,
+  )
+  assert export_plan(rec)["lint_waivers"] == waivers
+
+
+def test_import_rejects_contract_hash_drift():
+  # The DERIVED drift signal: change a capability's declared contract (here,
+  # its output schema) WITHOUT bumping the manual version — manual-version
+  # drift stays silent; the contract hash catches it.
+  env = export_plan(_frozen())
+
+  class NewCountReport(BaseModel):
+    n: int  # narrower contract than before
+
+  changed = _registry()
+  changed["count"].output_model = NewCountReport  # version string unchanged
+  with pytest.raises(PlanImportError, match="contract drift"):
+    import_plan(env, changed, task_input=_TASK)
 
 
 def test_lint_warns_on_unsynthesized_fanout():

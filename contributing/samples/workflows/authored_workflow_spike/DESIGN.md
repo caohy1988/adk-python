@@ -131,6 +131,8 @@ Then **`Graph.validate_graph()`** (reused) handles duplicate names, `START`/reac
 - **self-review**: a node (or pipeline stage) consuming output produced by the *same capability* — same-capability review cannot provide independent verification;
 - **unsynthesized fan-out**: the terminal output binds a bare per-item `fan_out` never combined or verified downstream.
 
+**Suppression** (so the lints stay credible instead of globally disabled): a capability registered with `allow_self_chain=True` opts out of the self-review lint (legitimate `draft → critique → redraft` refinement), and per-plan `lint_waivers` (node id → justification) are **recorded in the `FrozenWorkflowRecord`** — a suppressed lint is an auditable decision, not a silenced one.
+
 The complementary positive facts (`independence_facts`) are derivable from the frozen spec — e.g. *"stage `verifier` sees ONLY stage `reviewer`'s per-item output"* — which is what lets the frozen record **prove** structural bias controls to an auditor, not just assert them.
 
 ## 4. Semantics
@@ -152,7 +154,9 @@ class FrozenWorkflowRecord(BaseModel):
   spec_hash: str                      # sha256(canonical_json(spec)) — see §10
   planner_model: str
   registry_version: str
-  capability_versions: dict[str, str]
+  capability_versions: dict[str, str]          # manual bumps — coarse SECONDARY signal
+  capability_contract_hashes: dict[str, str]   # DERIVED sha256(input_kind+output schema) — primary drift signal
+  lint_waivers: dict[str, str]                 # node id -> justification; auditable lint suppression
   validation: ValidationResult        # {passed: bool, warnings: [...]}
   created_at: str                     # ISO-8601, stamped at freeze
   task_input_schema: dict | None      # expected root task-input schema (enables template reuse)
@@ -243,7 +247,10 @@ Re-runnable: `contributing/samples/workflows/authored_workflow_spike/` (31 deter
     # INTEGRITY (never trust the envelope's own `validation`):
     #   1. recompute sha256(canonical_json(spec)); REJECT if != envelope["spec_hash"]
     #   2. re-run WorkflowSpecValidator against the CURRENT registry
-    #   3. registry/capability drift -> fail loudly (or explicit migration)
+    #   3. registry/capability drift -> fail loudly (or explicit migration);
+    #      capability drift = manual version (secondary) AND derived contract
+    #      hash sha256(input_kind + output schema) (primary — catches schema
+    #      changes nobody versioned)
     # EXECUTION-INPUT:
     #   replay   : task_input digest must match envelope["task_input_digest"] (else audit-only)
     #   template : task_input validated against envelope["task_input_schema"] before execution

@@ -47,6 +47,14 @@ Point at the ADK-native evidence as it streams:
 
 (Re-send the same prompt to show resume reuses the frozen spec — same hash, not re-authored.)
 
+Then run the **free-authoring beat** — in a **new session**, send:
+
+```text
+Freely plan a security review of the files — decompose it yourself.
+```
+
+The planner receives ONLY the goal + capability descriptions (no plan recipe — `test_free_planner_instruction_is_recipe_free` pins this). The shape may differ run to run; that's the point — and the freeze beat then makes *this* run replayable. Talking point: *the default walkthrough shows the mechanics on a scripted plan; this beat is the honest "model-authored" claim.*
+
 Then run the **quality-gate beat** — send:
 
 ```text
@@ -82,11 +90,11 @@ Proof points: multi-stage `fan_out → step → step`; branch `step → branch`;
 
 ```bash
 pytest contributing/samples/workflows/dynamic_supervisor_spike/test_dynamic_supervisor_spike.py -q  # 11
-pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 31
-pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 7
+pytest contributing/samples/workflows/authored_workflow_spike/test_authoring.py -q                  # 34
+pytest contributing/samples/workflows/authored_workflow_demo/test_demo_agent.py -q                  # 8
 ```
 
-- Deterministic suites: #92 **11** + #93 **31** + demo **7** = **49** (incl. a no-LLM reuse-path test, the six-pattern coverage sweep — adversarial verification + tournament via loop-carried `init` — and the plan-quality lints).
+- Deterministic suites: #92 **11** + #93 **34** + demo **8** = **53** (incl. a no-LLM reuse-path test, the six-pattern coverage sweep — adversarial verification + tournament via loop-carried `init` — the plan-quality lints with `allow_self_chain` policy + recorded waivers, contract-hash drift rejection, and the recipe-free free-authoring instruction pin).
 - PR #3 CI green except the documented fork-only `agent-triage` token job.
 
 ## Recording notes

@@ -136,6 +136,18 @@ def test_quality_gate_rejects_self_review_plan():
   assert "re-checks its own capability's output" in lints[0]
 
 
+def test_free_planner_instruction_is_recipe_free():
+  # The honesty contract behind the free-authoring beat: the default
+  # instruction dictates the plan; the free instruction must NOT — only the
+  # goal, the capability descriptions, and the binding rules.
+  assert "reviewer then verifier" in demo._PLANNER_INSTR  # scripted (default)
+  assert "reviewer then verifier" not in demo._FREE_PLANNER_INSTR
+  assert "(1)" not in demo._FREE_PLANNER_INSTR  # no step recipe
+  assert "YOURSELF" in demo._FREE_PLANNER_INSTR
+  # trigger sets must not overlap (a prompt can't be both free and sloppy).
+  assert not set(demo._FREE_TRIGGERS) & set(demo._SLOPPY_TRIGGERS)
+
+
 def test_demo_spec_quality_lints_clean_and_independent():
   # Zero plan-quality lints: verification is by a DIFFERENT capability
   # (reviewer -> verifier), and the fan-out is synthesized (triager).

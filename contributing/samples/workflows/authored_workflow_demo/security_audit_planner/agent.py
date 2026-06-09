@@ -222,6 +222,26 @@ _SLOPPY_PLANNER_INSTR = (
 )
 
 
+# The FREE-AUTHORING beat: the planner receives ONLY the goal + capability
+# descriptions — no plan recipe. This is the honest "model-authored" claim
+# (the default _PLANNER_INSTR dictates the shape for recording reliability;
+# the spike's demand gate also used free authoring).
+_FREE_TRIGGERS = ("freely", "free-form", "your own plan", "decompose")
+_FREE_PLANNER_INSTR = (
+    "Author a WorkflowSpec using ONLY these capabilities: "
+    + _REGISTRY_DESC
+    + " The task input has a 'files' list of objects with path and code."
+    " GOAL: audit the files for security issues and produce a one-line"
+    " report note. Decompose the goal into a plan YOURSELF — no recipe is"
+    " provided. Choose whichever control blocks fit (step / fan_out /"
+    " pipeline / branch / loop_until). Binding rules:"
+    " Binding(source='task', path='files') reads the file list;"
+    " Binding(source='step', step=<id>) reads a prior step's output; a"
+    " pipeline stage takes the previous stage's per-item output"
+    " automatically. Set output to the final step."
+)
+
+
 def _msg(text: str) -> Event:
   return Event(
       content=types.Content(role="model", parts=[types.Part(text=text)])
@@ -305,18 +325,27 @@ async def author_validate_execute(ctx: Context, node_input):
     )
   else:
     reused = False
+    free = any(k in str(node_input or "").lower() for k in _FREE_TRIGGERS)
     cap_list = ", ".join(f"`{n}`" for n in reg.names())
-    yield _msg(
-        "🧭 **Model-authored Workflow** — planning a security audit over "
-        f"{len(FILES)} files using only registered capabilities "
-        f"({cap_list})."
-    )
+    if free:
+      yield _msg(
+          "🧭 **Free authoring** — the planner receives ONLY the goal +"
+          f" capability descriptions ({cap_list}); no plan recipe. The shape"
+          " below is the model's own decomposition (it may differ run to"
+          " run — and the freeze beat then makes THIS run replayable)."
+      )
+    else:
+      yield _msg(
+          "🧭 **Model-authored Workflow** — planning a security audit over "
+          f"{len(FILES)} files using only registered capabilities "
+          f"({cap_list})."
+      )
     planner = Agent(
         name="planner",
         model=MODEL,
         output_schema=WorkflowSpec,
         generate_content_config=DET,
-        instruction=_PLANNER_INSTR,
+        instruction=_FREE_PLANNER_INSTR if free else _PLANNER_INSTR,
     )
     raw = await ctx.run_node(
         planner,

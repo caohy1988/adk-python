@@ -180,7 +180,25 @@ class Capability(BaseModel):
   )
   max_fan_out: int = 100
   side_effect: bool = False
-  version: str = "1"  # bumped when the capability's contract changes (drift)
+  version: str = "1"  # manual bump — a coarse SECONDARY drift signal only
+  # Lint policy: same-capability chains (draft -> critique own draft ->
+  # redraft) are legitimate refinement for some capabilities; opting in here
+  # suppresses the self-review lint for this capability.
+  allow_self_chain: bool = False
+
+  def contract_hash(self) -> str:
+    """Derived drift signal — sha256 over the capability's declared contract.
+
+    Manual version strings don't get bumped when someone tweaks a schema; the
+    contract hash changes automatically, so drift detection on import does
+    not rely on developer discipline.
+    """
+    schema = (
+        None
+        if self.output_model is None
+        else self.output_model.model_json_schema()
+    )
+    return sha256_hex({"input_kind": self.input_kind, "output_schema": schema})
 
 
 class CapabilityRegistry:
@@ -201,9 +219,19 @@ class CapabilityRegistry:
   def capability_versions(
       self, only: Optional[set[str]] = None
   ) -> dict[str, str]:
-    """name -> version for drift detection on import (optionally filtered)."""
+    """name -> MANUAL version (coarse secondary drift signal)."""
     return {
         n: c.version
+        for n, c in self._by_name.items()
+        if only is None or n in only
+    }
+
+  def capability_contract_hashes(
+      self, only: Optional[set[str]] = None
+  ) -> dict[str, str]:
+    """name -> DERIVED contract hash (the primary drift signal on import)."""
+    return {
+        n: c.contract_hash()
         for n, c in self._by_name.items()
         if only is None or n in only
     }
@@ -240,17 +268,34 @@ class WorkflowSpecValidator:
   def __init__(self, registry: CapabilityRegistry):
     self.registry = registry
 
-  def validate(self, spec: WorkflowSpec) -> list[str]:
-    """Raises SpecValidationError on a hard error; returns soft warnings."""
+  def validate(
+      self,
+      spec: WorkflowSpec,
+      *,
+      lint_waivers: Optional[dict[str, str]] = None,
+  ) -> list[str]:
+    """Raises SpecValidationError on a hard error; returns soft warnings.
+
+    `lint_waivers` (node id -> justification) suppresses plan-quality lints
+    for the named nodes; record waivers in the FrozenWorkflowRecord so the
+    suppression itself is auditable.
+    """
     ids: set[str] = set()
     self._walk(spec.steps, set(), ids)
     if spec.output.source == "step" and spec.output.step not in ids:
       raise SpecValidationError(
           f"output references unknown step {spec.output.step!r}"
       )
-    return self.registry.open_map_warnings() + self.quality_lints(spec)
+    return self.registry.open_map_warnings() + self.quality_lints(
+        spec, lint_waivers=lint_waivers
+    )
 
-  def quality_lints(self, spec: WorkflowSpec) -> list[str]:
+  def quality_lints(
+      self,
+      spec: WorkflowSpec,
+      *,
+      lint_waivers: Optional[dict[str, str]] = None,
+  ) -> list[str]:
     """Plan-quality lints (soft warnings, never hard errors).
 
     Multi-agent quality rests on isolation: it is what mitigates
@@ -262,7 +307,13 @@ class WorkflowSpecValidator:
       cannot provide independent verification;
     * unsynthesized fan-out: a plan whose terminal output is a bare per-item
       fan_out never combined or verified by a downstream capability.
+
+    Suppression (so the lints stay credible instead of globally disabled):
+    a capability registered with `allow_self_chain=True` opts out of the
+    self-review lint (legitimate draft -> critique -> redraft refinement);
+    `lint_waivers` suppresses lints for specific node ids per plan.
     """
+    waivers = lint_waivers or {}
     lints: list[str] = []
     producer_cap: dict[str, str] = {}  # node id -> capability producing output
     consumed: set[str] = set()  # step ids some other node reads from
@@ -280,7 +331,15 @@ class WorkflowSpecValidator:
           for prev, st in zip(n.stages, n.stages[1:]):
             if st.input is not None and st.input.source == "step":
               consumed.add(st.input.step)
-            if st.capability == prev.capability and st.input is None:
+            if (
+                st.capability == prev.capability
+                and st.input is None
+                and n.id not in waivers
+                and not (
+                    st.capability in self.registry
+                    and self.registry[st.capability].allow_self_chain
+                )
+            ):
               lints.append(
                   f"plan-quality: pipeline {n.id!r} stage"
                   f" {st.capability!r} re-checks its own capability's output —"
@@ -304,6 +363,11 @@ class WorkflowSpecValidator:
             and isinstance(b, Binding)
             and b.source == "step"
             and producer_cap.get(b.step) == my_cap
+            and n.id not in waivers
+            and not (
+                my_cap in self.registry
+                and self.registry[my_cap].allow_self_chain
+            )
         ):
           lints.append(
               f"plan-quality: {n.id!r} consumes the output of {b.step!r} via"
@@ -336,7 +400,11 @@ class WorkflowSpecValidator:
         return None
 
       node_ = find(spec.steps)
-      if isinstance(node_, FanOut) and terminal not in consumed:
+      if (
+          isinstance(node_, FanOut)
+          and terminal not in consumed
+          and terminal not in waivers
+      ):
         lints.append(
             f"plan-quality: output binds directly to fan_out {terminal!r}"
             " with no downstream synthesis or verification step — parallel"
@@ -535,6 +603,12 @@ class FrozenWorkflowRecord(BaseModel):
   planner_model: str
   registry_version: str
   capability_versions: dict[str, str]
+  # DERIVED sha256 over each referenced capability's declared contract — the
+  # primary drift signal (manual versions above are secondary).
+  capability_contract_hashes: dict[str, str] = Field(default_factory=dict)
+  # Per-plan lint waivers (node id -> justification), recorded so a
+  # suppressed lint is an AUDITABLE decision, not a silenced one.
+  lint_waivers: dict[str, str] = Field(default_factory=dict)
   validation: ValidationResult
   created_at: str  # ISO-8601, stamped at freeze (caller supplies; not now())
   task_input_schema: Optional[dict] = None
@@ -550,9 +624,12 @@ class FrozenWorkflowRecord(BaseModel):
       created_at: str,
       task_input=None,
       task_input_schema: Optional[dict] = None,
+      lint_waivers: Optional[dict[str, str]] = None,
   ) -> "FrozenWorkflowRecord":
     """Validate + capture everything needed for replay and drift detection."""
-    warnings = WorkflowSpecValidator(registry).validate(spec)  # raises on hard
+    warnings = WorkflowSpecValidator(registry).validate(
+        spec, lint_waivers=lint_waivers
+    )  # raises on hard error
     refs = referenced_capabilities(spec)
     return cls(
         spec=spec,
@@ -560,6 +637,10 @@ class FrozenWorkflowRecord(BaseModel):
         planner_model=planner_model,
         registry_version=registry.version,
         capability_versions=registry.capability_versions(only=refs),
+        capability_contract_hashes=registry.capability_contract_hashes(
+            only=refs
+        ),
+        lint_waivers=dict(lint_waivers or {}),
         validation=ValidationResult(passed=True, warnings=warnings),
         created_at=created_at,
         task_input_schema=task_input_schema,
@@ -630,7 +711,7 @@ def import_plan(
         f" {registry.version!r}) — re-validate / migrate before reuse"
     )
 
-  # 3b. per-capability version drift.
+  # 3b. per-capability MANUAL version drift (coarse secondary signal).
   current = registry.capability_versions(only=referenced_capabilities(spec))
   recorded = envelope.get("capability_versions", {})
   drifted = {
@@ -642,6 +723,24 @@ def import_plan(
     raise PlanImportError(
         f"capability version drift (recorded vs current): {drifted} — promote"
         " to a template with explicit migration before reuse"
+    )
+
+  # 3c. per-capability CONTRACT drift (primary, derived signal): catches a
+  # changed input_kind / output schema even when nobody bumped a version.
+  current_ch = registry.capability_contract_hashes(
+      only=referenced_capabilities(spec)
+  )
+  recorded_ch = envelope.get("capability_contract_hashes") or {}
+  contract_drift = {
+      n: (recorded_ch[n], current_ch[n])
+      for n in current_ch
+      if n in recorded_ch and recorded_ch[n] != current_ch[n]
+  }
+  if contract_drift:
+    raise PlanImportError(
+        "capability contract drift (recorded vs current schema hash):"
+        f" {contract_drift} — the capability's declared contract changed"
+        " since export; re-validate / migrate before reuse"
     )
 
   # Execution-input contract.
