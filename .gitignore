@@ -127,3 +127,5 @@ security_audit_plan.json
 
 # ADK Web demo session stores (runtime)
 demo_sessions*.db
+ca_demo_sessions*.db
+ca_plan_store/

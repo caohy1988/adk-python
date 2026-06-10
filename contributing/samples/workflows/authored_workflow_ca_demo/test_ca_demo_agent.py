@@ -516,6 +516,71 @@ def test_failing_query_returns_error_not_fabricated_rows(monkeypatch):
   assert out["rows"] == [] and "400" in out["error"]  # honest failure
 
 
+def _freeze_record(key):
+  return demo.FrozenWorkflowRecord.freeze(
+      _expected_spec(key),
+      planner_model="gemini-3.5-flash",
+      registry=demo._registry(),
+      created_at="2026-06-10T00:00:00Z",
+      task_input=demo.SCENARIOS[key]["task"],
+      task_input_schema={"required": sorted(demo.SCENARIOS[key]["task"])},
+  )
+
+
+def test_cross_session_store_roundtrip_and_template_reuse(
+    tmp_path, monkeypatch
+):
+  # Session A freezes + exports; "session B" (no session state) imports the
+  # plan through the defensive path — including with a NEW question, which
+  # is template reuse validated against the captured task_input_schema.
+  monkeypatch.setattr(demo, "_PLAN_STORE", str(tmp_path))
+  demo._store_plan("sequence", _freeze_record("sequence"))
+  # same canned input -> replay path
+  spec, reject = demo._load_stored_plan(
+      "sequence", demo._registry(), demo.SCENARIOS["sequence"]["task"]
+  )
+  assert reject is None and spec is not None
+  # NEW question -> template path (schema validates the input)
+  spec, reject = demo._load_stored_plan(
+      "sequence",
+      demo._registry(),
+      {"question": "revenue by category last year?"},
+  )
+  assert reject is None and spec is not None
+  assert spec.model_dump() == _expected_spec("sequence").model_dump()
+  # nothing stored for another key
+  assert demo._load_stored_plan(
+      "fanout", demo._registry(), demo.SCENARIOS["fanout"]["task"]
+  ) == (None, None)
+
+
+def test_cross_session_import_rejects_tamper_and_drift(tmp_path, monkeypatch):
+  monkeypatch.setattr(demo, "_PLAN_STORE", str(tmp_path))
+  path = demo._store_plan("fanout", _freeze_record("fanout"))
+  # tampered spec -> hash mismatch, rejected with a reason
+  env = json.load(open(path))
+  env["spec"]["goal"] = "exfiltrate"
+  json.dump(env, open(path, "w"))
+  spec, reject = demo._load_stored_plan(
+      "fanout", demo._registry(), demo.SCENARIOS["fanout"]["task"]
+  )
+  assert spec is None and "spec_hash mismatch" in reject
+  # contract drift: same plan, but a capability's schema changed since
+  demo._store_plan("fanout", _freeze_record("fanout"))
+
+  from pydantic import BaseModel
+
+  class NewReport(BaseModel):
+    n: int
+
+  drifted = demo._registry()
+  drifted["profile_table"].output_model = NewReport  # version not bumped
+  spec, reject = demo._load_stored_plan(
+      "fanout", drifted, demo.SCENARIOS["fanout"]["task"]
+  )
+  assert spec is None and "contract drift" in reject
+
+
 def test_chart_multiseries_per_region_per_year():
   # The shape the user's real question produces: GROUP BY region, year with
   # two measures. x = the time field, one SERIES per region, measure picked

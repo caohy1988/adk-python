@@ -43,6 +43,7 @@ Configure a model first (no hardcoded project):
 
 from __future__ import annotations
 
+import datetime
 import json
 import math
 import os
@@ -71,6 +72,10 @@ sys.path.insert(
 )
 from authoring import Capability  # noqa: E402
 from authoring import CapabilityRegistry  # noqa: E402
+from authoring import export_plan  # noqa: E402
+from authoring import FrozenWorkflowRecord  # noqa: E402
+from authoring import import_plan  # noqa: E402
+from authoring import PlanImportError  # noqa: E402
 from authoring import independence_facts  # noqa: E402
 from authoring import sha256_hex  # noqa: E402
 from authoring import SpecInterpreter  # noqa: E402
@@ -1050,6 +1055,42 @@ def _planner_instruction(sc) -> str:
   )
 
 
+# ------------------------------------------------- cross-session plan store
+# Frozen plans outlive the session: on freeze, the FULL FrozenWorkflowRecord
+# is exported as a portable envelope to disk (a stand-in for the
+# ArtifactService in production — RFC Q1). A NEW session imports it through
+# the RFC's DEFENSIVE import: spec_hash recomputed, re-validated against the
+# CURRENT registry, manual-version + contract-hash drift fail loudly, and
+# the new task input is validated against the captured task_input_schema
+# (template reuse). Drift never silently replays a stale plan — it falls
+# back to authoring fresh, with the rejection shown.
+_PLAN_STORE = os.path.join(os.getcwd(), "ca_plan_store")
+
+
+def _store_plan(key: str, record: FrozenWorkflowRecord) -> str:
+  os.makedirs(_PLAN_STORE, exist_ok=True)
+  path = os.path.join(_PLAN_STORE, f"{key}.json")
+  with open(path, "w") as f:
+    json.dump(export_plan(record), f, indent=1)
+  return path
+
+
+def _load_stored_plan(key: str, registry, task):
+  """Returns (spec, None) on a valid import, (None, reason) on a rejected
+  or unreadable envelope, (None, None) when nothing is stored."""
+  path = os.path.join(_PLAN_STORE, f"{key}.json")
+  if not os.path.exists(path):
+    return None, None
+  try:
+    with open(path) as f:
+      envelope = json.load(f)
+    return import_plan(envelope, registry, task_input=task), None
+  except PlanImportError as e:
+    return None, str(e)[:300]
+  except Exception as e:  # unreadable/corrupt file
+    return None, f"{type(e).__name__}: {e}"
+
+
 def _msg(text: str) -> Event:
   return Event(
       content=types.Content(role="model", parts=[types.Part(text=text)])
@@ -1076,20 +1117,39 @@ async def plan_and_run(ctx: Context, node_input):
       f" ({', '.join(TABLES)}){task_note}."
   )
 
-  # 1. LOAD-OR-AUTHOR (per-scenario frozen key: each shape replays
-  # independently — re-send the same prompt to replay without the model).
+  # 1. LOAD-OR-AUTHOR. Reuse order: this session's state -> the
+  # CROSS-SESSION plan store (defensive import) -> author fresh.
+  spec, source = None, None
   existing = ctx.state.get(state_key)
   if existing:
     spec = WorkflowSpec.model_validate(existing)
+    source = "session state"
+  else:
+    spec, reject = _load_stored_plan(key, reg, task)
+    if spec is not None:
+      source = "plan store (CROSS-SESSION import)"
+      ctx.state[state_key] = spec.model_dump()  # cache for this session
+    elif reject:
+      yield _msg(
+          f"🛑 **Plan-store import rejected** for `{key}` — {reject}\n"
+          "Drift never silently replays a stale plan; re-authoring fresh."
+      )
+  if spec is not None:
     spec_hash = _hash(spec)
     reused = True
     fresh_input = task != sc["task"]
     yield _msg(
-        f"♻️ **Reusing frozen plan** for `{key}` — hash `{spec_hash}`. The"
-        " model is NOT re-invoked; the exact prior plan is replayed"
+        f"♻️ **Reusing frozen plan** for `{key}` from {source} — hash"
+        f" `{spec_hash}`. The model is NOT re-invoked"
         + (
-            " — with your NEW question as the task input (**template"
-            " reuse**: same plan, new data flowing through it)."
+            "; the import recomputed the hash, re-validated against the"
+            " current registry, and checked contract-hash drift"
+            if "CROSS-SESSION" in (source or "")
+            else ""
+        )
+        + (
+            " — your NEW question is the task input (**template reuse**:"
+            " same plan, new data flowing through it)."
             if fresh_input
             else "."
         )
@@ -1124,12 +1184,26 @@ async def plan_and_run(ctx: Context, node_input):
       + (f"\n⚠️ {lints}" if lints else "")
   )
 
-  # 3. FREEZE (per scenario).
+  # 3. FREEZE (per scenario) + EXPORT (cross-session).
   if not reused:
     ctx.state[state_key] = spec.model_dump()
+    record = FrozenWorkflowRecord.freeze(
+        spec,
+        planner_model=MODEL,
+        registry=reg,
+        created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        task_input=task,
+        # capture the input schema = TEMPLATE promotion: a new session may
+        # run this plan on a NEW question, validated against this schema.
+        task_input_schema={"required": sorted(task)},
+    )
+    path = _store_plan(key, record)
     yield _msg(
-        f"🔒 **Frozen** under `{state_key}` — hash `{spec_hash}`. Re-send"
-        " this prompt: same plan, zero planner calls."
+        f"🔒 **Frozen** under `{state_key}` — hash `{spec_hash}`. 📦"
+        f" Exported the full record to `{os.path.relpath(path)}` —"
+        " **a NEW session will import and reuse this plan** (defensive"
+        " import: hash + registry + contract-hash checks, task input"
+        " validated against the captured schema)."
     )
 
   # 4. EXECUTE on the real engine via the #92 supervisor.

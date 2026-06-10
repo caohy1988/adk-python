@@ -58,7 +58,7 @@ What to point at as each one streams:
 - **🗂️ scenario banner** — the expected shape, named before the model authors it.
 - **📋 authored plan** — a *different* typed `WorkflowSpec` per prompt; same closed vocabulary every time.
 - **✅ + 🧪 validation & independence lints** — every scenario lints clean; the provenance facts are statically provable from the bindings.
-- **🔒 freeze (per-scenario key)** — **re-send any prompt**: same hash, `0 planner calls (frozen replay)`. Seven independent frozen plans in one session.
+- **🔒 freeze (per-scenario key) + 📦 cross-session export** — every authored plan exports its full `FrozenWorkflowRecord` to `ca_plan_store/<scenario>.json`. **Re-send any prompt**: same hash, `0 planner calls (frozen replay)`. **Start a whole new session** and ask again: the plan is **imported from the store** through the RFC's defensive path — spec hash recomputed, re-validated against the current registry, manual-version + contract-hash drift fail loudly (with the rejection shown, then a fresh authoring), and your new question is validated against the captured `task_input_schema` (cross-session **template reuse**). Plans now outlive sessions.
 - **template reuse (scenario 1)** — after the first ask, send a *different* question (`What was revenue by region last year?`): the frozen plan is reused unchanged, your new question flows through it as new task input, and the mock rows change with the window (quarter vs year canned sets). Same plan, new data — the RFC's replay-vs-template distinction, live.
 - **📈 chart** — scenarios 1 and 7 emit the Conversational-Analytics-style chart artifact: a **rendered chart image inline in the chat** (matplotlib, optional — falls back to a Unicode preview) plus the **Vega-Lite spec** (what the real CA API returns). Time-series rows infer a line mark; in the tournament, the bracket picks the mark and `render_chart` draws the data with it.
 - **honest failure handling** — a query that still fails after repair returns empty rows + the real error (`engine: bigquery`); the mock warehouse is used ONLY when credentials are absent, never to paper over a failing query.
@@ -73,7 +73,7 @@ replayable — a turn-by-turn agent retry never is.*
 ## 2. Correctness proof (no LLM, no BigQuery)
 
 ```bash
-pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 28 (one live-gated: CA_DEMO_LIVE_BQ=1)
+pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 30 (one live-gated: CA_DEMO_LIVE_BQ=1)
 ```
 
 All seven expected shapes are built by hand, validated + lint-checked against
@@ -92,8 +92,10 @@ against the **live** registry (their capabilities are deterministic mocks).
   vocabulary — is the claim here.
 - The `flaky_dry_run` failure is simulated (every odd call fails) so the
   repair loop behaves identically on every run and in CI.
-- Frozen plans are per-scenario (`authored_workflow:ca:<scenario>`), so all
-  seven replay independently within a session.
+- Frozen plans are per-scenario (`authored_workflow:ca:<scenario>`) in
+  session state, AND exported per-scenario to `ca_plan_store/` for
+  cross-session reuse (delete a file to force fresh authoring; the store is
+  the demo's stand-in for the ArtifactService in the RFC's revised Q1).
 - Scenario 1 takes your live message as the question; the other six prompts
   are mode selectors with canned task inputs (their results don't change
   with your wording). Query answers come from real BigQuery when
