@@ -6,16 +6,19 @@ a user asks data questions in natural language, and the planner **authors a
 different typed `WorkflowSpec` per scenario** over Conversational-Analytics
 capabilities — `nl2sql`, `dry_run`, `run_query`, `profile_table`, `skeptic`,
 chart judging — against a mock `thelook_ecommerce` dataset (the dataset the
-CA docs demo against). Query execution runs on a **deterministic
-micro-warehouse**: a synthetic 24-month × 4-region × 4-category fact table
-plus SQL-intent parsing — the executor *aggregates* the facts per the
-query's grouping (month/region/category), time window (`INTERVAL N YEAR/QUARTER/MONTH`), filters (`country = 'United States'`, region/category
-literals), and measure alias (`AS total_sales`). No BigQuery project
-needed, and answers genuinely track the question (a trend question returns
-a real monthly series and charts as a line). Honest scope: it executes the
-query's *intent*, not its SQL — a real BigQuery backend is the production
-step. The language steps (NL2SQL, summaries, classification, skeptics) are
-live Gemini calls.
+CA docs demo against). **Query execution is REAL BigQuery** when
+credentials allow: `dry_run` hits the actual BigQuery dry-run API (real
+errors, real bytes-scanned) and `run_query` executes against
+`bigquery-public-data.thelook_ecommerce`, billed to your
+`GOOGLE_CLOUD_PROJECT` with safety rails (`maximum_bytes_billed` = 2 GB per
+query, 500-row result cap). Multi-dimensional questions ("each region's
+trend per year") return real grouped results and chart as multi-series
+lines. Without credentials (or with `CA_DEMO_USE_BIGQUERY=0`), execution
+falls back to a deterministic micro-warehouse (synthetic facts +
+SQL-intent aggregation) so CI and credential-less machines keep working —
+each dry-run/result beat carries an `engine` field (`bigquery` or `mock`)
+so the demo never misrepresents its data source. The language steps
+(NL2SQL, summaries, classification, skeptics) are live Gemini calls.
 
 Every scenario runs the full #93 machinery: **author → validate →
 independence lints → freeze (per-scenario key) → execute on the real engine
@@ -69,7 +72,7 @@ replayable — a turn-by-turn agent retry never is.*
 ## 2. Correctness proof (no LLM, no BigQuery)
 
 ```bash
-pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 22
+pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 27 (one live-gated: CA_DEMO_LIVE_BQ=1)
 ```
 
 All seven expected shapes are built by hand, validated + lint-checked against
@@ -92,6 +95,6 @@ against the **live** registry (their capabilities are deterministic mocks).
   seven replay independently within a session.
 - Scenario 1 takes your live message as the question; the other six prompts
   are mode selectors with canned task inputs (their results don't change
-  with your wording). Query answers come from the deterministic
-  micro-warehouse above — real aggregation over synthetic facts; there is
-  no BigQuery behind it.
+  with your wording). Query answers come from real BigQuery when
+  credentials allow (check the `engine` field in the dry-run/result beats);
+  otherwise the deterministic micro-warehouse.
