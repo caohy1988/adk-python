@@ -148,23 +148,33 @@ def _expected_spec(key: str) -> WorkflowSpec:
     return WorkflowSpec(
         goal="revenue by region",
         steps=[
-            StepRef(
-                kind="step",
-                id="sql",
-                capability="nl2sql",
-                input=Binding(source="task"),
-            ),
-            StepRef(
-                kind="step",
-                id="check",
-                capability="dry_run",
-                input=Binding(source="step", step="sql"),
+            LoopUntil(
+                kind="loop_until",
+                id="sqlgen",
+                init=Binding(source="task"),
+                body=[
+                    StepRef(
+                        kind="step",
+                        id="draft",
+                        capability="draft_or_repair_sql",
+                        input=Binding(source="step", step="sqlgen"),
+                    ),
+                    StepRef(
+                        kind="step",
+                        id="check",
+                        capability="dry_run",
+                        input=Binding(source="step", step="draft"),
+                    ),
+                ],
+                until_capability="sql_ok",
+                until_input=Binding(source="step", step="check"),
+                max_iters=3,
             ),
             StepRef(
                 kind="step",
                 id="rows",
                 capability="run_query",
-                input=Binding(source="step", step="check"),
+                input=Binding(source="step", step="sqlgen"),
             ),
             StepRef(
                 kind="step",
@@ -492,6 +502,20 @@ def test_dry_run_and_execute_fall_back_without_bigquery(monkeypatch):
   assert [r["region"] for r in out["rows"]][0] == "US-West"
 
 
+def test_failing_query_returns_error_not_fabricated_rows(monkeypatch):
+  class _Boom:
+
+    def query(self, *a, **k):
+      raise RuntimeError("400 invalid query")
+
+  monkeypatch.setitem(demo._BQ, "disabled", False)
+  monkeypatch.setitem(demo._BQ, "error", None)
+  monkeypatch.setitem(demo._BQ, "client", _Boom())
+  out = demo._execute_sql({"sql": "SELECT broken"})
+  assert out["engine"] == "bigquery"
+  assert out["rows"] == [] and "400" in out["error"]  # honest failure
+
+
 def test_chart_multiseries_per_region_per_year():
   # The shape the user's real question produces: GROUP BY region, year with
   # two measures. x = the time field, one SERIES per region, measure picked
@@ -708,7 +732,8 @@ def test_all_seven_shapes_validate_and_lint_clean():
 
 
 @pytest.mark.asyncio
-async def test_sequence_executes():
+async def test_sequence_executes(monkeypatch):
+  monkeypatch.setitem(demo._BQ, "disabled", True)  # no network in unit tests
   out = await _run(
       _expected_spec("sequence"),
       _stub_registry(),
@@ -729,7 +754,8 @@ async def test_fanout_executes_no_llm_needed():
 
 
 @pytest.mark.asyncio
-async def test_pipeline_executes_per_question():
+async def test_pipeline_executes_per_question(monkeypatch):
+  monkeypatch.setitem(demo._BQ, "disabled", True)
   out = await _run(
       _expected_spec("pipeline"),
       _stub_registry(),

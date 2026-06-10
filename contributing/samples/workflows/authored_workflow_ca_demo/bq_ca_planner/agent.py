@@ -335,11 +335,10 @@ def _execute_sql(value) -> dict:
           "bytes_processed": int(job.total_bytes_processed or 0),
       }
     except Exception as e:
-      return {
-          "rows": _query_engine(sql),
-          "engine": "mock-fallback",
-          "note": str(e)[:200],
-      }
+      # A failing query must NOT fabricate an answer from the mock — that
+      # path is only for missing credentials. Return the failure honestly;
+      # the repair loop upstream exists to prevent reaching here.
+      return {"rows": [], "engine": "bigquery", "error": str(e)[:300]}
   return {"rows": _query_engine(sql), "engine": "mock"}
 
 
@@ -874,17 +873,26 @@ def _scenario_defs():
   q_region = "What was revenue by region last quarter?"
   return {
       "sequence": dict(
-          title="Ask a question (sequence)",
-          shape="step → step → step → render_chart + step",
+          title="Ask a question (draft → REAL dry-run → repair → execute)",
+          shape=(
+              "loop_until(draft_or_repair → real dry_run) → run_query →"
+              " render_chart + step"
+          ),
           triggers=("revenue by region", "sequence"),
           task={"question": q_region},
           recipe=(
-              "Author, in order: (1) a step running nl2sql on the task;"
-              " (2) a step running dry_run on it; (3) a step running"
-              " run_query on that; (4) a step running render_chart on the"
-              " run_query step's output; (5) a step running"
-              " summarize_insight on the run_query step's output. Output ="
-              " the summarize step."
+              "Author, in order: (1) ONE loop_until for SQL drafting with"
+              " self-repair: init = Binding(source='task'); body = [(a) a"
+              " step running draft_or_repair_sql whose input is"
+              " Binding(source='step', step=<the loop's own id>) — round 0"
+              " reads the task, later rounds read the failed dry-run output"
+              " (sql + error); (b) a step running dry_run on (a)];"
+              " until_capability = sql_ok with until_input ="
+              " Binding(source='step', step=<the (b) step>); max_iters = 3."
+              " (2) a step running run_query on the loop's output. (3) a"
+              " step running render_chart on the run_query step's output."
+              " (4) a step running summarize_insight on the run_query"
+              " step's output. Output = the summarize step."
           ),
       ),
       "fanout": dict(

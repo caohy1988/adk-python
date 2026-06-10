@@ -43,15 +43,15 @@ adk web contributing/samples/workflows/authored_workflow_ca_demo --port 8001
 Open the UI, pick `bq_ca_planner`, and send the prompts below — **one
 scenario per prompt**, each authoring a different coordination shape:
 
-| #   | Send this prompt                                             | Shape authored                                                      | CA story                                                                   |
-| --- | ------------------------------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| 1   | `What was revenue by region last quarter?`                   | sequence: `nl2sql → dry_run → run_query → render_chart + summarize` | the basic ask-a-question flow — **your actual question is the task input** |
-| 2   | `Profile data quality across the dataset tables.`            | fan-out → synthesize                                                | per-table profiling in parallel, one report                                |
-| 3   | `Build a dashboard for these three questions.`               | pipeline(`nl2sql → dry_run`) per item                               | each panel translated + validated barrier-free                             |
-| 4   | `Route my question: what does order status 'Complete' mean?` | classify & route (branch)                                           | metadata questions skip SQL entirely                                       |
-| 5   | `Answer with SQL self-repair — the dry run is unreliable.`   | loop_until + **loop-carried `init`**                                | draft → failed dry run → repair using the error                            |
-| 6   | `Audit these insights — verify each one independently.`      | adversarial verification                                            | independent skeptics per insight; the $1M AOV claim gets refuted           |
-| 7   | `Pick the best chart for revenue by region.`                 | tournament                                                          | pairwise chart judging to a single winner                                  |
+| #   | Send this prompt                                             | Shape authored                                                                     | CA story                                                                                                                                                    |
+| --- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | `What was revenue by region last quarter?`                   | `loop_until(draft → REAL dry-run → repair) → run_query → render_chart + summarize` | the standard CA flow — **your actual question is the task input**, and a real BigQuery dry-run error (e.g. `TIMESTAMP_SUB ... YEAR`) feeds the repair round |
+| 2   | `Profile data quality across the dataset tables.`            | fan-out → synthesize                                                               | per-table profiling in parallel, one report                                                                                                                 |
+| 3   | `Build a dashboard for these three questions.`               | pipeline(`nl2sql → dry_run`) per item                                              | each panel translated + validated barrier-free                                                                                                              |
+| 4   | `Route my question: what does order status 'Complete' mean?` | classify & route (branch)                                                          | metadata questions skip SQL entirely                                                                                                                        |
+| 5   | `Answer with SQL self-repair — the dry run is unreliable.`   | loop_until + **loop-carried `init`**                                               | draft → failed dry run → repair using the error                                                                                                             |
+| 6   | `Audit these insights — verify each one independently.`      | adversarial verification                                                           | independent skeptics per insight; the $1M AOV claim gets refuted                                                                                            |
+| 7   | `Pick the best chart for revenue by region.`                 | tournament                                                                         | pairwise chart judging to a single winner                                                                                                                   |
 
 What to point at as each one streams:
 
@@ -61,6 +61,7 @@ What to point at as each one streams:
 - **🔒 freeze (per-scenario key)** — **re-send any prompt**: same hash, `0 planner calls (frozen replay)`. Seven independent frozen plans in one session.
 - **template reuse (scenario 1)** — after the first ask, send a *different* question (`What was revenue by region last year?`): the frozen plan is reused unchanged, your new question flows through it as new task input, and the mock rows change with the window (quarter vs year canned sets). Same plan, new data — the RFC's replay-vs-template distinction, live.
 - **📈 chart** — scenarios 1 and 7 emit the Conversational-Analytics-style chart artifact: a **rendered chart image inline in the chat** (matplotlib, optional — falls back to a Unicode preview) plus the **Vega-Lite spec** (what the real CA API returns). Time-series rows infer a line mark; in the tournament, the bracket picks the mark and `render_chart` draws the data with it.
+- **honest failure handling** — a query that still fails after repair returns empty rows + the real error (`engine: bigquery`); the mock warehouse is used ONLY when credentials are absent, never to paper over a failing query.
 - **📄 result + 📊 cost** — real execution on the #92 supervisor; the repair scenario shows exactly one repair iteration (`Table not found … did you mean orders?` → fixed), the audit scenario rejects the implausible insight, the tournament returns `["bar"]`.
 
 Talking point for scenario 5 (the differentiated one): *the repair loop needs
@@ -72,7 +73,7 @@ replayable — a turn-by-turn agent retry never is.*
 ## 2. Correctness proof (no LLM, no BigQuery)
 
 ```bash
-pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 27 (one live-gated: CA_DEMO_LIVE_BQ=1)
+pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 28 (one live-gated: CA_DEMO_LIVE_BQ=1)
 ```
 
 All seven expected shapes are built by hand, validated + lint-checked against
