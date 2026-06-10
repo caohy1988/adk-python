@@ -40,6 +40,16 @@ export SPIKE_GEMINI_MODEL=gemini-3.5-flash
 adk web contributing/samples/workflows/authored_workflow_ca_demo --port 8001
 ```
 
+**Talk to it first** — the agent has a conversational gate (the RFC's
+"no-plan escape hatch"): untriggered messages are intent-classified, and
+meta/chit-chat turns get a direct answer instead of a workflow. Try:
+
+```text
+What kinds of workflow can you issue?
+```
+
+→ a plain-language catalogue of the seven shapes with example prompts — `0 planner calls, 0 queries`. Data questions proceed to the machinery below.
+
 Open the UI, pick `bq_ca_planner`, and send the prompts below — **one
 scenario per prompt**, each authoring a different coordination shape:
 
@@ -73,7 +83,7 @@ replayable — a turn-by-turn agent retry never is.*
 ## 2. Correctness proof (no LLM, no BigQuery)
 
 ```bash
-pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 31 (one live-gated: CA_DEMO_LIVE_BQ=1)
+pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 32 (one live-gated: CA_DEMO_LIVE_BQ=1)
 ```
 
 All seven expected shapes are built by hand, validated + lint-checked against

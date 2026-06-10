@@ -787,6 +787,33 @@ def test_registry_clean_and_typed():
   assert reg.open_map_warnings() == []  # enumerated fields only
 
 
+def test_conversational_gate_routing():
+  # Triggered messages bypass the gate (mode selectors stay deterministic);
+  # untriggered messages go through the intent gate first — including the
+  # live failure this pins: a meta-question must NOT become a data query.
+  assert demo._matched_scenario("profile data quality please") == "fanout"
+  assert demo._matched_scenario("pick the best chart for revenue") == (
+      "tournament"
+  )
+  assert demo._matched_scenario("What was revenue by region?") is None
+  assert (
+      demo._matched_scenario("tell what kinds of workflow you can issue?")
+      is None
+  )
+  # the catalogue lists all seven scenarios and is template-safe
+  cat = demo._describe_workflows()
+  for sc in demo.SCENARIOS.values():
+    assert sc["title"] in cat
+  import re as _re
+
+  assert not _re.findall(r"\{[A-Za-z_][A-Za-z0-9_]*\}", cat)
+  assert not _re.findall(
+      r"\{[A-Za-z_][A-Za-z0-9_]*\}", demo._intent_agent().instruction
+  )
+  # the gate's schema: data -> proceed; meta/chat -> direct reply
+  assert set(demo.Intent.model_fields) == {"intent", "reply"}
+
+
 def test_scenario_routing():
   assert demo._scenario_for("What was revenue by region?") == "sequence"
   assert demo._scenario_for("Profile data quality please") == "fanout"

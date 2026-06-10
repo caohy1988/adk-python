@@ -449,6 +449,13 @@ class Verdict(BaseModel):
   refuted: bool
 
 
+class Intent(BaseModel):
+  """The conversational gate's verdict for untriggered messages."""
+
+  intent: Literal["data", "meta", "chat"]
+  reply: str = ""
+
+
 def _obj_of(v):
   """Accept a dict, a JSON-encoded dict/list string, or return None."""
   if isinstance(v, (dict, list)):
@@ -1093,6 +1100,56 @@ def _task_for(key: str, text: str) -> dict:
   return task
 
 
+def _matched_scenario(text: str):
+  """The scenario whose trigger the message hits, or None (gate decides)."""
+  t = (text or "").lower()
+  for key, sc in SCENARIOS.items():
+    if key == "sequence":
+      continue
+    if any(trigger in t for trigger in sc["triggers"]):
+      return key
+  return None
+
+
+def _describe_workflows() -> str:
+  """A brace-free catalogue of the workflow kinds, built from SCENARIOS so
+  it never drifts from the actual demo."""
+  lines = []
+  for sc in SCENARIOS.values():
+    shape = sc["shape"].replace("{", "(").replace("}", ")")
+    lines.append(f"* {sc['title']} — shape: {shape}")
+  return "\n".join(lines)
+
+
+def _intent_agent() -> Agent:
+  # The conversational gate: small questions should not pay orchestration
+  # overhead (the RFC's no-plan escape hatch). NOTE: instruction must stay
+  # brace-free (ADK templates curly identifiers as state injection).
+  return Agent(
+      name="intent_gate",
+      model=MODEL,
+      output_schema=Intent,
+      generate_content_config=DET,
+      instruction=(
+          "You are the front door of a BigQuery Conversational Analytics"
+          " demo agent. It answers questions over the public"
+          " bigquery-public-data.thelook_ecommerce dataset (orders,"
+          " order_items, products, users) by AUTHORING typed workflows:\n"
+          + _describe_workflows()
+          + "\nClassify the user's message. If it is a question answerable"
+          " from the e-commerce data (metrics, trends, segments, SQL-able"
+          " asks), output intent='data' with an empty reply. If it asks"
+          " what you can do, which workflows you can issue, how to use"
+          " you, or about your design, output intent='meta' and write a"
+          " genuinely helpful reply: list the workflow kinds above, one"
+          " example prompt each, and mention that plans are validated,"
+          " frozen, replayable across sessions, and run on real BigQuery."
+          " Otherwise output intent='chat' with a brief friendly reply"
+          " that points at what you can do. Reply in plain markdown."
+      ),
+  )
+
+
 def _scenario_for(text: str) -> str:
   """Specialized scenarios win over the generic ask-a-question fallback.
 
@@ -1174,7 +1231,21 @@ def _hash(spec: WorkflowSpec) -> str:
 async def plan_and_run(ctx: Context, node_input):
   reg = _registry()
   text = _text_of(node_input)
-  key = _scenario_for(text)
+  key = _matched_scenario(text)
+  if key is None:
+    # Conversational gate: only untriggered messages pay this one call —
+    # meta/chat turns get a direct answer and never issue a workflow.
+    raw = await ctx.run_node(_intent_agent(), node_input=text, run_id="intent")
+    verdict = Intent.model_validate(raw)
+    if verdict.intent != "data":
+      yield _msg(verdict.reply or "Ask me a question about the data!")
+      yield _msg(
+          "💬 _Conversational turn — no workflow issued (1 intent call,"
+          " 0 planner calls, 0 queries)._"
+      )
+      yield Event(output={"scenario": "conversation", "intent": verdict.intent})
+      return
+    key = "sequence"
   sc = SCENARIOS[key]
   task = _task_for(key, text)
   state_key = f"authored_workflow:ca:{key}"
