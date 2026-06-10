@@ -217,6 +217,132 @@ def _query_engine(sql_text: str) -> list[dict]:
   ]
 
 
+# ------------------------------------------------- REAL BigQuery backend
+# When credentials allow, dry_run and run_query hit the REAL
+# bigquery-public-data.thelook_ecommerce dataset (billed to
+# GOOGLE_CLOUD_PROJECT) — real dry-run errors, real bytes-scanned, real
+# multi-dimensional results. Safety rails: maximum_bytes_billed caps each
+# query, results cap at _MAX_ROWS. Anything that fails falls back to the
+# deterministic micro-warehouse above, so CI and credential-less machines
+# keep working. CA_DEMO_USE_BIGQUERY=0 forces the mock.
+_BQ_DATASET = "bigquery-public-data.thelook_ecommerce"
+_MAX_BYTES_BILLED = 2 * 1024**3  # 2 GB per query
+_MAX_ROWS = 500
+_BQ = {
+    "client": None,
+    "disabled": os.environ.get("CA_DEMO_USE_BIGQUERY", "1") != "1",
+    "error": None,
+}
+
+
+def _bq_client():
+  if _BQ["disabled"] or _BQ["error"]:
+    return None
+  if _BQ["client"] is None:
+    try:
+      from google.cloud import bigquery  # optional dependency
+
+      _BQ["client"] = bigquery.Client(
+          project=os.environ.get("GOOGLE_CLOUD_PROJECT") or None
+      )
+    except Exception as e:  # no lib / no credentials -> mock warehouse
+      _BQ["error"] = f"{type(e).__name__}: {e}"
+      return None
+  return _BQ["client"]
+
+
+def _qualify_sql(sql: str) -> str:
+  """Fully qualify bare thelook table refs for real BigQuery."""
+  s = (sql or "").replace("`", "")
+  s = re.sub(
+      r"(?<![\w.-])thelook_ecommerce\.",
+      "bigquery-public-data.thelook_ecommerce.",
+      s,
+  )
+  return re.sub(
+      r"bigquery-public-data\.thelook_ecommerce\.([A-Za-z_]\w*)",
+      r"`bigquery-public-data.thelook_ecommerce.\1`",
+      s,
+  )
+
+
+def _jsonify_cell(v):
+  import datetime as _dt
+  import decimal
+
+  if isinstance(v, decimal.Decimal):
+    return round(float(v), 2)
+  if isinstance(v, float):
+    return round(v, 2)
+  if isinstance(v, (_dt.datetime, _dt.date)):
+    return v.isoformat()
+  return v
+
+
+def _bq_dry_run(value) -> dict:
+  sql = _qualify_sql(_sql_of(value))
+  client = _bq_client()
+  if client is None:
+    return {
+        "sql": sql,
+        "valid": "select" in sql.lower(),
+        "error": None,
+        "engine": "mock",
+    }
+  from google.cloud import bigquery
+
+  try:
+    job = client.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False),
+    )
+    return {
+        "sql": sql,
+        "valid": True,
+        "error": None,
+        "engine": "bigquery",
+        "bytes_processed": int(job.total_bytes_processed or 0),
+    }
+  except Exception as e:  # the REAL BigQuery error feeds the repair story
+    return {
+        "sql": sql,
+        "valid": False,
+        "error": str(e)[:500],
+        "engine": "bigquery",
+    }
+
+
+def _execute_sql(value) -> dict:
+  sql = _qualify_sql(_sql_of(value))
+  client = _bq_client()
+  if client is not None:
+    from google.cloud import bigquery
+
+    try:
+      job = client.query(
+          sql,
+          job_config=bigquery.QueryJobConfig(
+              maximum_bytes_billed=_MAX_BYTES_BILLED
+          ),
+      )
+      rows = [
+          {k: _jsonify_cell(v) for k, v in dict(r).items()}
+          for r in job.result(max_results=_MAX_ROWS)
+      ]
+      return {
+          "rows": rows,
+          "engine": "bigquery",
+          "bytes_processed": int(job.total_bytes_processed or 0),
+      }
+    except Exception as e:
+      return {
+          "rows": _query_engine(sql),
+          "engine": "mock-fallback",
+          "note": str(e)[:200],
+      }
+  return {"rows": _query_engine(sql), "engine": "mock"}
+
+
 _CANNED_PROFILES = {
     "orders": {"table": "orders", "row_count": 125210, "null_pct": 0.2},
     "order_items": {
@@ -304,19 +430,30 @@ def _verdict_of(v) -> dict:
 _VEGA_MARK = {"bar": "bar", "line": "line", "scatter": "point", "pie": "arc"}
 
 
-def _ascii_bars(rows, width: int = 24) -> str:
-  """A Unicode bar preview of (label, value) rows — renders in the chat."""
+def _ascii_bars(rows, x=None, y=None, series=None, width: int = 24) -> str:
+  """A Unicode bar preview of the rows — renders in the chat. Uses the
+  derived x/y/series fields when given (so an integer `year` column is
+  never mistaken for the measure); falls back to first-str/first-number."""
   pts = []
   for r in rows or []:
     if not isinstance(r, dict):
       continue
-    label = next((str(v) for v in r.values() if isinstance(v, str)), "?")
-    num = next(
-        (float(v) for v in r.values() if isinstance(v, (int, float))), 0.0
-    )
+    if x in r:
+      label = str(r.get(x, "?"))
+    else:
+      label = next((str(v) for v in r.values() if isinstance(v, str)), "?")
+    if series and series in r:
+      label = f"{r[series]} {label}"
+    if y in r:
+      num = float(r.get(y) or 0.0)
+    else:
+      num = next(
+          (float(v) for v in r.values() if isinstance(v, (int, float))), 0.0
+      )
     pts.append((label, num))
   if not pts:
     return "(no rows)"
+  pts = pts[:40]  # keep the chat readable for wide results
   mx = max(n for _, n in pts) or 1.0
   lw = max(len(label) for label, _ in pts)
   return "\n".join(
@@ -357,23 +494,62 @@ def _render_chart(v) -> dict:
   if not explicit and len(rows or []) >= 2 and all(map(_datelike, rows)):
     chart_type = "line"
   first = rows[0] if rows and isinstance(rows[0], dict) else {}
-  x_field = next((k for k, v in first.items() if isinstance(v, str)), "label")
-  y_field = next(
-      (k for k, v in first.items() if isinstance(v, (int, float))), "value"
+  timeish = ("year", "quarter", "month", "week", "date", "day")
+  str_fields = [k for k, v in first.items() if isinstance(v, str)]
+  time_fields = [
+      k
+      for k, v in first.items()
+      if k.lower() in timeish
+      or (isinstance(v, str) and re.match(r"^\d{4}([-/]\d{2})?", v))
+  ]
+  num_fields = [
+      k
+      for k, v in first.items()
+      if isinstance(v, (int, float))
+      and not isinstance(v, bool)
+      and k not in time_fields
+  ]
+  x_field = (
+      time_fields[0]
+      if time_fields
+      else (str_fields[0] if str_fields else "label")
   )
+  # a second categorical field becomes the SERIES (one line per value) —
+  # e.g. GROUP BY region, year -> x=year, one series per region.
+  series_field = next(
+      (k for k in str_fields if k != x_field and k not in time_fields), None
+  )
+  if series_field is None and len(time_fields) == 0:
+    series_field = None
+
+  def _measure_rank(k: str) -> int:
+    kl = k.lower()
+    if "revenue" in kl or "sales" in kl:
+      return 0
+    if "total" in kl or "amount" in kl:
+      return 1
+    return 2
+
+  y_field = sorted(num_fields, key=_measure_rank)[0] if num_fields else "value"
+  if series_field and not explicit:
+    chart_type = "line"  # comparing series over a dimension -> lines
+  encoding = {
+      "x": {"field": x_field, "type": "nominal"},
+      "y": {"field": y_field, "type": "quantitative"},
+  }
+  if series_field:
+    encoding["color"] = {"field": series_field, "type": "nominal"}
   return {
       "chart_type": chart_type,
       "x_field": x_field,
       "y_field": y_field,
-      "ascii": _ascii_bars(rows),
+      "series_field": series_field,
+      "ascii": _ascii_bars(rows, x=x_field, y=y_field, series=series_field),
       "vega_lite": {
           "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
           "mark": _VEGA_MARK[chart_type],
           "data": {"values": rows},
-          "encoding": {
-              "x": {"field": x_field, "type": "nominal"},
-              "y": {"field": y_field, "type": "quantitative"},
-          },
+          "encoding": encoding,
       },
   }
 
@@ -393,32 +569,40 @@ def _chart_png(chart: dict):
   import io
 
   rows = chart["vega_lite"]["data"]["values"]
-  labels = [
-      next((str(v) for v in r.values() if isinstance(v, str)), "?")
-      for r in rows
-  ]
-  values = [
-      next((float(v) for v in r.values() if isinstance(v, (int, float))), 0.0)
-      for r in rows
-  ]
+  x, y = chart.get("x_field", "label"), chart.get("y_field", "value")
+  series = chart.get("series_field")
   kind = chart["chart_type"]
-  fig, ax = plt.subplots(figsize=(6.4, 3.4), dpi=144)
-  if kind == "pie":
-    ax.pie(values, labels=labels, autopct="%1.0f%%")
-  elif kind == "line":
-    ax.plot(labels, values, marker="o", color="#4285F4")
-  elif kind == "scatter":
-    ax.scatter(labels, values, s=80, color="#4285F4")
+  fig, ax = plt.subplots(figsize=(6.8, 3.6), dpi=144)
+  if series:
+    # one line per series value (e.g. per region), x shared
+    by_series: dict = {}
+    for r in rows:
+      by_series.setdefault(str(r.get(series, "?")), []).append(
+          (str(r.get(x, "?")), float(r.get(y) or 0.0))
+      )
+    for name, pts in sorted(by_series.items()):
+      pts.sort()
+      ax.plot([p[0] for p in pts], [p[1] for p in pts], marker="o", label=name)
+    ax.legend(fontsize=8)
   else:
-    ax.bar(labels, values, color="#4285F4")
-  if kind != "pie":
-    ax.set_ylabel(chart.get("y_field", "value"))
+    labels = [str(r.get(x, "?")) for r in rows]
+    values = [float(r.get(y) or 0.0) for r in rows]
+    if kind == "pie":
+      ax.pie(values, labels=labels, autopct="%1.0f%%")
+    elif kind == "line":
+      ax.plot(labels, values, marker="o", color="#4285F4")
+    elif kind == "scatter":
+      ax.scatter(labels, values, s=80, color="#4285F4")
+    else:
+      ax.bar(labels, values, color="#4285F4")
+  if kind != "pie" or series:
+    ax.set_ylabel(y)
     ax.grid(axis="y", alpha=0.3)
     ax.spines[["top", "right"]].set_visible(False)
-  ax.set_title(
-      f"{chart.get('y_field', 'value')} by {chart.get('x_field', 'label')}"
-      f" ({kind})"
-  )
+    if len({str(r.get(x, "")) for r in rows}) > 8:
+      ax.tick_params(axis="x", labelrotation=60, labelsize=7)
+  title = f"{y} by {x}" + (f" per {series}" if series else "") + f" ({kind})"
+  ax.set_title(title)
   fig.tight_layout()
   buf = io.BytesIO()
   fig.savefig(buf, format="png")
@@ -460,8 +644,9 @@ def _registry() -> CapabilityRegistry:
               "nl2sql",
               Sql,
               "Translate the question in the input JSON to one BigQuery"
-              f" StandardSQL SELECT over thelook_ecommerce: {schema_blurb}."
-              " Output Sql.",
+              " StandardSQL SELECT over the public dataset"
+              " bigquery-public-data.thelook_ecommerce (use fully-qualified"
+              f" table names): {schema_blurb}. Output Sql.",
           ),
       ),
       Capability(
@@ -474,8 +659,9 @@ def _registry() -> CapabilityRegistry:
               Sql,
               "Input JSON has a question, and possibly a prior sql + error"
               " from a failed dry run. Draft (or repair, using the error)"
-              " one BigQuery StandardSQL SELECT over thelook_ecommerce:"
-              f" {schema_blurb}. Output Sql.",
+              " one BigQuery StandardSQL SELECT over the public dataset"
+              " bigquery-public-data.thelook_ecommerce (fully-qualified"
+              f" table names): {schema_blurb}. Output Sql.",
           ),
       ),
       Capability(
@@ -522,14 +708,7 @@ def _registry() -> CapabilityRegistry:
           name="dry_run",
           input_kind="item",
           serialize_input=False,
-          build=_stub(
-              "dry_run",
-              lambda s: {
-                  "sql": _sql_of(s),
-                  "valid": "select" in _sql_of(s).lower(),
-                  "error": None,
-              },
-          ),
+          build=_stub("dry_run", _bq_dry_run),
       ),
       Capability(
           name="flaky_dry_run",
@@ -552,9 +731,7 @@ def _registry() -> CapabilityRegistry:
           name="run_query",
           input_kind="item",
           serialize_input=False,
-          build=_stub(
-              "run_query", lambda s: {"rows": _query_engine(_sql_of(s))}
-          ),
+          build=_stub("run_query", _execute_sql),
       ),
       Capability(
           name="profile_table",

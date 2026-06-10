@@ -454,6 +454,95 @@ def test_chart_png_renders_or_falls_back():
     assert demo._chart_png(demo._render_chart([kind])) is not None
 
 
+def test_qualify_sql_for_real_bigquery():
+  q = demo._qualify_sql(
+      "SELECT * FROM thelook_ecommerce.orders JOIN"
+      " thelook_ecommerce.order_items USING (order_id)"
+  )
+  assert "`bigquery-public-data.thelook_ecommerce.orders`" in q
+  assert "`bigquery-public-data.thelook_ecommerce.order_items`" in q
+  # already-qualified and backticked inputs normalize to the same form
+  same = demo._qualify_sql(
+      "SELECT * FROM `bigquery-public-data.thelook_ecommerce.orders`"
+  )
+  assert same.count("`bigquery-public-data.thelook_ecommerce.orders`") == 1
+
+
+def test_jsonify_cells():
+  import datetime
+  import decimal
+
+  assert demo._jsonify_cell(decimal.Decimal("3.14159")) == 3.14
+  assert demo._jsonify_cell(2.71828) == 2.72
+  assert demo._jsonify_cell(datetime.date(2024, 1, 31)) == "2024-01-31"
+  assert demo._jsonify_cell(datetime.datetime(2024, 1, 31, 12, 0)).startswith(
+      "2024-01-31T12:00"
+  )
+  assert demo._jsonify_cell("x") == "x" and demo._jsonify_cell(7) == 7
+
+
+def test_dry_run_and_execute_fall_back_without_bigquery(monkeypatch):
+  monkeypatch.setitem(demo._BQ, "disabled", True)
+  d = demo._bq_dry_run({"sql": "SELECT region FROM thelook_ecommerce.orders"})
+  assert d["engine"] == "mock" and d["valid"] is True
+  out = demo._execute_sql(
+      {"sql": "SELECT region, SUM(x) AS revenue ... GROUP BY region"}
+  )
+  assert out["engine"] == "mock"
+  assert [r["region"] for r in out["rows"]][0] == "US-West"
+
+
+def test_chart_multiseries_per_region_per_year():
+  # The shape the user's real question produces: GROUP BY region, year with
+  # two measures. x = the time field, one SERIES per region, measure picked
+  # by name preference (total_sales over total_orders); int year never
+  # mistaken for the measure.
+  rows = [
+      {"region": r, "year": y, "total_sales": s, "total_orders": o}
+      for (r, y, s, o) in [
+          ("US-West", 2024, 100.0, 10),
+          ("US-West", 2025, 130.0, 12),
+          ("EMEA", 2024, 70.0, 8),
+          ("EMEA", 2025, 90.0, 9),
+      ]
+  ]
+  ch = demo._render_chart({"rows": rows})
+  assert ch["x_field"] == "year"
+  assert ch["series_field"] == "region"
+  assert ch["y_field"] == "total_sales"
+  assert ch["chart_type"] == "line"
+  assert ch["vega_lite"]["encoding"]["color"]["field"] == "region"
+  assert "US-West" in ch["ascii"] and "130.00" in ch["ascii"]
+  png = demo._chart_png(ch)
+  if png is not None:
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("CA_DEMO_LIVE_BQ"),
+    reason="live BigQuery round-trip (set CA_DEMO_LIVE_BQ=1 + credentials)",
+)
+def test_live_bigquery_roundtrip():
+  good = demo._bq_dry_run({
+      "sql": (
+          "SELECT status, COUNT(*) AS n FROM thelook_ecommerce.orders"
+          " GROUP BY status"
+      )
+  })
+  assert good["engine"] == "bigquery" and good["valid"] is True
+  assert good["bytes_processed"] > 0
+  bad = demo._bq_dry_run({"sql": "SELECT nope FROM thelook_ecommerce.orders"})
+  assert bad["valid"] is False and bad["error"]  # a REAL BigQuery error
+  out = demo._execute_sql({
+      "sql": (
+          "SELECT status, COUNT(*) AS n FROM thelook_ecommerce.orders"
+          " GROUP BY status ORDER BY n DESC LIMIT 3"
+      )
+  })
+  assert out["engine"] == "bigquery" and len(out["rows"]) == 3
+  assert out["rows"][0]["n"] > 0
+
+
 def test_engine_aggregates_by_region_and_window():
   # The "intelligent mock": rows are AGGREGATED from synthetic facts per the
   # SQL's intent, not pattern-matched to a canned answer.
