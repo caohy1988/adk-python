@@ -75,8 +75,8 @@ from authoring import CapabilityRegistry  # noqa: E402
 from authoring import export_plan  # noqa: E402
 from authoring import FrozenWorkflowRecord  # noqa: E402
 from authoring import import_plan  # noqa: E402
-from authoring import PlanImportError  # noqa: E402
 from authoring import independence_facts  # noqa: E402
+from authoring import PlanImportError  # noqa: E402
 from authoring import sha256_hex  # noqa: E402
 from authoring import SpecInterpreter  # noqa: E402
 from authoring import WorkflowSpec  # noqa: E402
@@ -286,10 +286,15 @@ def _jsonify_cell(v):
 
 def _bq_dry_run(value) -> dict:
   sql = _qualify_sql(_sql_of(value))
+  # Preserve the user's question through the dry run: after a FAILURE this
+  # output becomes the loop-carried value, and the repair round needs full
+  # context (question + sql + error), not just sql + error.
+  question = str(_field_of(value, "question", "") or "")
   client = _bq_client()
   if client is None:
     return {
         "sql": sql,
+        "question": question,
         "valid": "select" in sql.lower(),
         "error": None,
         "engine": "mock",
@@ -303,6 +308,7 @@ def _bq_dry_run(value) -> dict:
     )
     return {
         "sql": sql,
+        "question": question,
         "valid": True,
         "error": None,
         "engine": "bigquery",
@@ -311,6 +317,7 @@ def _bq_dry_run(value) -> dict:
   except Exception as e:  # the REAL BigQuery error feeds the repair story
     return {
         "sql": sql,
+        "question": question,
         "valid": False,
         "error": str(e)[:500],
         "engine": "bigquery",
@@ -377,6 +384,56 @@ _JUDGE_RANK = {"bar": 0, "line": 1, "scatter": 2, "pie": 3}
 # ------------------------------------------------- typed outputs (LLM caps)
 class Sql(BaseModel):
   sql: str
+  # Echoed by the SQL-drafting capabilities so the loop-carried value still
+  # holds the user's question after a FAILED dry run — the repair round
+  # repairs with full context (question + sql + real error), not sql+error.
+  question: str = ""
+
+
+class DryRunResult(BaseModel):
+  sql: str
+  valid: bool
+  error: str | None = None
+  engine: str = "mock"
+  question: str = ""
+  bytes_processed: int = 0
+
+
+class QueryResult(BaseModel):
+  rows: list[dict]
+  engine: str = "mock"
+  bytes_processed: int = 0
+  error: str | None = None
+
+
+class ChartArtifact(BaseModel):
+  chart_type: str
+  x_field: str
+  y_field: str
+  series_field: str | None = None
+  ascii: str
+  vega_lite: dict
+
+
+class TableProfile(BaseModel):
+  table: str
+  row_count: int
+  null_pct: float
+
+
+class QualityReport(BaseModel):
+  tables: int
+  worst_table: str
+  max_null_pct: float
+
+
+class SchemaAnswer(BaseModel):
+  answer: str
+
+
+class VerifiedInsights(BaseModel):
+  verified: list[str]
+  rejected: list[str]
 
 
 class Insight(BaseModel):
@@ -650,7 +707,8 @@ def _registry() -> CapabilityRegistry:
               "Translate the question in the input JSON to one BigQuery"
               " StandardSQL SELECT over the public dataset"
               " bigquery-public-data.thelook_ecommerce (use fully-qualified"
-              f" table names): {schema_blurb}. Output Sql.",
+              f" table names): {schema_blurb}. Output Sql, echoing the"
+              " question field.",
           ),
       ),
       Capability(
@@ -665,7 +723,8 @@ def _registry() -> CapabilityRegistry:
               " from a failed dry run. Draft (or repair, using the error)"
               " one BigQuery StandardSQL SELECT over the public dataset"
               " bigquery-public-data.thelook_ecommerce (fully-qualified"
-              f" table names): {schema_blurb}. Output Sql.",
+              f" table names): {schema_blurb}. Output Sql, echoing the"
+              " question field.",
           ),
       ),
       Capability(
@@ -711,12 +770,14 @@ def _registry() -> CapabilityRegistry:
       Capability(
           name="dry_run",
           input_kind="item",
+          output_model=DryRunResult,
           serialize_input=False,
           build=_stub("dry_run", _bq_dry_run),
       ),
       Capability(
           name="flaky_dry_run",
           input_kind="item",
+          output_model=DryRunResult,
           serialize_input=False,
           build=_stub("flaky_dry_run", lambda s: _flaky_dry_run(s)),
       ),
@@ -734,11 +795,13 @@ def _registry() -> CapabilityRegistry:
       Capability(
           name="run_query",
           input_kind="item",
+          output_model=QueryResult,
           serialize_input=False,
           build=_stub("run_query", _execute_sql),
       ),
       Capability(
           name="profile_table",
+          output_model=TableProfile,
           input_kind="item",
           serialize_input=False,
           max_fan_out=20,
@@ -751,6 +814,7 @@ def _registry() -> CapabilityRegistry:
       ),
       Capability(
           name="quality_report",
+          output_model=QualityReport,
           input_kind="list",
           serialize_input=False,
           build=_stub(
@@ -766,6 +830,7 @@ def _registry() -> CapabilityRegistry:
       ),
       Capability(
           name="describe_schema",
+          output_model=SchemaAnswer,
           input_kind="item",
           serialize_input=False,
           build=_stub(
@@ -776,11 +841,13 @@ def _registry() -> CapabilityRegistry:
       Capability(
           name="render_chart",
           input_kind="item",
+          output_model=ChartArtifact,
           serialize_input=False,
           build=_stub("render_chart", _render_chart),
       ),
       Capability(
           name="keep_verified",
+          output_model=VerifiedInsights,
           input_kind="list",
           serialize_input=False,
           build=_stub(
@@ -1060,7 +1127,9 @@ def _planner_instruction(sc) -> str:
 # is exported as a portable envelope to disk (a stand-in for the
 # ArtifactService in production — RFC Q1). A NEW session imports it through
 # the RFC's DEFENSIVE import: spec_hash recomputed, re-validated against the
-# CURRENT registry, manual-version + contract-hash drift fail loudly, and
+# CURRENT registry, manual-version + DECLARED-contract drift (input kind +
+# declared output schema; capabilities without a declared output model rely
+# on manual versions) fail loudly, and
 # the new task input is validated against the captured task_input_schema
 # (template reuse). Drift never silently replays a stale plan — it falls
 # back to authoring fresh, with the rejection shown.

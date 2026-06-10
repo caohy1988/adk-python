@@ -581,6 +581,30 @@ def test_cross_session_import_rejects_tamper_and_drift(tmp_path, monkeypatch):
   assert spec is None and "contract drift" in reject
 
 
+def test_dry_run_preserves_question_for_repair_rounds(monkeypatch):
+  # Review finding: after a FAILED dry run, the loop-carried value must
+  # still hold the user's question — otherwise the repair round repairs
+  # from sql+error with no goal context. Mock branch:
+  monkeypatch.setitem(demo._BQ, "disabled", True)
+  out = demo._bq_dry_run({"sql": "SELECT 1", "question": "trend by year?"})
+  assert out["question"] == "trend by year?"
+
+  # Real-branch FAILURE (the path that feeds the repair round):
+  class _Boom:
+
+    def query(self, *a, **k):
+      raise RuntimeError("400 TIMESTAMP_SUB does not support YEAR")
+
+  monkeypatch.setitem(demo._BQ, "disabled", False)
+  monkeypatch.setitem(demo._BQ, "error", None)
+  monkeypatch.setitem(demo._BQ, "client", _Boom())
+  out = demo._bq_dry_run({"sql": "SELECT broken", "question": "trend?"})
+  assert out["valid"] is False and "TIMESTAMP_SUB" in out["error"]
+  assert out["question"] == "trend?"  # full repair context preserved
+  # and the Sql schema itself carries the echo field:
+  assert "question" in demo.Sql.model_fields
+
+
 def test_chart_multiseries_per_region_per_year():
   # The shape the user's real question produces: GROUP BY region, year with
   # two measures. x = the time field, one SERIES per region, measure picked
