@@ -814,6 +814,51 @@ def test_conversational_gate_routing():
   assert set(demo.Intent.model_fields) == {"intent", "reply"}
 
 
+@pytest.mark.asyncio
+async def test_meta_question_escapes_without_any_workflow(
+    tmp_path, monkeypatch
+):
+  """The full no-workflow escape path, no LLM: a meta-question returns the
+  gate's reply BEFORE plan-store import, session replay, authoring, or
+  execution — the exact live failure mode, locked end-to-end."""
+
+  def stub_gate():
+    @node(name="intent_gate")
+    async def n(ctx, node_input):
+      yield Event(output={"intent": "meta", "reply": "Seven workflow shapes."})
+
+    return n
+
+  monkeypatch.setattr(demo, "_intent_agent", stub_gate)
+  stub_reg = _stub_registry()  # build BEFORE patching (it reads _registry)
+  monkeypatch.setattr(demo, "_registry", lambda: stub_reg)
+  monkeypatch.setattr(demo, "_PLAN_STORE", str(tmp_path))  # empty store
+  ss = InMemorySessionService()
+  session = await ss.create_session(app_name="demo", user_id="u")
+  runner = Runner(app_name="demo", node=demo.root_agent, session_service=ss)
+  texts, final = [], None
+  async for ev in runner.run_async(
+      user_id="u",
+      session_id=session.id,
+      new_message=types.Content(
+          parts=[types.Part(text="tell what kinds of workflow you can issue?")],
+          role="user",
+      ),
+  ):
+    if isinstance(ev, Event) and ev.content and ev.content.parts:
+      texts += [p.text for p in ev.content.parts if p.text]
+    if isinstance(ev, Event) and isinstance(ev.output, dict):
+      final = ev.output
+  joined = "\n".join(texts)
+  assert "Seven workflow shapes." in joined  # the gate's reply reached chat
+  assert final == {"scenario": "conversation", "intent": "meta"}
+  # and NOTHING workflow-shaped happened:
+  assert "hash" not in (final or {})
+  for marker in ("Authored plan", "Reusing frozen plan", "Validation passed"):
+    assert marker not in joined
+  assert not list(tmp_path.iterdir())  # nothing was frozen/exported
+
+
 def test_scenario_routing():
   assert demo._scenario_for("What was revenue by region?") == "sequence"
   assert demo._scenario_for("Profile data quality please") == "fanout"
