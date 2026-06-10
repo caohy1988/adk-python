@@ -415,10 +415,13 @@ def test_stubs_tolerate_authored_binding_shapes():
 
 def test_render_chart_accepts_authored_binding_shapes():
   # query output (dict with rows) -> bar over those rows
-  ch = demo._render_chart({"rows": demo._CANNED_ROWS_YEAR})
+  region_rows = demo._query_engine(
+      "SELECT region, SUM(x) AS revenue ... GROUP BY region INTERVAL 1 YEAR"
+  )
+  ch = demo._render_chart({"rows": region_rows})
   assert ch["chart_type"] == "bar"
-  assert "1,648,140.00" in ch["ascii"]
-  assert ch["vega_lite"]["data"]["values"] == demo._CANNED_ROWS_YEAR
+  assert "US-West" in ch["ascii"]
+  assert ch["vega_lite"]["data"]["values"] == region_rows
   # tournament winner (list with one chart type) -> that mark, canned rows
   ch = demo._render_chart(["pie"])
   assert ch["chart_type"] == "pie"
@@ -432,14 +435,85 @@ def test_render_chart_accepts_authored_binding_shapes():
   assert len(lines) == 4 and lines[0].count("█") > lines[-1].count("█")
 
 
-def test_rows_track_the_sql_window():
-  # The mock executor returns a DIFFERENT canned set for a year-scale
-  # window, so the demo output visibly tracks the question.
-  q_sql = "SELECT ... WHERE created_at >= INTERVAL 1 QUARTER"
-  y_sql = "SELECT ... WHERE created_at >= INTERVAL 1 YEAR"
-  assert demo._rows_for(q_sql) == demo._CANNED_ROWS
-  assert demo._rows_for(y_sql) == demo._CANNED_ROWS_YEAR
-  assert demo._rows_for({"sql": y_sql}) == demo._CANNED_ROWS_YEAR
+def test_render_chart_derives_encoding_fields():
+  ch = demo._render_chart({"rows": [{"category": "A", "count": 3}]})
+  assert ch["x_field"] == "category" and ch["y_field"] == "count"
+  enc = ch["vega_lite"]["encoding"]
+  assert enc["x"]["field"] == "category" and enc["y"]["field"] == "count"
+
+
+def test_chart_png_renders_or_falls_back():
+  ch = demo._render_chart({"rows": demo._CANNED_ROWS})
+  png = demo._chart_png(ch)
+  if png is None:
+    pytest.skip("matplotlib not installed — text fallback path")
+  assert png[:8] == b"\x89PNG\r\n\x1a\n"  # real PNG bytes
+  assert len(png) > 5000
+  # every chart kind renders without error
+  for kind in ("pie", "line", "scatter"):
+    assert demo._chart_png(demo._render_chart([kind])) is not None
+
+
+def test_engine_aggregates_by_region_and_window():
+  # The "intelligent mock": rows are AGGREGATED from synthetic facts per the
+  # SQL's intent, not pattern-matched to a canned answer.
+  q = demo._query_engine(
+      "SELECT country AS region, SUM(p) AS revenue ... GROUP BY region"
+      " ... INTERVAL 1 QUARTER"
+  )
+  y = demo._query_engine(
+      "SELECT country AS region, SUM(p) AS revenue ... GROUP BY region"
+      " ... INTERVAL 1 YEAR"
+  )
+  assert [r["region"] for r in q] == ["US-West", "US-East", "EMEA", "APAC"]
+  # a year window strictly contains the quarter window:
+  assert (
+      all(yr["revenue"] > qr["revenue"] for yr, qr in zip(y, q)) and len(y) == 4
+  )
+
+
+def test_engine_monthly_trend_with_alias_and_country_filter():
+  # The exact live gap this replaces: a trend question now returns a real
+  # monthly series, honoring the SQL's measure alias and US filter.
+  rows = demo._query_engine(
+      "SELECT DATE_TRUNC(o.created_at, MONTH) AS month, SUM(oi.sale_price)"
+      " AS total_sales FROM ... WHERE country = 'United States' AND"
+      " created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 YEAR)"
+      " GROUP BY month ORDER BY month"
+  )
+  assert len(rows) == 24  # 2 years of months
+  assert list(rows[0]) == ["month", "total_sales"]
+  assert rows[0]["month"] == "2024-01" and rows[-1]["month"] == "2025-12"
+  # US-only filter: below the all-regions total for the same window
+  all_rows = demo._query_engine(
+      "SELECT month, SUM(x) AS total_sales ... INTERVAL 2 YEAR GROUP BY month"
+  )
+  assert rows[0]["total_sales"] < all_rows[0]["total_sales"]
+
+
+def test_engine_grand_total_and_category_grouping():
+  total = demo._query_engine("SELECT SUM(sale_price) ... INTERVAL 2 YEAR")
+  assert len(total) == 1 and total[0]["revenue"] > 0
+  cats = demo._query_engine(
+      "SELECT category, SUM(x) AS revenue ... GROUP BY category"
+  )
+  assert [r["category"] for r in cats] == [
+      "Outerwear",
+      "Jeans",
+      "Activewear",
+      "Accessories",
+  ]
+
+
+def test_chart_infers_line_for_time_series():
+  rows = demo._query_engine(
+      "SELECT month, SUM(x) AS sales ... GROUP BY month INTERVAL 1 YEAR"
+  )
+  ch = demo._render_chart({"rows": rows})
+  assert ch["chart_type"] == "line"  # date-shaped x labels -> trend line
+  assert ch["vega_lite"]["mark"] == "line"
+  # an explicit winner still wins over the inference:
+  assert demo._render_chart(["bar"])["chart_type"] == "bar"
 
 
 def test_text_of_extracts_user_message():

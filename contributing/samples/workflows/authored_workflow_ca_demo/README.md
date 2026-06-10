@@ -6,9 +6,16 @@ a user asks data questions in natural language, and the planner **authors a
 different typed `WorkflowSpec` per scenario** over Conversational-Analytics
 capabilities — `nl2sql`, `dry_run`, `run_query`, `profile_table`, `skeptic`,
 chart judging — against a mock `thelook_ecommerce` dataset (the dataset the
-CA docs demo against). Query execution / dry-run / profiling are
-deterministic mocks (**no BigQuery project needed**); the language steps
-(NL2SQL, summaries, classification, skeptics) are live Gemini calls.
+CA docs demo against). Query execution runs on a **deterministic
+micro-warehouse**: a synthetic 24-month × 4-region × 4-category fact table
+plus SQL-intent parsing — the executor *aggregates* the facts per the
+query's grouping (month/region/category), time window (`INTERVAL N YEAR/QUARTER/MONTH`), filters (`country = 'United States'`, region/category
+literals), and measure alias (`AS total_sales`). No BigQuery project
+needed, and answers genuinely track the question (a trend question returns
+a real monthly series and charts as a line). Honest scope: it executes the
+query's *intent*, not its SQL — a real BigQuery backend is the production
+step. The language steps (NL2SQL, summaries, classification, skeptics) are
+live Gemini calls.
 
 Every scenario runs the full #93 machinery: **author → validate →
 independence lints → freeze (per-scenario key) → execute on the real engine
@@ -50,7 +57,7 @@ What to point at as each one streams:
 - **✅ + 🧪 validation & independence lints** — every scenario lints clean; the provenance facts are statically provable from the bindings.
 - **🔒 freeze (per-scenario key)** — **re-send any prompt**: same hash, `0 planner calls (frozen replay)`. Seven independent frozen plans in one session.
 - **template reuse (scenario 1)** — after the first ask, send a *different* question (`What was revenue by region last year?`): the frozen plan is reused unchanged, your new question flows through it as new task input, and the mock rows change with the window (quarter vs year canned sets). Same plan, new data — the RFC's replay-vs-template distinction, live.
-- **📈 chart** — scenarios 1 and 7 emit the Conversational-Analytics-style chart artifact: a Unicode bar preview rendered in the chat plus the **Vega-Lite spec** (what the real CA API returns). In the tournament, the bracket picks the mark and `render_chart` draws the data with it.
+- **📈 chart** — scenarios 1 and 7 emit the Conversational-Analytics-style chart artifact: a **rendered chart image inline in the chat** (matplotlib, optional — falls back to a Unicode preview) plus the **Vega-Lite spec** (what the real CA API returns). Time-series rows infer a line mark; in the tournament, the bracket picks the mark and `render_chart` draws the data with it.
 - **📄 result + 📊 cost** — real execution on the #92 supervisor; the repair scenario shows exactly one repair iteration (`Table not found … did you mean orders?` → fixed), the audit scenario rejects the implausible insight, the tournament returns `["bar"]`.
 
 Talking point for scenario 5 (the differentiated one): *the repair loop needs
@@ -62,7 +69,7 @@ replayable — a turn-by-turn agent retry never is.*
 ## 2. Correctness proof (no LLM, no BigQuery)
 
 ```bash
-pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 16
+pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 21
 ```
 
 All seven expected shapes are built by hand, validated + lint-checked against
@@ -85,5 +92,6 @@ against the **live** registry (their capabilities are deterministic mocks).
   seven replay independently within a session.
 - Scenario 1 takes your live message as the question; the other six prompts
   are mode selectors with canned task inputs (their results don't change
-  with your wording). All query results are canned either way — quarter vs
-  year selects between two mock row sets; there is no BigQuery behind it.
+  with your wording). Query answers come from the deterministic
+  micro-warehouse above — real aggregation over synthetic facts; there is
+  no BigQuery behind it.

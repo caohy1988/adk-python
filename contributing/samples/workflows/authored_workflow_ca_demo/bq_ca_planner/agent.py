@@ -44,7 +44,9 @@ Configure a model first (no hardcoded project):
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import sys
 import time
 from typing import Literal
@@ -96,15 +98,95 @@ _CANNED_ROWS = [
     {"region": "APAC", "revenue": 188777.75},
 ]
 
-# A year-scale window returns a different canned set, so the demo output
-# visibly TRACKS the input: ask "last quarter" vs "last year" and the rows
-# change (still mocks — no BigQuery behind them).
-_CANNED_ROWS_YEAR = [
-    {"region": "US-West", "revenue": 1648140.00},
-    {"region": "US-East", "revenue": 1571980.40},
-    {"region": "EMEA", "revenue": 1180510.90},
-    {"region": "APAC", "revenue": 760222.15},
+# ------------------------------------------------- micro-warehouse engine
+# The "intelligent mock executor": a deterministic synthetic fact table
+# (24 months x 4 regions x 4 categories) plus lightweight SQL-INTENT parsing.
+# Instead of pattern-matching to a canned answer, run_query AGGREGATES the
+# facts according to the query's grouping (month/region/category), window
+# (INTERVAL N YEAR/QUARTER/MONTH), filters (country/region literals), and
+# measure alias (SUM(...) AS <name>). Honest scope: it executes the query's
+# INTENT, not its SQL — a real BigQuery backend is the production step.
+_REGION_WEIGHT = {"US-West": 1.00, "US-East": 0.95, "EMEA": 0.72, "APAC": 0.46}
+_CATEGORY_WEIGHT = {
+    "Outerwear": 0.34,
+    "Jeans": 0.27,
+    "Activewear": 0.22,
+    "Accessories": 0.17,
+}
+_MONTHS = [f"{y}-{m:02d}" for y in (2024, 2025) for m in range(1, 13)]
+_BASE_MONTHLY = 142000.0
+
+
+def _seasonal(i: int) -> float:
+  # mild growth + yearly seasonality — deterministic, no RNG.
+  return 1.0 + 0.18 * math.sin(i * math.pi / 6) + 0.012 * i
+
+
+_FACTS = [
+    {
+        "month": month,
+        "region": region,
+        "category": category,
+        "revenue": round(_BASE_MONTHLY * rw * cw * _seasonal(i), 2),
+    }
+    for i, month in enumerate(_MONTHS)
+    for region, rw in _REGION_WEIGHT.items()
+    for category, cw in _CATEGORY_WEIGHT.items()
 ]
+
+
+def _query_engine(sql_text: str) -> list[dict]:
+  """Aggregate the synthetic facts according to the SQL's intent."""
+  s = (sql_text or "").lower()
+  # time window: last N months from the warehouse's end (default: a quarter)
+  m_y = re.search(r"interval\s+(\d+)\s+year", s)
+  m_q = re.search(r"interval\s+(\d+)\s+quarter", s)
+  m_m = re.search(r"interval\s+(\d+)\s+month", s)
+  if m_y:
+    n = int(m_y.group(1)) * 12
+  elif m_q:
+    n = int(m_q.group(1)) * 3
+  elif m_m:
+    n = int(m_m.group(1))
+  elif "year" in s:
+    n = 12
+  else:
+    n = 3
+  months = set(_MONTHS[-min(n, len(_MONTHS)) :])
+  facts = [f for f in _FACTS if f["month"] in months]
+  # filters: country / region literals
+  if "united states" in s or "'us'" in s:
+    facts = [f for f in facts if f["region"].startswith("US-")]
+  for region in _REGION_WEIGHT:
+    if f"'{region.lower()}'" in s:
+      facts = [f for f in facts if f["region"] == region]
+  for category in _CATEGORY_WEIGHT:
+    if f"'{category.lower()}'" in s:
+      facts = [f for f in facts if f["category"] == category]
+  # grouping dimension
+  if re.search(r"date_trunc|group by\s+month|\bmonth\b", s):
+    dim = "month"
+  elif "category" in s or "department" in s:
+    dim = "category"
+  elif "region" in s or "country" in s:
+    dim = "region"
+  else:
+    dim = None
+  # measure name: honor the SQL's alias when present
+  alias = re.search(r"sum\([^)]*\)\s+as\s+([a-z_][a-z0-9_]*)", s)
+  measure = alias.group(1) if alias else "revenue"
+  if dim is None:
+    return [{measure: round(sum(f["revenue"] for f in facts), 2)}]
+  agg: dict = {}
+  for f in facts:
+    agg[f[dim]] = agg.get(f[dim], 0.0) + f["revenue"]
+  items = (
+      sorted(agg.items())
+      if dim == "month"
+      else sorted(agg.items(), key=lambda kv: -kv[1])
+  )
+  return [{dim: k, measure: round(v, 2)} for k, v in items]
+
 
 _CANNED_PROFILES = {
     "orders": {"table": "orders", "row_count": 125210, "null_pct": 0.2},
@@ -221,32 +303,98 @@ def _render_chart(v) -> dict:
   (list with one chart-type string), or a bare chart-type string. Emits the
   Conversational-Analytics-style artifact: a Vega-Lite spec + a text
   preview the chat can render."""
-  chart_type, rows = "bar", _CANNED_ROWS
+  chart_type, rows, explicit = "bar", _CANNED_ROWS, False
   obj = _obj_of(v)
   if isinstance(obj, dict):
     rows = obj.get("rows", rows)
     if str(obj.get("chart_type", "")) in _VEGA_MARK:
-      chart_type = str(obj["chart_type"])
+      chart_type, explicit = str(obj["chart_type"]), True
   elif isinstance(obj, list) and obj:
     if isinstance(obj[0], dict):
       rows = obj
     elif str(obj[0]) in _VEGA_MARK:
-      chart_type = str(obj[0])
+      chart_type, explicit = str(obj[0]), True
   elif isinstance(v, str) and v in _VEGA_MARK:
-    chart_type = v
+    chart_type, explicit = v, True
+  # date-shaped x labels (a time series) default to a LINE mark unless the
+  # chart type was chosen explicitly (e.g. by the tournament winner).
+  if not explicit and any(
+      isinstance(r, dict)
+      and any(
+          isinstance(val, str) and re.match(r"^\d{4}-\d{2}", val)
+          for val in r.values()
+      )
+      for r in rows or []
+  ):
+    chart_type = "line"
+  first = rows[0] if rows and isinstance(rows[0], dict) else {}
+  x_field = next((k for k, v in first.items() if isinstance(v, str)), "label")
+  y_field = next(
+      (k for k, v in first.items() if isinstance(v, (int, float))), "value"
+  )
   return {
       "chart_type": chart_type,
+      "x_field": x_field,
+      "y_field": y_field,
       "ascii": _ascii_bars(rows),
       "vega_lite": {
           "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
           "mark": _VEGA_MARK[chart_type],
           "data": {"values": rows},
           "encoding": {
-              "x": {"field": "region", "type": "nominal"},
-              "y": {"field": "revenue", "type": "quantitative"},
+              "x": {"field": x_field, "type": "nominal"},
+              "y": {"field": y_field, "type": "quantitative"},
           },
       },
   }
+
+
+def _chart_png(chart: dict):
+  """Render the chart artifact to PNG bytes via matplotlib, or None.
+
+  Optional dependency: without matplotlib the demo falls back to the text
+  preview + Vega-Lite spec (which any Vega editor renders faithfully)."""
+  try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+  except ImportError:
+    return None
+  import io
+
+  rows = chart["vega_lite"]["data"]["values"]
+  labels = [
+      next((str(v) for v in r.values() if isinstance(v, str)), "?")
+      for r in rows
+  ]
+  values = [
+      next((float(v) for v in r.values() if isinstance(v, (int, float))), 0.0)
+      for r in rows
+  ]
+  kind = chart["chart_type"]
+  fig, ax = plt.subplots(figsize=(6.4, 3.4), dpi=144)
+  if kind == "pie":
+    ax.pie(values, labels=labels, autopct="%1.0f%%")
+  elif kind == "line":
+    ax.plot(labels, values, marker="o", color="#4285F4")
+  elif kind == "scatter":
+    ax.scatter(labels, values, s=80, color="#4285F4")
+  else:
+    ax.bar(labels, values, color="#4285F4")
+  if kind != "pie":
+    ax.set_ylabel(chart.get("y_field", "value"))
+    ax.grid(axis="y", alpha=0.3)
+    ax.spines[["top", "right"]].set_visible(False)
+  ax.set_title(
+      f"{chart.get('y_field', 'value')} by {chart.get('x_field', 'label')}"
+      f" ({kind})"
+  )
+  fig.tight_layout()
+  buf = io.BytesIO()
+  fig.savefig(buf, format="png")
+  plt.close(fig)
+  return buf.getvalue()
 
 
 def _stub(name, fn):
@@ -375,7 +523,9 @@ def _registry() -> CapabilityRegistry:
           name="run_query",
           input_kind="item",
           serialize_input=False,
-          build=_stub("run_query", lambda s: {"rows": _rows_for(s)}),
+          build=_stub(
+              "run_query", lambda s: {"rows": _query_engine(_sql_of(s))}
+          ),
       ),
       Capability(
           name="profile_table",
@@ -634,11 +784,6 @@ def _scenario_defs():
 SCENARIOS = _scenario_defs()
 
 
-def _rows_for(value) -> list:
-  """Canned rows; a year-scale window in the SQL selects the year set."""
-  return _CANNED_ROWS_YEAR if "year" in _sql_of(value).lower() else _CANNED_ROWS
-
-
 def _text_of(node_input) -> str:
   """The user's message text, whatever shape the node input arrives in."""
   if isinstance(node_input, str):
@@ -783,12 +928,34 @@ async def plan_and_run(ctx: Context, node_input):
       for v in interp.state.values()
       if isinstance(v, dict) and "vega_lite" in v
   ):
-    yield _msg(
-        f"📈 **Chart ({chart['chart_type']})** — the"
-        " Conversational-Analytics-style artifact (text preview + Vega-Lite"
-        f" spec):\n```\n{chart['ascii']}\n```\n```json\n"
-        f"{json.dumps(chart['vega_lite'], indent=1)}\n```"
-    )
+    png = _chart_png(chart)
+    if png is not None:
+      yield Event(
+          content=types.Content(
+              role="model",
+              parts=[
+                  types.Part(
+                      text=(
+                          f"📈 **Chart ({chart['chart_type']})** — rendered"
+                          " from the Conversational-Analytics-style"
+                          " Vega-Lite artifact:"
+                      )
+                  ),
+                  types.Part.from_bytes(data=png, mime_type="image/png"),
+              ],
+          )
+      )
+      yield _msg(
+          "Vega-Lite spec (the portable artifact behind the image):\n"
+          f"```json\n{json.dumps(chart['vega_lite'], indent=1)}\n```"
+      )
+    else:
+      yield _msg(
+          f"📈 **Chart ({chart['chart_type']})** — text preview + Vega-Lite"
+          " spec (install matplotlib for an inline rendered image):\n```\n"
+          f"{chart['ascii']}\n```\n```json\n"
+          f"{json.dumps(chart['vega_lite'], indent=1)}\n```"
+      )
   display = (
       {k: v for k, v in result.items() if k != "vega_lite"}
       if isinstance(result, dict)
