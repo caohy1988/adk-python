@@ -505,6 +505,32 @@ def test_engine_grand_total_and_category_grouping():
   ]
 
 
+def test_engine_yearly_and_quarterly_grains():
+  # The exact live gap: EXTRACT(YEAR ...) AS year GROUP BY year produced a
+  # single anonymous grand total. Yearly and quarterly grains now bucket the
+  # monthly facts (the warehouse holds 24 months, so a 3-year window caps
+  # at 2 years of buckets).
+  yearly = demo._query_engine(
+      "SELECT EXTRACT(YEAR FROM t1.created_at) AS year, SUM(t2.sale_price)"
+      " AS total_sales FROM ... WHERE t1.created_at >="
+      " TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 YEAR) GROUP BY year"
+      " ORDER BY year"
+  )
+  assert [r["year"] for r in yearly] == ["2024", "2025"]
+  assert all(r["total_sales"] > 1_000_000 for r in yearly)
+  quarterly = demo._query_engine(
+      "SELECT DATE_TRUNC(created_at, QUARTER) AS quarter, SUM(x) AS revenue"
+      " ... INTERVAL 2 YEAR GROUP BY quarter"
+  )
+  assert [r["quarter"] for r in quarterly] == [
+      f"{y}-Q{q}" for y in (2024, 2025) for q in (1, 2, 3, 4)
+  ]
+  # buckets are consistent: quarters sum to their year.
+  assert round(sum(r["revenue"] for r in quarterly[:4]), 2) == round(
+      yearly[0]["total_sales"], 2
+  )
+
+
 def test_chart_infers_line_for_time_series():
   rows = demo._query_engine(
       "SELECT month, SUM(x) AS sales ... GROUP BY month INTERVAL 1 YEAR"
@@ -512,8 +538,15 @@ def test_chart_infers_line_for_time_series():
   ch = demo._render_chart({"rows": rows})
   assert ch["chart_type"] == "line"  # date-shaped x labels -> trend line
   assert ch["vega_lite"]["mark"] == "line"
+  # quarterly and yearly buckets are time series too:
+  q_rows = [{"quarter": "2024-Q1", "v": 1.0}, {"quarter": "2024-Q2", "v": 2.0}]
+  assert demo._render_chart({"rows": q_rows})["chart_type"] == "line"
+  y_rows = [{"year": "2024", "v": 1.0}, {"year": "2025", "v": 2.0}]
+  assert demo._render_chart({"rows": y_rows})["chart_type"] == "line"
   # an explicit winner still wins over the inference:
   assert demo._render_chart(["bar"])["chart_type"] == "bar"
+  # a single point is not a trend:
+  assert demo._render_chart({"rows": [{"total": 5.0}]})["chart_type"] == "bar"
 
 
 def test_text_of_extracts_user_message():

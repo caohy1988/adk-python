@@ -163,29 +163,58 @@ def _query_engine(sql_text: str) -> list[dict]:
   for category in _CATEGORY_WEIGHT:
     if f"'{category.lower()}'" in s:
       facts = [f for f in facts if f["category"] == category]
-  # grouping dimension
-  if re.search(r"date_trunc|group by\s+month|\bmonth\b", s):
-    dim = "month"
-  elif "category" in s or "department" in s:
+  # measure name: honor the SQL's alias when present
+  alias = re.search(r"sum\([^)]*\)\s+as\s+([a-z_][a-z0-9_]*)", s)
+  measure = alias.group(1) if alias else "revenue"
+  # time grain: DATE_TRUNC(..., G) / EXTRACT(G FROM ...) / AS g / GROUP BY g.
+  # Scope the GROUP BY check to the actual clause (stop at ORDER BY/LIMIT)
+  # with INTERVAL phrases stripped — a trailing "INTERVAL 1 YEAR" window
+  # must not read as a yearly grouping.
+  gb_match = re.search(r"group by\s+(.*?)(?:\border by\b|\blimit\b|$)", s)
+  gb_clause = re.sub(
+      r"interval\s+\d+\s+\w+", "", gb_match.group(1) if gb_match else ""
+  )
+  grain = None
+  for g in ("month", "week", "quarter", "year"):
+    if (
+        re.search(rf"date_trunc\([^)]*,\s*{g}\s*\)", s)
+        or re.search(rf"extract\(\s*{g}\s+from", s)
+        or re.search(rf"\bas\s+{g}\b", s)
+        or re.search(rf"\b{g}\b", gb_clause)
+    ):
+      grain = "month" if g == "week" else g  # weekly facts -> monthly grain
+      break
+  if grain:
+
+    def bucket(month: str) -> str:
+      y, mm = month.split("-")
+      if grain == "month":
+        return month
+      if grain == "quarter":
+        return f"{y}-Q{(int(mm) - 1) // 3 + 1}"
+      return y  # year
+
+    agg: dict = {}
+    for f in facts:
+      b = bucket(f["month"])
+      agg[b] = agg.get(b, 0.0) + f["revenue"]
+    return [{grain: k, measure: round(v, 2)} for k, v in sorted(agg.items())]
+  # categorical dimension
+  if "category" in s or "department" in s:
     dim = "category"
   elif "region" in s or "country" in s:
     dim = "region"
   else:
     dim = None
-  # measure name: honor the SQL's alias when present
-  alias = re.search(r"sum\([^)]*\)\s+as\s+([a-z_][a-z0-9_]*)", s)
-  measure = alias.group(1) if alias else "revenue"
   if dim is None:
     return [{measure: round(sum(f["revenue"] for f in facts), 2)}]
-  agg: dict = {}
+  agg = {}
   for f in facts:
     agg[f[dim]] = agg.get(f[dim], 0.0) + f["revenue"]
-  items = (
-      sorted(agg.items())
-      if dim == "month"
-      else sorted(agg.items(), key=lambda kv: -kv[1])
-  )
-  return [{dim: k, measure: round(v, 2)} for k, v in items]
+  return [
+      {dim: k, measure: round(v, 2)}
+      for k, v in sorted(agg.items(), key=lambda kv: -kv[1])
+  ]
 
 
 _CANNED_PROFILES = {
@@ -316,16 +345,16 @@ def _render_chart(v) -> dict:
       chart_type, explicit = str(obj[0]), True
   elif isinstance(v, str) and v in _VEGA_MARK:
     chart_type, explicit = v, True
+
   # date-shaped x labels (a time series) default to a LINE mark unless the
   # chart type was chosen explicitly (e.g. by the tournament winner).
-  if not explicit and any(
-      isinstance(r, dict)
-      and any(
-          isinstance(val, str) and re.match(r"^\d{4}-\d{2}", val)
-          for val in r.values()
-      )
-      for r in rows or []
-  ):
+  def _datelike(r) -> bool:
+    return isinstance(r, dict) and any(
+        isinstance(val, str) and re.match(r"^\d{4}(-\d{2}|-q\d|$)", val.lower())
+        for val in r.values()
+    )
+
+  if not explicit and len(rows or []) >= 2 and all(map(_datelike, rows)):
     chart_type = "line"
   first = rows[0] if rows and isinstance(rows[0], dict) else {}
   x_field = next((k for k, v in first.items() if isinstance(v, str)), "label")
