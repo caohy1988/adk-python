@@ -8705,3 +8705,40 @@ class TestAgentlessInvocationContext:
     assert len(rows) == 1
     assert rows[0]["event_type"] == "USER_MESSAGE_RECEIVED"
     assert rows[0]["agent"] is None
+
+  @pytest.mark.asyncio
+  async def test_event_author_wins_even_if_core_returns_sentinel(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      agentless_invocation_context,
+      dummy_arrow_schema,
+      monkeypatch,
+  ):
+    """Simulates the core sentinel fix for the no-agent case
+    (ReadonlyContext.agent_name returning 'unknown' instead of
+    raising): the row must still use Event.author because the plugin
+    derives the label from the underlying invocation context, not from
+    ReadonlyContext.agent_name."""
+    from google.adk.agents import readonly_context as readonly_context_lib
+
+    monkeypatch.setattr(
+        readonly_context_lib.ReadonlyContext,
+        "agent_name",
+        property(lambda self: "unknown"),
+    )
+    event = event_lib.Event(
+        author="workflow_node_c",
+        actions=event_actions_lib.EventActions(state_delta={"k": "v"}),
+    )
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        agentless_invocation_context
+    )
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=agentless_invocation_context, event=event
+    )
+    await asyncio.sleep(0.01)
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert len(rows) == 1
+    assert rows[0]["agent"] == "workflow_node_c"
+    assert rows[0]["agent"] != "unknown"
