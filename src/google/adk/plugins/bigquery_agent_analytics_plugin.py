@@ -3116,10 +3116,27 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     except (TypeError, ValueError):
       attributes_json = json.dumps(attributes, default=str)
 
+    # InvocationContext.agent is Optional and is None for invocations
+    # driven by a workflow engine (deterministic nodes), in which case
+    # ReadonlyContext.agent_name raises AttributeError. Without this
+    # guard the row is silently dropped by _safe_callback — a data-loss
+    # bug that hits workflow events hardest. Fall back to the source
+    # Event's author (the emitting node/agent), then null.
+    try:
+      agent_name = callback_context.agent_name
+    except AttributeError:
+      agent_name = getattr(event_data.source_event, "author", None)
+      logger.debug(
+          "InvocationContext.agent is None; using source Event author"
+          " %r as the row's agent for event_type=%s.",
+          agent_name,
+          event_type,
+      )
+
     row = {
         "timestamp": timestamp,
         "event_type": event_type,
-        "agent": callback_context.agent_name,
+        "agent": agent_name,
         "user_id": callback_context.user_id,
         "session_id": callback_context.session.id,
         "invocation_id": callback_context.invocation_id,

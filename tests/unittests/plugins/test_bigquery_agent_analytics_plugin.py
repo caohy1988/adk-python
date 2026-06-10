@@ -8602,3 +8602,106 @@ class TestUnmatchedLongRunningIdFallback:
     rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
     pauses = [r for r in rows if r["event_type"] == "TOOL_PAUSED"]
     assert len(pauses) == 1
+
+
+class TestAgentlessInvocationContext:
+  """Workflow-driven invocations can have InvocationContext.agent=None;
+  rows must not be dropped (ReadonlyContext.agent_name raises
+  AttributeError in that case)."""
+
+  @pytest.fixture
+  def agentless_invocation_context(self, mock_session):
+    mock_session_service = mock.create_autospec(
+        base_session_service_lib.BaseSessionService,
+        instance=True,
+        spec_set=True,
+    )
+    mock_plugin_manager = mock.create_autospec(
+        plugin_manager_lib.PluginManager, instance=True, spec_set=True
+    )
+    return InvocationContext(
+        agent=None,
+        session=mock_session,
+        invocation_id="inv-workflow-1",
+        session_service=mock_session_service,
+        plugin_manager=mock_plugin_manager,
+    )
+
+  @pytest.mark.asyncio
+  async def test_event_row_uses_source_event_author(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      agentless_invocation_context,
+      dummy_arrow_schema,
+  ):
+    """Event-originating row falls back to event.author for the agent
+    column instead of being dropped."""
+    event = event_lib.Event(
+        author="workflow_node_b",
+        actions=event_actions_lib.EventActions(state_delta={"k": "v"}),
+    )
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        agentless_invocation_context
+    )
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=agentless_invocation_context, event=event
+    )
+    await asyncio.sleep(0.01)
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert len(rows) == 1
+    assert rows[0]["event_type"] == "STATE_DELTA"
+    assert rows[0]["agent"] == "workflow_node_b"
+
+  @pytest.mark.asyncio
+  async def test_workflow_event_types_not_dropped(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      agentless_invocation_context,
+      dummy_arrow_schema,
+  ):
+    """The ADK 2.0 workflow-centric event types (the ones most likely
+    to fire with agent=None) land instead of being dropped."""
+    event = event_lib.Event(
+        author="supervisor_node",
+        actions=event_actions_lib.EventActions(
+            transfer_to_agent="specialist",
+            agent_state={"step": 1},
+        ),
+    )
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        agentless_invocation_context
+    )
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=agentless_invocation_context, event=event
+    )
+    await asyncio.sleep(0.01)
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    types_emitted = {r["event_type"] for r in rows}
+    assert "AGENT_TRANSFER" in types_emitted
+    assert "AGENT_STATE_CHECKPOINT" in types_emitted
+    assert all(r["agent"] == "supervisor_node" for r in rows)
+
+  @pytest.mark.asyncio
+  async def test_callback_only_row_gets_null_agent(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      agentless_invocation_context,
+      dummy_arrow_schema,
+  ):
+    """Row with no source Event (user-message path) gets agent=null
+    rather than being dropped."""
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        agentless_invocation_context
+    )
+    await bq_plugin_inst.on_user_message_callback(
+        invocation_context=agentless_invocation_context,
+        user_message=types.Content(role="user", parts=[types.Part(text="hi")]),
+    )
+    await asyncio.sleep(0.01)
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert len(rows) == 1
+    assert rows[0]["event_type"] == "USER_MESSAGE_RECEIVED"
+    assert rows[0]["agent"] is None
