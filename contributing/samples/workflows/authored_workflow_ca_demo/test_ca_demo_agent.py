@@ -814,6 +814,98 @@ def test_audit_takes_live_insights_not_canned():
   )
 
 
+@pytest.mark.asyncio
+async def test_skeptics_are_runtime_isolated_not_reading_history():
+  """Empirical isolation proof (no network): a spy on the model layer
+  captures each fanned-out skeptic's ACTUAL LLM request. Each request must
+  contain exactly its own insight — not the sibling's insight, not prior
+  chat beats, not the user's turn message. This is the runtime half of the
+  independence story; the binding lints are the static half."""
+  from google.adk import Agent
+  from google.adk.models.llm_response import LlmResponse
+
+  captured = []
+
+  def spy(callback_context=None, llm_request=None, **kw):
+    captured.append(
+        " ".join(
+            p.text
+            for c in llm_request.contents or []
+            for p in c.parts or []
+            if p.text
+        )
+    )
+    return LlmResponse(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    text=json.dumps(
+                        {"insight": "echo", "refuted": False, "reason": "spy"}
+                    )
+                )
+            ],
+        )
+    )
+
+  def skeptic_build():
+    return Agent(
+        name="skeptic",
+        model="gemini-2.5-flash",  # never called — spy short-circuits
+        output_schema=demo.Verdict,
+        instruction="Refute or uphold. Output Verdict.",
+        before_model_callback=spy,
+    )
+
+  reg = CapabilityRegistry([
+      Capability(
+          name="skeptic",
+          input_kind="item",
+          serialize_input=True,
+          build=skeptic_build,
+      ),
+      demo._registry()._by_name["keep_verified"],
+  ])
+  spec = _expected_spec("adversarial")
+  holder = {}
+
+  @node(rerun_on_resume=True)
+  async def parent(ctx, node_input):
+    yield Event(
+        content=types.Content(
+            role="model",
+            parts=[types.Part(text="SECRET-PRIOR-BEAT plan authored")],
+        )
+    )
+    holder["out"] = await SpecInterpreter(reg, ctx).execute(
+        spec,
+        {"insights": ["INSIGHT-ALPHA is true", "INSIGHT-BETA is false"]},
+    )
+    yield Event(output={"_done": True})
+
+  wf = Workflow(name="t", edges=[("START", parent)])
+  ss = InMemorySessionService()
+  r = Runner(app_name="t", node=wf, session_service=ss)
+  s = await ss.create_session(app_name="t", user_id="u")
+  async for _ in r.run_async(
+      user_id="u",
+      session_id=s.id,
+      new_message=types.Content(
+          parts=[types.Part(text="USER-TURN-MESSAGE audit stuff")],
+          role="user",
+      ),
+  ):
+    pass
+
+  assert len(captured) == 2  # one REAL dispatch per insight
+  assert "INSIGHT-ALPHA" in captured[0] and "INSIGHT-BETA" in captured[1]
+  for request_text in captured:
+    assert "SECRET-PRIOR-BEAT" not in request_text  # no chat history
+    assert "USER-TURN-MESSAGE" not in request_text  # no user turn
+  assert "INSIGHT-BETA" not in captured[0]  # no sibling leakage
+  assert "INSIGHT-ALPHA" not in captured[1]
+
+
 def test_skeptic_verdicts_render_with_reasons():
   # The audit beat the user could not see: every verdict in interpreter
   # state renders as one line WITH the skeptic's stated reason.
