@@ -447,6 +447,7 @@ class Category(BaseModel):
 class Verdict(BaseModel):
   insight: str
   refuted: bool
+  reason: str = ""  # the skeptic must SHOW ITS WORK — one-sentence judgment
 
 
 class Intent(BaseModel):
@@ -491,8 +492,28 @@ def _verdict_of(v) -> dict:
     return {
         "insight": str(obj["insight"]),
         "refuted": bool(obj.get("refuted")),
+        "reason": str(obj.get("reason", "") or ""),
     }
-  return {"insight": str(v), "refuted": False}
+  return {"insight": str(v), "refuted": False, "reason": ""}
+
+
+def _verdict_lines(state: dict):
+  """Render every skeptic verdict found in interpreter state — one line per
+  insight, with the skeptic's stated reason — or [] when no audit ran."""
+  lines = []
+  for value in state.values():
+    if not (isinstance(value, list) and value):
+      continue
+    verdicts = [_verdict_of(item) for item in value]
+    if not all(
+        _obj_of(item) and "refuted" in (_obj_of(item) or {}) for item in value
+    ):
+      continue
+    for v in verdicts:
+      mark = "❌ REFUTED" if v["refuted"] else "✅ upheld"
+      reason = f" — {v['reason']}" if v["reason"] else ""
+      lines.append(f"{mark} — \"{v['insight']}\"{reason}")
+  return lines
 
 
 _VEGA_MARK = {"bar": "bar", "line": "line", "scatter": "point", "pie": "arc"}
@@ -770,7 +791,9 @@ def _registry() -> CapabilityRegistry:
               "You are an adversarial data reviewer. Input: one insight"
               " about an e-commerce dataset (avg order ~ $60-90, 100k"
               " users). Try to REFUTE it; refuted=true if implausible."
-              " Echo the insight. Output Verdict.",
+              " Echo the insight, and ALWAYS give reason: one sentence"
+              " explaining what you checked and why it stands or falls"
+              " (note caveats like partial years). Output Verdict.",
           ),
       ),
       # ---- deterministic mocks (no BigQuery needed) ----
@@ -1104,7 +1127,7 @@ def _extract_insights(text: str):
         rest,
         flags=re.I,
     )
-    rest = rest.strip().strip('"').strip()
+    rest = rest.strip().strip('"').rstrip("?!.").strip()
     if len(rest) >= 12:
       parts = [s.strip() for s in re.split(r"[;\n]+", rest) if s.strip()]
       return parts or None
@@ -1397,6 +1420,13 @@ async def plan_and_run(ctx: Context, node_input):
   interp = SpecInterpreter(reg, ctx)
   result = await interp.execute(spec, task)
   elapsed = time.perf_counter() - t0
+  verdict_lines = _verdict_lines(interp.state)
+  if verdict_lines:
+    rendered = "\n".join(f"   - {line}" for line in verdict_lines)
+    yield _msg(
+        "🕵️ **Skeptic verdicts** (one independent skeptic per insight —"
+        f" provably isolated from whatever produced it):\n{rendered}"
+    )
   for chart in (
       v
       for v in interp.state.values()

@@ -416,6 +416,7 @@ def test_stubs_tolerate_authored_binding_shapes():
   assert demo._verdict_of(json.dumps({"insight": "x", "refuted": True})) == {
       "insight": "x",
       "refuted": True,
+      "reason": "",
   }
   assert demo._verdict_of("just text")["refuted"] is False
   demo._FLAKY_CALLS["n"] = 1  # next call is even -> passes
@@ -811,6 +812,36 @@ def test_audit_takes_live_insights_not_canned():
   assert demo._task_for("fanout", f"audit {claim}") == (
       demo.SCENARIOS["fanout"]["task"]
   )
+
+
+def test_skeptic_verdicts_render_with_reasons():
+  # The audit beat the user could not see: every verdict in interpreter
+  # state renders as one line WITH the skeptic's stated reason.
+  state = {
+      "sqlgen": {"sql": "..."},  # non-verdict values are ignored
+      "verdicts": [
+          {
+              "insight": "AOV is $1,000,000.",
+              "refuted": True,
+              "reason": "Implausible: dataset AOV is roughly $60-90.",
+          },
+          json.dumps({
+              "insight": "Sales peaked in 2025.",
+              "refuted": False,
+              "reason": "Consistent with the yearly totals; 2026 is partial.",
+          }),
+      ],
+  }
+  lines = demo._verdict_lines(state)
+  assert len(lines) == 2
+  assert lines[0].startswith("❌ REFUTED") and "$60-90" in lines[0]
+  assert lines[1].startswith("✅ upheld") and "2026 is partial" in lines[1]
+  assert demo._verdict_lines({"x": {"rows": []}}) == []  # no audit -> no beat
+  # the Verdict schema demands the reasoning field
+  assert "reason" in demo.Verdict.model_fields
+  # extraction drops the trailing '?' user phrasing drags in
+  task = demo._task_for("adversarial", "audit this insight sales doubled YoY?")
+  assert task == {"insights": ["sales doubled YoY"]}
 
 
 def test_conversational_gate_routing():
