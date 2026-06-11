@@ -787,6 +787,32 @@ def test_registry_clean_and_typed():
   assert reg.open_map_warnings() == []  # enumerated fields only
 
 
+def test_audit_takes_live_insights_not_canned():
+  # The live failure this pins: 'audit this insight <X>' must audit X, not
+  # the canned demo set. (Typo'd filler like 'ingisht' is tolerated.)
+  claim = (
+      "China and the United States lead global sales, with most markets"
+      " peaking in 2025"
+  )
+  task = demo._task_for("adversarial", f"audit this ingisht {claim}")
+  assert task == {"insights": [claim]}
+  # multiple insights split on ';'
+  task = demo._task_for("adversarial", "verify insights: A is true; B is up")
+  assert task == {"insights": ["A is true", "B is up"]}
+  # trigger-only message + a remembered last insight -> audit THAT
+  task = demo._task_for(
+      "adversarial", "audit these insights", last_insight=claim
+  )
+  assert task == {"insights": [claim]}
+  # trigger-only, nothing remembered -> canned demo set (final fallback)
+  task = demo._task_for("adversarial", "audit these insights")
+  assert task == demo.SCENARIOS["adversarial"]["task"]
+  # other scenarios unaffected
+  assert demo._task_for("fanout", f"audit {claim}") == (
+      demo.SCENARIOS["fanout"]["task"]
+  )
+
+
 def test_conversational_gate_routing():
   # Triggered messages bypass the gate (mode selectors stay deterministic);
   # untriggered messages go through the intent gate first — including the

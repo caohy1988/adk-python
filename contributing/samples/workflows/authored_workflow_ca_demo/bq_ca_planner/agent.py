@@ -1088,15 +1088,47 @@ def _text_of(node_input) -> str:
   return str(node_input or "")
 
 
-def _task_for(key: str, text: str) -> dict:
-  """The scenario's task input. The ask-a-question scenario takes the LIVE
-  user message as the question — so a re-send with a different question is
-  TEMPLATE REUSE: the frozen plan unchanged, new task input flowing through
-  it. Other scenarios keep their canned inputs (their prompts are mode
-  selectors, not questions)."""
+def _extract_insights(text: str):
+  """Insights inlined in an audit ask ('audit this insight: X' / lists
+  split on ';' or newlines), or None when the message is trigger-only."""
+  t = (text or "").strip()
+  tl = t.lower()
+  for trig in ("verify insights", "audit", "verify"):
+    i = tl.find(trig)
+    if i < 0:
+      continue
+    rest = t[i + len(trig) :]
+    rest = re.sub(
+        r"^[\s:,\-—]*((these|this|the|my)\s+)?(insights?|claims?|ingisht\w*)?[\s:,\-—]*",
+        "",
+        rest,
+        flags=re.I,
+    )
+    rest = rest.strip().strip('"').strip()
+    if len(rest) >= 12:
+      parts = [s.strip() for s in re.split(r"[;\n]+", rest) if s.strip()]
+      return parts or None
+    return None
+  return None
+
+
+def _task_for(key: str, text: str, last_insight: str | None = None) -> dict:
+  """The scenario's task input. LIVE inputs where they make sense:
+
+  * sequence: the user's message IS the question;
+  * adversarial: insights inlined in the message are audited; with none
+    inlined, the session's LAST generated insight ('audit that'); only
+    then the canned demo set.
+  Other scenarios keep canned inputs (their prompts are mode selectors)."""
   task = dict(SCENARIOS[key]["task"])
   if key == "sequence" and text.strip():
     task = {"question": text.strip()}
+  if key == "adversarial":
+    inline = _extract_insights(text)
+    if inline:
+      task = {"insights": inline}
+    elif last_insight:
+      task = {"insights": [last_insight]}
   return task
 
 
@@ -1247,10 +1279,24 @@ async def plan_and_run(ctx: Context, node_input):
       return
     key = "sequence"
   sc = SCENARIOS[key]
-  task = _task_for(key, text)
+  task = _task_for(
+      key,
+      text,
+      last_insight=ctx.state.get("authored_workflow:ca:last_insight"),
+  )
   state_key = f"authored_workflow:ca:{key}"
 
-  task_note = f' — question: "{task["question"]}"' if key == "sequence" else ""
+  if key == "sequence":
+    task_note = f' — question: "{task["question"]}"'
+  elif key == "adversarial":
+    src_note = (
+        "canned demo set"
+        if task == sc["task"]
+        else "YOUR insights (live input)"
+    )
+    task_note = f" — auditing {src_note}: {task['insights']}"
+  else:
+    task_note = ""
   yield _msg(
       f"🗂️ **Scenario: {sc['title']}** — expected shape `{sc['shape']}`,"
       " over mock `thelook_ecommerce`"
@@ -1395,6 +1441,9 @@ async def plan_and_run(ctx: Context, node_input):
       f" {elapsed:.1f}s + "
       + ("0 planner calls (frozen replay)." if reused else "1 planner call.")
   )
+  if isinstance(result, dict) and isinstance(result.get("insight"), str):
+    # remembered so a later 'audit that insight' audits THIS, not canned data
+    ctx.state["authored_workflow:ca:last_insight"] = result["insight"]
   yield Event(
       output={
           "scenario": key,

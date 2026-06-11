@@ -53,15 +53,15 @@ What kinds of workflow can you issue?
 Open the UI, pick `bq_ca_planner`, and send the prompts below — **one
 scenario per prompt**, each authoring a different coordination shape:
 
-| #   | Send this prompt                                             | Shape authored                                                                     | CA story                                                                                                                                                    |
-| --- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | `What was revenue by region last quarter?`                   | `loop_until(draft → REAL dry-run → repair) → run_query → render_chart + summarize` | the standard CA flow — **your actual question is the task input**, and a real BigQuery dry-run error (e.g. `TIMESTAMP_SUB ... YEAR`) feeds the repair round |
-| 2   | `Profile data quality across the dataset tables.`            | fan-out → synthesize                                                               | per-table profiling in parallel, one report                                                                                                                 |
-| 3   | `Build a dashboard for these three questions.`               | pipeline(`nl2sql → dry_run`) per item                                              | each panel translated + validated barrier-free                                                                                                              |
-| 4   | `Route my question: what does order status 'Complete' mean?` | classify & route (branch)                                                          | metadata questions skip SQL entirely                                                                                                                        |
-| 5   | `Answer with SQL self-repair — the dry run is unreliable.`   | loop_until + **loop-carried `init`**                                               | draft → failed dry run → repair using the error                                                                                                             |
-| 6   | `Audit these insights — verify each one independently.`      | adversarial verification                                                           | independent skeptics per insight; the $1M AOV claim gets refuted                                                                                            |
-| 7   | `Pick the best chart for revenue by region.`                 | tournament                                                                         | pairwise chart judging to a single winner                                                                                                                   |
+| #   | Send this prompt                                                                        | Shape authored                                                                     | CA story                                                                                                                                                    |
+| --- | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | `What was revenue by region last quarter?`                                              | `loop_until(draft → REAL dry-run → repair) → run_query → render_chart + summarize` | the standard CA flow — **your actual question is the task input**, and a real BigQuery dry-run error (e.g. `TIMESTAMP_SUB ... YEAR`) feeds the repair round |
+| 2   | `Profile data quality across the dataset tables.`                                       | fan-out → synthesize                                                               | per-table profiling in parallel, one report                                                                                                                 |
+| 3   | `Build a dashboard for these three questions.`                                          | pipeline(`nl2sql → dry_run`) per item                                              | each panel translated + validated barrier-free                                                                                                              |
+| 4   | `Route my question: what does order status 'Complete' mean?`                            | classify & route (branch)                                                          | metadata questions skip SQL entirely                                                                                                                        |
+| 5   | `Answer with SQL self-repair — the dry run is unreliable.`                              | loop_until + **loop-carried `init`**                                               | draft → failed dry run → repair using the error                                                                                                             |
+| 6   | `Audit this insight: <paste any claim>` (or just `audit that insight` after a question) | adversarial verification                                                           | **audits YOUR insights** — inlined in the message, or the session's last generated insight; the canned $1M-AOV set is only the final fallback               |
+| 7   | `Pick the best chart for revenue by region.`                                            | tournament                                                                         | pairwise chart judging to a single winner                                                                                                                   |
 
 What to point at as each one streams:
 
@@ -83,7 +83,7 @@ replayable — a turn-by-turn agent retry never is.*
 ## 2. Correctness proof (no LLM, no BigQuery)
 
 ```bash
-pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 33 (one live-gated: CA_DEMO_LIVE_BQ=1)
+pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 34 (one live-gated: CA_DEMO_LIVE_BQ=1)
 ```
 
 All seven expected shapes are built by hand, validated + lint-checked against
