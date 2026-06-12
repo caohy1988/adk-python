@@ -234,18 +234,14 @@ def _expected_spec(key: str) -> WorkflowSpec:
                 id="panels",
                 over=Binding(source="task", path="questions"),
                 stages=[
-                    PipelineStage(capability="nl2sql"),
+                    PipelineStage(capability="draft_or_repair_sql"),
                     PipelineStage(capability="dry_run"),
+                    PipelineStage(capability="run_query"),
+                    PipelineStage(capability="render_chart"),
                 ],
             ),
-            StepRef(
-                kind="step",
-                id="sum",
-                capability="summarize_insight",
-                input=Binding(source="step", step="panels"),
-            ),
         ],
-        output=Binding(source="step", step="sum"),
+        output=Binding(source="step", step="panels"),
     )
   if key == "branch":
     return WorkflowSpec(
@@ -1256,13 +1252,18 @@ async def test_fanout_executes_no_llm_needed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pipeline_executes_per_question(monkeypatch):
+  # Every panel is translated, validated, EXECUTED, and charted — the shape
+  # the CA head-to-head proved out (3 real panels in ~10s, barrier-free).
   monkeypatch.setitem(demo._BQ, "disabled", True)
   out = await _run(
       _expected_spec("pipeline"),
       _stub_registry(),
       demo.SCENARIOS["pipeline"]["task"],
   )
-  assert out == {"insight": "US-West leads revenue."}
+  assert len(out) == 3
+  for panel in out:
+    assert "vega_lite" in panel and panel["chart_type"] in ("bar", "line")
+    assert panel["vega_lite"]["data"]["values"]  # executed rows, per panel
 
 
 @pytest.mark.asyncio

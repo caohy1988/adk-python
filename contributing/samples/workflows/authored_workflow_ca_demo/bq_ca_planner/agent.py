@@ -1118,22 +1118,34 @@ def _scenario_defs():
           ),
       ),
       "pipeline": dict(
-          title="Build a dashboard (pipeline)",
-          shape="pipeline(nl2sql → dry_run) → step",
+          title="Build a dashboard (pipeline — executes every panel)",
+          shape=(
+              "pipeline(draft → REAL dry_run → run_query → render_chart)"
+              " per panel, barrier-free"
+          ),
           triggers=("dashboard",),
           task={
               "questions": [
-                  {"question": "Top 5 product categories by revenue?"},
-                  {"question": "Monthly active users by traffic source?"},
-                  {"question": "Return rate by department?"},
+                  {"question": "Monthly total revenue for 2025"},
+                  {
+                      "question": (
+                          "Top 5 product categories by total revenue in 2025"
+                      )
+                  },
+                  {
+                      "question": (
+                          "New users per month in 2025 broken down by"
+                          " traffic source"
+                      )
+                  },
               ]
           },
           recipe=(
-              "Author: (1) a pipeline over task.questions with two stages,"
-              " nl2sql then dry_run, so each dashboard question is"
-              " translated and validated per item; (2) a step running"
-              " summarize_insight on the pipeline output. Output = the"
-              " summarize step."
+              "Author: ONE pipeline over task.questions with FOUR stages —"
+              " draft_or_repair_sql, then dry_run, then run_query, then"
+              " render_chart — so each dashboard panel is translated,"
+              " validated, EXECUTED, and charted per item, barrier-free."
+              " Output = the pipeline."
           ),
       ),
       "branch": dict(
