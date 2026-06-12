@@ -1350,9 +1350,14 @@ async def plan_and_run(ctx: Context, node_input):
     task_note = f" — auditing {src_note}: {task['insights']}"
   else:
     task_note = ""
+  data_note = (
+      "LIVE `bigquery-public-data.thelook_ecommerce`"
+      if _bq_client() is not None
+      else "mock `thelook_ecommerce` warehouse (no BigQuery credentials)"
+  )
   yield _msg(
       f"🗂️ **Scenario: {sc['title']}** — expected shape `{sc['shape']}`,"
-      " over mock `thelook_ecommerce`"
+      f" over {data_note}"
       f" ({', '.join(TABLES)}){task_note}."
   )
 
