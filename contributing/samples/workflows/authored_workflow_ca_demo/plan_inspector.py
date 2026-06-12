@@ -299,6 +299,24 @@ def _fetch_session(app: str, user: str, session_id: str, port: int = 8001):
     return None
 
 
+def _session_questions(session: dict) -> set:
+  """Lower-cased user-turn texts plus revise-target questions — used to
+  scope middle results to THIS session's actual flow."""
+  qs = set()
+  for e in session.get("events", []):
+    content = e.get("content") or {}
+    texts = [
+        p.get("text", "") for p in content.get("parts") or [] if p.get("text")
+    ]
+    blob = " ".join(texts)
+    if e.get("author") == "user" and blob.strip():
+      qs.add(re.sub(r"\s+", " ", blob.strip().lower()))
+    m = re.search(r'Revising the frozen SQL\*?\*? for: \\?"([^"]+)"', blob)
+    if m:
+      qs.add(re.sub(r"\s+", " ", m.group(1).strip().lower()))
+  return qs
+
+
 def _session_timeline(session: dict) -> str:
   turns, cur = [], None
   for e in session.get("events", []):
@@ -394,7 +412,7 @@ def main() -> str:
         with open(os.path.join(sql_dir, fn)) as f:
           mid_results.append(json.load(f))
 
-  timeline = ""
+  timeline, session_qs = "", None
   if len(sys.argv) > 1:
     sid = sys.argv[1]
     app = sys.argv[2] if len(sys.argv) > 2 else "bq_ca_planner"
@@ -402,12 +420,36 @@ def main() -> str:
     session = _fetch_session(app, user, sid)
     if session:
       timeline = _session_timeline(session)
+      session_qs = _session_questions(session)
 
-  # middle results attach to the workflow that produced them (sequence).
+  # Middle results attach to the workflow that produced them (sequence).
+  # With a session given, scope them to THAT session's flow; artifacts from
+  # other sessions collapse into a separate card (the store is global by
+  # design — that's the cross-session point — but the page should mirror
+  # the demo run on screen).
+  if session_qs is not None:
+    in_session = [
+        r
+        for r in mid_results
+        if re.sub(r"\s+", " ", r.get("question", "").strip().lower())
+        in session_qs
+    ]
+    other = [r for r in mid_results if r not in in_session]
+  else:
+    in_session, other = mid_results, []
+
   cards = timeline
   for name, env in envs.items():
-    attach = mid_results if name == "sequence" else ()
+    attach = in_session if name == "sequence" else ()
     cards += _plan_card(name, env, attach)
+  if other:
+    cards += (
+        '<div class="card"><details><summary>❄️ Frozen middle results from'
+        f" OTHER sessions ({len(other)}) — the store is cross-session by"
+        " design</summary>"
+        + "".join(_mid_result(r) for r in other)
+        + "</details></div>"
+    )
 
   page = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>RFC #93 — Frozen Workflows with Frozen Middle Results</title>
