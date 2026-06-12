@@ -1192,14 +1192,23 @@ async def test_sequence_executes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fanout_executes_no_llm_needed():
-  # profiling + report are deterministic mocks even in the LIVE registry.
+async def test_fanout_executes_no_llm_needed(monkeypatch):
+  # All SEVEN real dataset tables, profiled in parallel. The mock engine is
+  # pinned here (no network in unit tests); with credentials the profiler
+  # queries the real __TABLES__ metadata and labels engine=bigquery.
+  monkeypatch.setitem(demo._BQ, "disabled", True)
   out = await _run(
       _expected_spec("fanout"),
       demo._registry(),
       demo.SCENARIOS["fanout"]["task"],
   )
-  assert out == {"tables": 4, "worst_table": "users", "max_null_pct": 7.9}
+  profiles = demo._CANNED_PROFILES.values()
+  assert out == {
+      "tables": 7,
+      "total_rows": sum(p["row_count"] for p in profiles),
+      "largest_table": "events",
+      "total_size_mb": round(sum(p["size_mb"] for p in profiles), 1),
+  }
 
 
 @pytest.mark.asyncio

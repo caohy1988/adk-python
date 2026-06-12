@@ -91,9 +91,18 @@ DET = types.GenerateContentConfig(temperature=0)
 # are deterministic mocks so the demo needs no BigQuery project.
 TABLES = {
     "orders": "order_id, user_id, status, created_at, num_of_item",
-    "order_items": "id, order_id, product_id, sale_price, status",
+    "order_items": "id, order_id, product_id, sale_price, status, created_at",
     "products": "id, name, category, brand, retail_price, department",
     "users": "id, email, age, country, traffic_source, created_at",
+    "events": (
+        "id, user_id, session_id, created_at, city, browser,"
+        " traffic_source, uri, event_type"
+    ),
+    "inventory_items": (
+        "id, product_id, created_at, sold_at, cost, product_category,"
+        " product_brand, product_distribution_center_id"
+    ),
+    "distribution_centers": "id, name, latitude, longitude",
 }
 
 _CANNED_ROWS = [
@@ -368,16 +377,59 @@ def query_thelook(sql: str) -> dict:
   }
 
 
+# Mock fallback profiles (used WITHOUT credentials; clearly labeled via the
+# engine field — with credentials, profiling queries the real __TABLES__).
 _CANNED_PROFILES = {
-    "orders": {"table": "orders", "row_count": 125210, "null_pct": 0.2},
+    "orders": {"table": "orders", "row_count": 125000, "size_mb": 11.0},
     "order_items": {
         "table": "order_items",
-        "row_count": 181830,
-        "null_pct": 0.0,
+        "row_count": 182000,
+        "size_mb": 24.0,
     },
-    "products": {"table": "products", "row_count": 29120, "null_pct": 3.4},
-    "users": {"table": "users", "row_count": 100000, "null_pct": 7.9},
+    "products": {"table": "products", "row_count": 29120, "size_mb": 4.8},
+    "users": {"table": "users", "row_count": 100000, "size_mb": 27.0},
+    "events": {"table": "events", "row_count": 2400000, "size_mb": 740.0},
+    "inventory_items": {
+        "table": "inventory_items",
+        "row_count": 490000,
+        "size_mb": 138.0,
+    },
+    "distribution_centers": {
+        "table": "distribution_centers",
+        "row_count": 10,
+        "size_mb": 0.1,
+    },
 }
+
+
+def _profile_table(value) -> dict:
+  """REAL table profile from BigQuery __TABLES__ metadata (row count, size)
+  when credentials allow; the canned fallback otherwise — engine-labeled."""
+  name = str(value).strip().strip("`'\"")
+  if _bq_client() is not None and re.fullmatch(r"[A-Za-z_][\w]*", name):
+    out = _execute_sql({
+        "sql": (
+            "SELECT table_id, row_count, size_bytes FROM"
+            " `bigquery-public-data.thelook_ecommerce.__TABLES__` WHERE"
+            f" table_id = '{name}'"
+        )
+    })
+    rows = out.get("rows") or []
+    if rows:
+      return {
+          "table": rows[0]["table_id"],
+          "row_count": int(rows[0]["row_count"]),
+          "size_mb": round(float(rows[0]["size_bytes"]) / 1048576, 1),
+          "engine": "bigquery",
+      }
+  prof = dict(
+      _CANNED_PROFILES.get(
+          name, {"table": name, "row_count": 0, "size_mb": 0.0}
+      )
+  )
+  prof["engine"] = "mock"
+  return prof
+
 
 _SCHEMA_NOTES = {
     "default": (
@@ -432,13 +484,15 @@ class ChartArtifact(BaseModel):
 class TableProfile(BaseModel):
   table: str
   row_count: int
-  null_pct: float
+  size_mb: float
+  engine: str = "mock"
 
 
 class QualityReport(BaseModel):
   tables: int
-  worst_table: str
-  max_null_pct: float
+  total_rows: int
+  largest_table: str
+  total_size_mb: float
 
 
 class SchemaAnswer(BaseModel):
@@ -864,12 +918,7 @@ def _registry() -> CapabilityRegistry:
           input_kind="item",
           serialize_input=False,
           max_fan_out=20,
-          build=_stub(
-              "profile_table",
-              lambda t: _CANNED_PROFILES.get(
-                  str(t), {"table": str(t), "row_count": 0, "null_pct": 0.0}
-              ),
-          ),
+          build=_stub("profile_table", _profile_table),
       ),
       Capability(
           name="quality_report",
@@ -880,10 +929,19 @@ def _registry() -> CapabilityRegistry:
               "quality_report",
               lambda profiles: {
                   "tables": len(profiles),
-                  "worst_table": max(profiles, key=lambda p: p["null_pct"])[
-                      "table"
-                  ],
-                  "max_null_pct": max(p["null_pct"] for p in profiles),
+                  "total_rows": sum(
+                      int(p.get("row_count", 0)) for p in profiles
+                  ),
+                  "largest_table": (
+                      max(profiles, key=lambda p: p.get("row_count", 0))[
+                          "table"
+                      ]
+                      if profiles
+                      else ""
+                  ),
+                  "total_size_mb": round(
+                      sum(float(p.get("size_mb", 0)) for p in profiles), 1
+                  ),
               },
           ),
       ),
