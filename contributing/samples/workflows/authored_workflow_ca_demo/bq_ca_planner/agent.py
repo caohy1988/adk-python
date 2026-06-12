@@ -406,10 +406,10 @@ _TABLE_LIST_CACHE: dict = {}
 
 
 def _live_table_list() -> list:
-  """The dataset's ACTUAL tables from __TABLES__ (cached per process),
-  falling back to the curated catalogue without credentials. Includes
-  whatever really exists — e.g. the empty stray 'thelook_ecommerce-table'
-  placeholder — so profiling never drifts from what the console shows."""
+  """The dataset's ACTUAL non-empty tables from __TABLES__ (cached per
+  process), falling back to the curated catalogue without credentials.
+  Empty strays (e.g. the 0-row 'thelook_ecommerce-table' placeholder) are
+  excluded — matching the production CA agent's 7-table scope."""
   if "tables" in _TABLE_LIST_CACHE:
     return _TABLE_LIST_CACHE["tables"]
   tables = list(TABLES)
@@ -417,8 +417,8 @@ def _live_table_list() -> list:
     out = _execute_sql({
         "sql": (
             "SELECT table_id FROM"
-            " `bigquery-public-data.thelook_ecommerce.__TABLES__` ORDER BY"
-            " table_id"
+            " `bigquery-public-data.thelook_ecommerce.__TABLES__` WHERE"
+            " row_count > 0 ORDER BY table_id"
         )
     })
     live = [r["table_id"] for r in out.get("rows") or []]
