@@ -354,6 +354,20 @@ def _execute_sql(value) -> dict:
   return {"rows": _query_engine(sql), "engine": "mock"}
 
 
+def query_thelook(sql: str) -> dict:
+  """Run ONE read-only StandardSQL SELECT against the public dataset
+  bigquery-public-data.thelook_ecommerce to check a claim. Use small
+  aggregate queries (GROUP BY / COUNT / SUM); results are capped. Returns
+  rows, the executing engine, and the real error when the SQL is invalid.
+  """
+  out = _execute_sql({"sql": sql})
+  return {
+      "rows": out.get("rows", [])[:50],
+      "engine": out.get("engine"),
+      "error": out.get("error"),
+  }
+
+
 _CANNED_PROFILES = {
     "orders": {"table": "orders", "row_count": 125210, "null_pct": 0.2},
     "order_items": {
@@ -785,15 +799,30 @@ def _registry() -> CapabilityRegistry:
           input_kind="item",
           output_model=Verdict,
           serialize_input=True,
-          build=_llm(
-              "skeptic",
-              Verdict,
-              "You are an adversarial data reviewer. Input: one insight"
-              " about an e-commerce dataset (avg order ~ $60-90, 100k"
-              " users). Try to REFUTE it; refuted=true if implausible."
-              " Echo the insight, and ALWAYS give reason: one sentence"
-              " explaining what you checked and why it stands or falls"
-              " (note caveats like partial years). Output Verdict.",
+          # v2: the skeptic became DATA-GROUNDED (a real query tool) — a
+          # semantic contract change, so stored plans drift-reject and
+          # re-author rather than silently reusing the plausibility-only
+          # skeptic. ADK supports output_schema + tools together: tools in
+          # the thought loop, structure enforced on the final output.
+          version="2",
+          build=lambda: Agent(
+              name="skeptic",
+              model=MODEL,
+              output_schema=Verdict,
+              generate_content_config=DET,
+              tools=[query_thelook],
+              instruction=(
+                  "You are an adversarial DATA reviewer with a real"
+                  " BigQuery tool. Input: one insight/claim about the"
+                  " public dataset bigquery-public-data.thelook_ecommerce"
+                  f" ({schema_blurb}). Do NOT judge from priors: VERIFY the"
+                  " claim by running 1-3 small aggregate SELECTs with the"
+                  " query_thelook tool and compare the actual numbers to"
+                  " the claim. Then output Verdict: echo the claim as"
+                  " insight; refuted=true only if the data contradicts it;"
+                  " reason = one sentence citing the numbers you queried"
+                  " (note caveats like partial years)."
+              ),
           ),
       ),
       # ---- deterministic mocks (no BigQuery needed) ----
@@ -949,12 +978,13 @@ _CAPS_BLURB = (
     " draft_or_repair_sql (item: a question plus optional prior sql and error"
     " -> Sql), summarize_insight (item: rows or stats JSON -> Insight with"
     " field insight), classify_question (item: a question -> Category with"
-    " field category equal to 'data' or 'schema'), skeptic (item: one insight"
-    " -> Verdict with fields insight and refuted), dry_run (item: Sql -> object"
-    " with sql, valid, error), flaky_dry_run (same as dry_run but may fail"
-    " transiently), sql_ok (item: dry-run output -> bool), run_query (item:"
-    " validated sql -> object with rows), profile_table (item: a table name ->"
-    " stats object), quality_report (LIST of stats -> report object),"
+    " field category equal to 'data' or 'schema'), skeptic (item: one —"
+    " data-grounded: it runs real verification queries via its query_thelook"
+    " tool; insight -> Verdict with fields insight and refuted), dry_run (item:"
+    " Sql -> object with sql, valid, error), flaky_dry_run (same as dry_run but"
+    " may fail transiently), sql_ok (item: dry-run output -> bool), run_query"
+    " (item: validated sql -> object with rows), profile_table (item: a table"
+    " name -> stats object), quality_report (LIST of stats -> report object),"
     " describe_schema (item: a question -> object with answer), keep_verified"
     " (LIST of Verdicts -> object with verified and rejected), render_chart"
     " (item: query output with rows, or a chart-type winner -> a chart artifact"

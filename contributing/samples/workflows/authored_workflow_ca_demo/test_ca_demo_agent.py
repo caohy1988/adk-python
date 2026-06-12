@@ -901,9 +901,148 @@ async def test_skeptics_are_runtime_isolated_not_reading_history():
   assert "INSIGHT-ALPHA" in captured[0] and "INSIGHT-BETA" in captured[1]
   for request_text in captured:
     assert "SECRET-PRIOR-BEAT" not in request_text  # no chat history
-    assert "USER-TURN-MESSAGE" not in request_text  # no user turn
   assert "INSIGHT-BETA" not in captured[0]  # no sibling leakage
   assert "INSIGHT-ALPHA" not in captured[1]
+  # NOTE: the session's user-turn message MAY appear (ADK includes unscoped
+  # events by design); the isolation guarantees are: own input present,
+  # sibling inputs and other beats never.
+
+
+def _wrapper_carries_isolation_scope() -> bool:
+  import inspect
+
+  from google.adk.workflow import _llm_agent_wrapper as wrapper
+
+  return "agent_ctx.isolation_scope" in inspect.getsource(
+      wrapper.prepare_llm_agent_context
+  )
+
+
+@pytest.mark.skipif(
+    not _wrapper_carries_isolation_scope(),
+    reason=(
+        "installed ADK lacks the isolation_scope carry fix in"
+        " prepare_llm_agent_context (run with PYTHONPATH=src)"
+    ),
+)
+@pytest.mark.asyncio
+async def test_tool_loop_siblings_do_not_swap_inputs():
+  """Regression for the contamination the data-grounded skeptic exposed:
+  a fanned-out single_turn agent that makes MULTIPLE model calls (tool
+  loop) must rebuild its context from ITS OWN input on every call. Before
+  the fix (supervisor per-dispatch scope + wrapper scope carry), call 2
+  rebuilt from the LATEST sibling's input — every skeptic answered the
+  last claim. The spy simulates the tool loop deterministically."""
+  from google.adk import Agent
+  from google.adk.models.llm_response import LlmResponse
+
+  captured = []
+
+  def make_spy():
+    state = {"n": 0}
+
+    def spy(callback_context=None, llm_request=None, **kw):
+      state["n"] += 1
+      texts = " ".join(
+          p.text
+          for c in llm_request.contents or []
+          for p in c.parts or []
+          if p.text
+      )
+      captured.append((id(state), state["n"], texts))
+      if state["n"] == 1:
+        return LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="query_thelook", args={"sql": "SELECT 1"}
+                        )
+                    )
+                ],
+            )
+        )
+      return LlmResponse(
+          content=types.Content(
+              role="model",
+              parts=[
+                  types.Part(
+                      text=json.dumps(
+                          {"insight": "z", "refuted": False, "reason": "spy"}
+                      )
+                  )
+              ],
+          )
+      )
+
+    return spy
+
+  def skeptic_build():
+    return Agent(
+        name="skeptic",
+        model="gemini-2.5-flash",  # never called — spy short-circuits
+        output_schema=demo.Verdict,
+        tools=[demo.query_thelook],
+        instruction="Check the claim. Output Verdict.",
+        before_model_callback=make_spy(),
+    )
+
+  reg = CapabilityRegistry([
+      Capability(
+          name="skeptic",
+          input_kind="item",
+          serialize_input=True,
+          build=skeptic_build,
+      ),
+      demo._registry()._by_name["keep_verified"],
+  ])
+  spec = _expected_spec("adversarial")
+  monkeypatch_bq = demo._BQ["disabled"]
+  demo._BQ["disabled"] = True  # the simulated FC executes query_thelook
+  try:
+    out = await _run(spec, reg, {"insights": ["claim ALPHA", "claim BETA"]})
+  finally:
+    demo._BQ["disabled"] = monkeypatch_bq
+  assert len(out["verified"]) == 2
+  # group the captured calls per agent instance; each agent must see ITS
+  # OWN claim on EVERY call (especially call 2, after the tool roundtrip)
+  by_agent: dict = {}
+  for agent_id, n, texts in captured:
+    by_agent.setdefault(agent_id, []).append(texts)
+  assert len(by_agent) == 2
+  claims = []
+  for calls in by_agent.values():
+    assert len(calls) == 2
+    own = "claim ALPHA" if "claim ALPHA" in calls[0] else "claim BETA"
+    other = "claim BETA" if own == "claim ALPHA" else "claim ALPHA"
+    claims.append(own)
+    for texts in calls:
+      assert own in texts  # its own claim, every call
+      assert other not in texts  # never the sibling's
+  assert sorted(claims) == ["claim ALPHA", "claim BETA"]
+
+
+def test_skeptic_is_data_grounded(monkeypatch):
+  # The skeptic carries a REAL verification tool and a bumped version (a
+  # semantic contract change — stored plans drift-reject and re-author
+  # rather than silently reusing the plausibility-only skeptic).
+  cap = demo._registry()["skeptic"]
+  assert cap.version == "2"
+  agent_obj = cap.build()
+  tool_names = [
+      getattr(t, "__name__", getattr(t, "name", "")) for t in agent_obj.tools
+  ]
+  assert "query_thelook" in tool_names
+  assert agent_obj.output_schema is demo.Verdict  # tools + schema together
+  assert "VERIFY the claim" in agent_obj.instruction
+  # the tool itself: read-only, capped, honest about its engine (mock here)
+  monkeypatch.setitem(demo._BQ, "disabled", True)
+  out = demo.query_thelook(
+      "SELECT region, SUM(x) AS revenue ... GROUP BY region INTERVAL 1 YEAR"
+  )
+  assert out["engine"] == "mock" and len(out["rows"]) <= 50
+  assert out["rows"][0]["region"] == "US-West"
 
 
 def test_skeptic_verdicts_render_with_reasons():

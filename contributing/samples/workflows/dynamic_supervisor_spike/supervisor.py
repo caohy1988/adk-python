@@ -86,13 +86,31 @@ class DynamicNodeSupervisor:
   async def dispatch(
       self, child, *, node_input: Any = None, run_id: str | None = None
   ) -> Any:
-    """One leaf dispatch. The gate is held ONLY for the child execution."""
+    """One leaf dispatch. The gate is held ONLY for the child execution.
+
+    Each dispatch runs in its OWN sub-branch AND its own isolation scope
+    (parent_scope::run_id). Parallel siblings share an author name, and a
+    single_turn LLM child making MULTIPLE model calls (tool loops) rebuilds
+    its context per call by scanning for the latest input event in its
+    isolation scope — with the parent's shared scope, sibling inputs landing
+    in between get picked up instead (observed: fanned-out tool-using
+    skeptics all answering the LAST sibling's claim). The wrapper stamps the
+    child's input event and its FC/FR trail with ctx.isolation_scope, so a
+    per-dispatch scope makes context independence structural for multi-call
+    children rather than an artifact of single-call timing.
+    """
     async with self.gate:
       self._in_flight += 1
       self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
+      parent_scope = getattr(self.ctx, "isolation_scope", None)
+      scope = f"{parent_scope}::{run_id}" if run_id else parent_scope
       try:
         return await self.ctx.run_node(
-            child, node_input=node_input, run_id=run_id
+            child,
+            node_input=node_input,
+            run_id=run_id,
+            use_sub_branch=True,
+            override_isolation_scope=scope,
         )
       finally:
         self._in_flight -= 1
