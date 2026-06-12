@@ -58,8 +58,8 @@ scenario per prompt**, each authoring a different coordination shape:
 | 1   | `What was revenue by region last quarter?`                                              | `loop_until(draft → REAL dry-run → repair) → run_query → render_chart + summarize` | the standard CA flow — **your actual question is the task input**, and a real BigQuery dry-run error (e.g. `TIMESTAMP_SUB ... YEAR`) feeds the repair round                                                                                                                      |
 | 2   | `Profile data quality across the dataset tables.`                                       | fan-out → synthesize                                                               | per-table profiling in parallel, one report                                                                                                                                                                                                                                      |
 | 3   | `Build a dashboard for these three questions.`                                          | pipeline(`nl2sql → dry_run`) per item                                              | each panel translated + validated barrier-free                                                                                                                                                                                                                                   |
-| 4   | `Route my question: what does order status 'Complete' mean?`                            | classify & route (branch)                                                          | metadata questions skip SQL entirely                                                                                                                                                                                                                                             |
-| 5   | `Answer with SQL self-repair — the dry run is unreliable.`                              | loop_until + **loop-carried `init`**                                               | draft → failed dry run → repair using the error                                                                                                                                                                                                                                  |
+| 4   | `Route my question: what does order status 'Complete' mean?`                            | classify & route (branch)                                                          | metadata questions skip SQL planning — answered by a data-grounded agent that queries the REAL data (DISTINCT values, counts)                                                                                                                                                    |
+| 5   | `Answer with SQL self-repair — the dry run is unreliable.`                              | loop_until + **loop-carried `init`**                                               | a REALLY broken query (`thelook_ecommerce.order`) is checked by the REAL dry-run, repaired from the actual BigQuery error, then executed                                                                                                                                         |
 | 6   | `Audit this insight: <paste any claim>` (or just `audit that insight` after a question) | adversarial verification                                                           | **audits YOUR insights with DATA-GROUNDED skeptics** — each runs real BigQuery checks via its `query_thelook` tool and cites the numbers (the $1M-AOV claim is refuted with the actual ~$86 AOV); insights from your message, the session's last insight, or the canned fallback |
 | 7   | `Pick the best chart for revenue by region.`                                            | tournament                                                                         | pairwise chart judging to a single winner                                                                                                                                                                                                                                        |
 
@@ -83,7 +83,7 @@ replayable — a turn-by-turn agent retry never is.*
 ## 2. Correctness proof (no LLM, no BigQuery)
 
 ```bash
-pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 38 (one live-gated; one gated on the patched ADK wrapper)
+pytest contributing/samples/workflows/authored_workflow_ca_demo/test_ca_demo_agent.py -q   # 38 collected (one live-gated; one gated on the patched ADK wrapper)
 ```
 
 All seven expected shapes are built by hand, validated + lint-checked against
@@ -100,8 +100,9 @@ against the **live** registry (their capabilities are deterministic mocks).
   free-decomposition evidence is the spike's demand gate and the main demo's
   free-authoring beat. The *variety* — seven shapes from one closed
   vocabulary — is the claim here.
-- The `flaky_dry_run` failure is simulated (every odd call fails) so the
-  repair loop behaves identically on every run and in CI.
+- Nothing in the live path is simulated anymore: the repair scenario
+  checks a really-broken query against the real dry-run; transient-failure
+  simulation now lives only in the CI test stubs.
 - Frozen plans are per-scenario (`authored_workflow:ca:<scenario>`) in
   session state, AND exported per-scenario to `ca_plan_store/` for
   cross-session reuse (delete a file to force fresh authoring; the store is

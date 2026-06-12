@@ -431,19 +431,6 @@ def _profile_table(value) -> dict:
   return prof
 
 
-_SCHEMA_NOTES = {
-    "default": (
-        "orders.status takes Complete / Shipped / Processing / Cancelled /"
-        " Returned; 'Complete' means the order was delivered and the return"
-        " window has closed."
-    )
-}
-
-# Simulated transient dry-run failure (repair-loop scenario): every ODD call
-# fails, so EVERY run of the loop shows exactly one repair iteration —
-# deterministic on camera and in CI, and replay behaves identically.
-_FLAKY_CALLS = {"n": 0}
-
 _JUDGE_RANK = {"bar": 0, "line": 1, "scatter": 2, "pie": 3}
 
 
@@ -626,7 +613,7 @@ def _render_chart(v) -> dict:
   (list with one chart-type string), or a bare chart-type string. Emits the
   Conversational-Analytics-style artifact: a Vega-Lite spec + a text
   preview the chat can render."""
-  chart_type, rows, explicit = "bar", _CANNED_ROWS, False
+  chart_type, rows, explicit = "bar", None, False
   obj = _obj_of(v)
   if isinstance(obj, dict):
     rows = obj.get("rows", rows)
@@ -650,6 +637,21 @@ def _render_chart(v) -> dict:
 
   if not explicit and len(rows or []) >= 2 and all(map(_datelike, rows)):
     chart_type = "line"
+  if rows is None:
+    # No rows handed over (e.g. the tournament passes only the winning
+    # chart type): chart REAL revenue-by-region data, not canned values.
+    rows = (
+        _execute_sql({
+            "sql": (
+                "SELECT u.country AS region, SUM(oi.sale_price) AS revenue"
+                " FROM thelook_ecommerce.order_items AS oi JOIN"
+                " thelook_ecommerce.orders AS o ON oi.order_id = o.order_id"
+                " JOIN thelook_ecommerce.users AS u ON o.user_id = u.id"
+                " GROUP BY region ORDER BY revenue DESC LIMIT 8"
+            )
+        }).get("rows")
+        or _CANNED_ROWS
+    )
   first = rows[0] if rows and isinstance(rows[0], dict) else {}
   timeish = ("year", "quarter", "month", "week", "date", "day")
   str_fields = [k for k, v in first.items() if isinstance(v, str)]
@@ -816,7 +818,9 @@ def _registry() -> CapabilityRegistry:
               "draft_or_repair_sql",
               Sql,
               "Input JSON has a question, and possibly a prior sql + error"
-              " from a failed dry run. Draft (or repair, using the error)"
+              " from a failed dry run. If there is an error, REPAIR the sql"
+              " using it; if the sql is valid (no error), return it"
+              " unchanged. Otherwise draft"
               " one BigQuery StandardSQL SELECT over the public dataset"
               " bigquery-public-data.thelook_ecommerce (fully-qualified"
               f" table names): {schema_blurb}. Output Sql, echoing the"
@@ -888,13 +892,6 @@ def _registry() -> CapabilityRegistry:
           build=_stub("dry_run", _bq_dry_run),
       ),
       Capability(
-          name="flaky_dry_run",
-          input_kind="item",
-          output_model=DryRunResult,
-          serialize_input=False,
-          build=_stub("flaky_dry_run", lambda s: _flaky_dry_run(s)),
-      ),
-      Capability(
           name="sql_ok",
           input_kind="item",
           serialize_input=False,
@@ -949,10 +946,25 @@ def _registry() -> CapabilityRegistry:
           name="describe_schema",
           output_model=SchemaAnswer,
           input_kind="item",
-          serialize_input=False,
-          build=_stub(
-              "describe_schema",
-              lambda q: {"answer": _SCHEMA_NOTES["default"]},
+          serialize_input=True,
+          # v2: answers metadata questions from the REAL dataset (it queries
+          # DISTINCT values / counts) instead of a canned sentence.
+          version="2",
+          build=lambda: Agent(
+              name="describe_schema",
+              model=MODEL,
+              output_schema=SchemaAnswer,
+              generate_content_config=DET,
+              tools=[query_thelook],
+              instruction=(
+                  "Answer metadata/meaning questions about the public"
+                  " dataset bigquery-public-data.thelook_ecommerce"
+                  f" ({schema_blurb}). QUERY the real data with the"
+                  " query_thelook tool (e.g. SELECT DISTINCT values, small"
+                  " counts) rather than answering from priors. Output"
+                  " SchemaAnswer: a concise answer grounded in the queried"
+                  " values."
+              ),
           ),
       ),
       Capability(
@@ -1010,23 +1022,6 @@ def _registry() -> CapabilityRegistry:
   ])
 
 
-def _flaky_dry_run(s):
-  _FLAKY_CALLS["n"] += 1
-  if _FLAKY_CALLS["n"] % 2 == 1:  # every odd call fails -> 1 repair per run
-    return {
-        "question": str(_field_of(s, "question", "") or ""),
-        "sql": _sql_of(s),
-        "valid": False,
-        "error": "Table not found: `thelook.order` (did you mean orders?)",
-    }
-  return {
-      "question": str(_field_of(s, "question", "") or ""),
-      "sql": _sql_of(s),
-      "valid": True,
-      "error": None,
-  }
-
-
 # ------------------------------------------------- scenarios
 _CAPS_BLURB = (
     # NOTE: instruction strings must stay BRACE-FREE — ADK templates
@@ -1039,8 +1034,8 @@ _CAPS_BLURB = (
     " field category equal to 'data' or 'schema'), skeptic (item: one —"
     " data-grounded: it runs real verification queries via its query_thelook"
     " tool; insight -> Verdict with fields insight and refuted), dry_run (item:"
-    " Sql -> object with sql, valid, error), flaky_dry_run (same as dry_run but"
-    " may fail transiently), sql_ok (item: dry-run output -> bool), run_query"
+    " Sql or a task with sql -> object with sql, valid, error — the REAL"
+    " BigQuery dry-run), sql_ok (item: dry-run output -> bool), run_query"
     " (item: validated sql -> object with rows), profile_table (item: a table"
     " name -> stats object), quality_report (LIST of stats -> report object),"
     " describe_schema (item: a question -> object with answer), keep_verified"
@@ -1130,19 +1125,31 @@ def _scenario_defs():
           ),
       ),
       "loop": dict(
-          title="SQL self-repair (loop_until + loop-carried state)",
-          shape="loop_until(init=task, body=[draft_or_repair, flaky_dry_run])",
-          triggers=("repair", "unreliable", "retry"),
-          task={"question": q_region},
+          title="SQL self-repair from a REAL broken query (loop_until)",
+          shape="loop_until(REAL dry_run → repair) → run_query",
+          triggers=("repair", "unreliable", "retry", "broken"),
+          task={
+              "question": q_region,
+              "sql": (  # 'order' instead of 'orders' -> a REAL not-found error
+                  "SELECT u.country AS region, SUM(oi.sale_price) AS revenue"
+                  " FROM thelook_ecommerce.order_items AS oi JOIN"
+                  " thelook_ecommerce.order AS o ON oi.order_id ="
+                  " o.order_id JOIN thelook_ecommerce.users AS u ON"
+                  " o.user_id = u.id GROUP BY region ORDER BY revenue DESC"
+              ),
+          },
           recipe=(
-              "Author ONE loop_until: init = Binding(source='task'); body ="
-              " [(a) a step running draft_or_repair_sql whose input is"
-              " Binding(source='step', step=<the loop's own id>) — it reads"
-              " the loop-carried value: the task on round 0, the failed"
-              " dry-run output (sql + error) afterwards; (b) a step running"
-              " flaky_dry_run on (a)]; until_capability = sql_ok with"
-              " until_input = Binding(source='step', step=<the (b) step>);"
-              " max_iters = 3. Output = the loop."
+              "Author, in order: (1) ONE loop_until: init ="
+              " Binding(source='task'); body = [(a) a step running dry_run"
+              " whose input is Binding(source='step', step=<the loop's own"
+              " id>) — round 0 checks the task's sql, later rounds check"
+              " the repaired sql; (b) a step running draft_or_repair_sql"
+              " on (a) — it reads question + sql + the REAL BigQuery error"
+              " and outputs a fixed Sql (if there is no error, return the"
+              " sql unchanged)]; until_capability = sql_ok with until_input"
+              " = Binding(source='step', step=<the (a) step>); max_iters ="
+              " 3. (2) a step running run_query on the loop's output."
+              " Output = the run_query step."
           ),
       ),
       "adversarial": dict(

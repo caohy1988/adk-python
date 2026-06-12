@@ -62,6 +62,7 @@ _LLM_CAPS = (
     "summarize_insight",
     "classify_question",
     "skeptic",
+    "describe_schema",  # v2: data-grounded (query tool) — stubbed in tests
 )
 
 
@@ -132,6 +133,20 @@ def _stub_registry() -> CapabilityRegistry:
           build=_stub(
               "skeptic",
               lambda v: {"insight": str(v), "refuted": "1,000,000" in str(v)},
+          ),
+      ),
+      Capability(
+          name="describe_schema",
+          input_kind="item",
+          serialize_input=False,
+          build=_stub(
+              "describe_schema",
+              lambda q: {
+                  "answer": (
+                      "orders.status values include Complete, Shipped,"
+                      " Processing, Cancelled, Returned."
+                  )
+              },
           ),
       ),
   ]
@@ -294,7 +309,7 @@ def _expected_spec(key: str) -> WorkflowSpec:
     )
   if key == "loop":
     return WorkflowSpec(
-        goal="sql self-repair",
+        goal="sql self-repair from a real broken query",
         steps=[
             LoopUntil(
                 kind="loop_until",
@@ -303,23 +318,29 @@ def _expected_spec(key: str) -> WorkflowSpec:
                 body=[
                     StepRef(
                         kind="step",
-                        id="draft",
-                        capability="draft_or_repair_sql",
+                        id="check",
+                        capability="dry_run",
                         input=Binding(source="step", step="repair"),
                     ),
                     StepRef(
                         kind="step",
-                        id="check",
-                        capability="flaky_dry_run",
-                        input=Binding(source="step", step="draft"),
+                        id="fix",
+                        capability="draft_or_repair_sql",
+                        input=Binding(source="step", step="check"),
                     ),
                 ],
                 until_capability="sql_ok",
                 until_input=Binding(source="step", step="check"),
                 max_iters=3,
             ),
+            StepRef(
+                kind="step",
+                id="rows",
+                capability="run_query",
+                input=Binding(source="step", step="repair"),
+            ),
         ],
-        output=Binding(source="step", step="repair"),
+        output=Binding(source="step", step="rows"),
     )
   if key == "adversarial":
     return WorkflowSpec(
@@ -402,11 +423,12 @@ async def _run(spec, registry, task_input):
 
 
 # ----------------------------------------------------- tests
-def test_stubs_tolerate_authored_binding_shapes():
+def test_stubs_tolerate_authored_binding_shapes(monkeypatch):
   # The plan is MODEL-authored: a binding may hand a stub the whole step
   # output (dict), a dotted path into it (raw string), or a JSON-encoded
   # payload. The live error this pins: nl2sql -> dry_run with path='sql'
   # passed a raw SQL string and the stub assumed a dict.
+  monkeypatch.setitem(demo._BQ, "disabled", True)
   raw_sql = "SELECT region FROM order_items"
   assert demo._sql_of({"sql": raw_sql}) == raw_sql
   assert demo._sql_of(json.dumps({"sql": raw_sql})) == raw_sql
@@ -419,12 +441,13 @@ def test_stubs_tolerate_authored_binding_shapes():
       "reason": "",
   }
   assert demo._verdict_of("just text")["refuted"] is False
-  demo._FLAKY_CALLS["n"] = 1  # next call is even -> passes
-  out = demo._flaky_dry_run(raw_sql)  # raw string input must not crash
+  # dry-run (mock branch) tolerates a raw SQL string input too
+  out = demo._bq_dry_run(raw_sql)
   assert out["valid"] is True and out["sql"] == raw_sql
 
 
-def test_render_chart_accepts_authored_binding_shapes():
+def test_render_chart_accepts_authored_binding_shapes(monkeypatch):
+  monkeypatch.setitem(demo._BQ, "disabled", True)
   # query output (dict with rows) -> bar over those rows
   region_rows = demo._query_engine(
       "SELECT region, SUM(x) AS revenue ... GROUP BY region INTERVAL 1 YEAR"
@@ -446,14 +469,16 @@ def test_render_chart_accepts_authored_binding_shapes():
   assert len(lines) == 4 and lines[0].count("█") > lines[-1].count("█")
 
 
-def test_render_chart_derives_encoding_fields():
+def test_render_chart_derives_encoding_fields(monkeypatch):
+  monkeypatch.setitem(demo._BQ, "disabled", True)
   ch = demo._render_chart({"rows": [{"category": "A", "count": 3}]})
   assert ch["x_field"] == "category" and ch["y_field"] == "count"
   enc = ch["vega_lite"]["encoding"]
   assert enc["x"]["field"] == "category" and enc["y"]["field"] == "count"
 
 
-def test_chart_png_renders_or_falls_back():
+def test_chart_png_renders_or_falls_back(monkeypatch):
+  monkeypatch.setitem(demo._BQ, "disabled", True)
   ch = demo._render_chart({"rows": demo._CANNED_ROWS})
   png = demo._chart_png(ch)
   if png is None:
@@ -606,7 +631,8 @@ def test_dry_run_preserves_question_for_repair_rounds(monkeypatch):
   assert "question" in demo.Sql.model_fields
 
 
-def test_chart_multiseries_per_region_per_year():
+def test_chart_multiseries_per_region_per_year(monkeypatch):
+  monkeypatch.setitem(demo._BQ, "disabled", True)
   # The shape the user's real question produces: GROUP BY region, year with
   # two measures. x = the time field, one SERIES per region, measure picked
   # by name preference (total_sales over total_orders); int year never
@@ -734,7 +760,8 @@ def test_engine_yearly_and_quarterly_grains():
   )
 
 
-def test_chart_infers_line_for_time_series():
+def test_chart_infers_line_for_time_series(monkeypatch):
+  monkeypatch.setitem(demo._BQ, "disabled", True)
   rows = demo._query_engine(
       "SELECT month, SUM(x) AS sales ... GROUP BY month INTERVAL 1 YEAR"
   )
@@ -1233,16 +1260,42 @@ async def test_branch_routes_schema_question():
 
 
 @pytest.mark.asyncio
-async def test_loop_repairs_sql_exactly_once():
-  demo._FLAKY_CALLS["n"] = 0
-  out = await _run(
-      _expected_spec("loop"),
-      _stub_registry(),
-      demo.SCENARIOS["loop"]["task"],
+async def test_loop_repairs_sql_exactly_once(monkeypatch):
+  # The demo uses the REAL dry-run on a really-broken query; in CI the
+  # failure is simulated by a stateful stub (fails the first check only).
+  monkeypatch.setitem(demo._BQ, "disabled", True)
+  calls = {"n": 0}
+
+  def checking(s):
+    calls["n"] += 1
+    if calls["n"] == 1:
+      return {
+          "question": str(demo._field_of(s, "question", "") or ""),
+          "sql": demo._sql_of(s),
+          "valid": False,
+          "error": "Not found: Table thelook_ecommerce.order",
+      }
+    return {
+        "question": str(demo._field_of(s, "question", "") or ""),
+        "sql": demo._sql_of(s),
+        "valid": True,
+        "error": None,
+    }
+
+  reg = _stub_registry()
+  caps = [c for n, c in reg._by_name.items() if n != "dry_run"]
+  caps.append(
+      Capability(
+          name="dry_run",
+          input_kind="item",
+          serialize_input=False,
+          build=_stub("dry_run", checking),
+      )
   )
-  assert out["valid"] is True
-  # odd call fails, even call passes -> exactly one repair iteration.
-  assert demo._FLAKY_CALLS["n"] == 2
+  reg = CapabilityRegistry(caps)
+  out = await _run(_expected_spec("loop"), reg, demo.SCENARIOS["loop"]["task"])
+  assert calls["n"] == 2  # exactly one repair round
+  assert out["engine"] == "mock" and out["rows"]  # query ran after repair
 
 
 @pytest.mark.asyncio
@@ -1257,7 +1310,8 @@ async def test_adversarial_rejects_implausible_insight():
 
 
 @pytest.mark.asyncio
-async def test_tournament_picks_best_chart_no_llm_needed():
+async def test_tournament_picks_best_chart_no_llm_needed(monkeypatch):
+  monkeypatch.setitem(demo._BQ, "disabled", True)
   # pairing + judging are deterministic mocks even in the LIVE registry.
   out = await _run(
       _expected_spec("tournament"),
