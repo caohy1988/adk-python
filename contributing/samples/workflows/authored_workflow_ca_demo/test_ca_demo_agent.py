@@ -794,13 +794,29 @@ def test_text_of_extracts_user_message():
   assert demo._text_of(w) == "last year please"
 
 
+def test_fanout_profiles_the_live_table_list(monkeypatch):
+  # Profiling fans out over whatever REALLY exists in the dataset (live
+  # __TABLES__, cached); without credentials it falls back to the curated
+  # catalogue. The live list legitimately includes the empty stray
+  # 'thelook_ecommerce-table' the console shows.
+  monkeypatch.setitem(demo._BQ, "disabled", True)
+  monkeypatch.setattr(demo, "_TABLE_LIST_CACHE", {})
+  assert demo._task_for("fanout", "profile data quality") == {
+      "tables": list(demo.TABLES)
+  }
+  # cache short-circuits repeated metadata queries
+  monkeypatch.setattr(demo, "_TABLE_LIST_CACHE", {"tables": ["a", "b"]})
+  assert demo._task_for("fanout", "x") == {"tables": ["a", "b"]}
+
+
 def test_sequence_takes_live_question_others_stay_canned():
   q = "What was revenue by region last year?"
   assert demo._task_for("sequence", q) == {"question": q}
   # empty/whitespace falls back to the canned question
   assert demo._task_for("sequence", "  ") == demo.SCENARIOS["sequence"]["task"]
-  # mode-selector scenarios keep their canned inputs
-  assert demo._task_for("fanout", q) == demo.SCENARIOS["fanout"]["task"]
+  # mode-selector scenarios keep canned/derived inputs (fanout discovers
+  # the live table list — see test_fanout_profiles_the_live_table_list)
+  assert demo._task_for("pipeline", q) == demo.SCENARIOS["pipeline"]["task"]
 
 
 def test_root_agent_importable_and_named():
@@ -836,8 +852,8 @@ def test_audit_takes_live_insights_not_canned():
   task = demo._task_for("adversarial", "audit these insights")
   assert task == demo.SCENARIOS["adversarial"]["task"]
   # other scenarios unaffected
-  assert demo._task_for("fanout", f"audit {claim}") == (
-      demo.SCENARIOS["fanout"]["task"]
+  assert demo._task_for("pipeline", f"audit {claim}") == (
+      demo.SCENARIOS["pipeline"]["task"]
   )
 
 

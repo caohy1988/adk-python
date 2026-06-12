@@ -402,11 +402,37 @@ _CANNED_PROFILES = {
 }
 
 
+_TABLE_LIST_CACHE: dict = {}
+
+
+def _live_table_list() -> list:
+  """The dataset's ACTUAL tables from __TABLES__ (cached per process),
+  falling back to the curated catalogue without credentials. Includes
+  whatever really exists — e.g. the empty stray 'thelook_ecommerce-table'
+  placeholder — so profiling never drifts from what the console shows."""
+  if "tables" in _TABLE_LIST_CACHE:
+    return _TABLE_LIST_CACHE["tables"]
+  tables = list(TABLES)
+  if _bq_client() is not None:
+    out = _execute_sql({
+        "sql": (
+            "SELECT table_id FROM"
+            " `bigquery-public-data.thelook_ecommerce.__TABLES__` ORDER BY"
+            " table_id"
+        )
+    })
+    live = [r["table_id"] for r in out.get("rows") or []]
+    if live:
+      tables = live
+  _TABLE_LIST_CACHE["tables"] = tables
+  return tables
+
+
 def _profile_table(value) -> dict:
   """REAL table profile from BigQuery __TABLES__ metadata (row count, size)
   when credentials allow; the canned fallback otherwise — engine-labeled."""
   name = str(value).strip().strip("`'\"")
-  if _bq_client() is not None and re.fullmatch(r"[A-Za-z_][\w]*", name):
+  if _bq_client() is not None and re.fullmatch(r"[A-Za-z_][\w-]*", name):
     out = _execute_sql({
         "sql": (
             "SELECT table_id, row_count, size_bytes FROM"
@@ -1241,6 +1267,8 @@ def _task_for(key: str, text: str, last_insight: str | None = None) -> dict:
   task = dict(SCENARIOS[key]["task"])
   if key == "sequence" and text.strip():
     task = {"question": text.strip()}
+  if key == "fanout":
+    task = {"tables": _live_table_list()}  # whatever REALLY exists
   if key == "adversarial":
     inline = _extract_insights(text)
     if inline:
