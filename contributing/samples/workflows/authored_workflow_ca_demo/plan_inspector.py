@@ -176,17 +176,31 @@ def _kv(label, value, why, tag, tag_label) -> str:
   )
 
 
-def _sql_producing_step_ids(spec) -> list:
-  """The plan steps whose validated results the store freezes (the drafting
-  loop in the ask-a-question plan)."""
-  ids = []
+def _sql_producing_step_ids(spec, mid_results=()) -> list:
+  """The plan steps whose validated results froze. Prefer the lineage the
+  artifacts RECORDED (produced_by_step); fall back to the drafting-loop
+  heuristic for records frozen before lineage existed."""
+  recorded = {
+      r.get("produced_by_step")
+      for r in mid_results
+      if r.get("produced_by_step")
+  }
+  step_ids = {s.get("id") for s in spec.get("steps", [])}
+  # lineage may point INSIDE a loop body — surface the loop in that case
   for s in spec.get("steps", []):
-    sid = str(s.get("id", "")).lower()
-    if s.get("kind") == "loop_until" and any(
-        h in sid for h in _SQL_PRODUCER_HINTS
-    ):
-      ids.append(s.get("id"))
-  return ids
+    if s.get("kind") == "loop_until":
+      body_ids = {b.get("id") for b in s.get("body", [])}
+      if recorded & body_ids:
+        recorded.add(s.get("id"))
+  ids = [i for i in recorded if i in step_ids]
+  if ids:
+    return ids
+  return [
+      s.get("id")
+      for s in spec.get("steps", [])
+      if s.get("kind") == "loop_until"
+      and any(h in str(s.get("id", "")).lower() for h in _SQL_PRODUCER_HINTS)
+  ]
 
 
 def _mid_result(rec: dict) -> str:
@@ -206,8 +220,16 @@ def _mid_result(rec: dict) -> str:
       f" <code>{rec.get('sql_hash', '')[:16]}</code> · validated"
       f" {str(rec.get('validated_at', ''))[:19]} ·"
       f" engine {html.escape(str(rec.get('engine', '')))} ·"
-      f" {len(revs)} human revision(s)</div>"
-      f"<details><summary>the validated artifact (SQL, in this instance)"
+      f" {len(revs)} human revision(s)"
+      + (
+          " · <b>lineage:</b> plan"
+          f" <code>{html.escape(str(rec['plan_hash']))}</code>, step"
+          f" <code>{html.escape(str(rec.get('produced_by_step', '?')))}</code>"
+          if rec.get("plan_hash")
+          else ""
+      )
+      + "</div>"
+      "<details><summary>the validated artifact (SQL, in this instance)"
       f"</summary><pre>{html.escape(rec.get('sql', ''))}</pre></details>"
       + (rev_html or "")
       + "</div>"
@@ -216,7 +238,7 @@ def _mid_result(rec: dict) -> str:
 
 def _plan_card(name: str, env: dict, mid_results=()) -> str:
   spec = env.get("spec", {})
-  frozen_ids = _sql_producing_step_ids(spec) if mid_results else []
+  frozen_ids = _sql_producing_step_ids(spec, mid_results) if mid_results else []
   parts = [
       f'<div class="card"><h2 style="margin-top:0">Frozen workflow:'
       f" {html.escape(name)} — “{html.escape(spec.get('goal', ''))}”</h2>",
@@ -440,7 +462,13 @@ def main() -> str:
 
   cards = timeline
   for name, env in envs.items():
-    attach = in_session if name == "sequence" else ()
+    short = str(env.get("spec_hash", ""))[:12]
+    attach = [
+        r
+        for r in in_session
+        if r.get("plan_hash") == short
+        or (not r.get("plan_hash") and name == "sequence")
+    ]
     cards += _plan_card(name, env, attach)
   if other:
     cards += (

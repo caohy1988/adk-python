@@ -1139,6 +1139,22 @@ def test_sql_freezing_roundtrip_and_revision_history(tmp_path, monkeypatch):
   assert "calendar quarters" in rec2["revisions"][0]["feedback"]
   # unknown question -> None
   assert demo._load_frozen_sql("never asked") is None
+  # WORKFLOW LINEAGE: the middle result records which plan + step produced
+  # it, and revisions inherit the lineage (the artifact is structurally
+  # attached to the frozen workflow, not just stored beside it).
+  demo._freeze_sql(
+      "lineage q",
+      "SELECT 1",
+      plan_hash="abc123def456",
+      produced_by_step="sqlgen",
+  )
+  rec3 = demo._load_frozen_sql("lineage q")
+  assert rec3["plan_hash"] == "abc123def456"
+  assert rec3["produced_by_step"] == "sqlgen"
+  demo._freeze_sql("lineage q", "SELECT 2", feedback="tweak it", previous=rec3)
+  rec4 = demo._load_frozen_sql("lineage q")
+  assert rec4["plan_hash"] == "abc123def456"  # lineage survives revisions
+  assert len(rec4["revisions"]) == 1
 
 
 def test_frozen_sql_replay_plan_is_static_and_clean():

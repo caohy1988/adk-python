@@ -1444,6 +1444,8 @@ def _freeze_sql(
     bytes_processed: int = 0,
     feedback: str | None = None,
     previous: dict | None = None,
+    plan_hash: str | None = None,
+    produced_by_step: str | None = None,
 ) -> str:
   """Freeze (or revise) the validated SQL for a question.
 
@@ -1476,6 +1478,14 @@ def _freeze_sql(
       "bytes_processed": int(bytes_processed or 0),
       "validated_at": _now_iso(),
   })
+  # WORKFLOW LINEAGE: the middle result is an instance of a specific plan's
+  # step for a specific question — record which plan (hash) and which step
+  # produced it, so the artifact is structurally attached to the frozen
+  # workflow, not just stored beside it. Revisions inherit the lineage.
+  if plan_hash:
+    rec["plan_hash"] = plan_hash
+  if produced_by_step:
+    rec["produced_by_step"] = produced_by_step
   with open(path, "w") as f:
     json.dump(rec, f, indent=1)
   return path
@@ -1836,13 +1846,13 @@ async def plan_and_run(ctx: Context, node_input):
     # a frozen plan — freeze its dry-run-validated output so replays of
     # this exact question are numerically deterministic (and feedback can
     # amend it auditably).
-    checked = next(
+    checked_step, checked = next(
         (
-            v
-            for v in interp.state.values()
+            (k, v)
+            for k, v in interp.state.items()
             if isinstance(v, dict) and v.get("valid") is True and v.get("sql")
         ),
-        None,
+        (None, None),
     )
     if checked:
       _freeze_sql(
@@ -1850,6 +1860,8 @@ async def plan_and_run(ctx: Context, node_input):
           checked["sql"],
           engine=str(checked.get("engine", "bigquery")),
           bytes_processed=checked.get("bytes_processed", 0),
+          plan_hash=spec_hash,
+          produced_by_step=checked_step,
       )
       yield _msg(
           "🧊 **SQL frozen** for this question — re-ask it (any session)"
