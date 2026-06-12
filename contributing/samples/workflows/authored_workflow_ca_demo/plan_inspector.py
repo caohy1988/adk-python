@@ -78,6 +78,16 @@ pre { background: #202124; color: #e8eaed; border-radius: 10px; padding: 14px;
 .bad { border-left-color: var(--red); background: #fce8e655; }
 .bad b { color: var(--red); }
 details summary { cursor: pointer; color: var(--blue); font-weight: 600; margin: 8px 0; }
+.turn { display: flex; gap: 14px; margin: 10px 0; }
+.turn .num { flex: 0 0 30px; height: 30px; border-radius: 50%; background: var(--blue);
+             color: #fff; font-weight: 700; display: flex; align-items: center;
+             justify-content: center; }
+.turn .body { flex: 1; background: var(--card); border: 1px solid var(--line);
+              border-radius: 10px; padding: 10px 14px; }
+.turn .ask { font-weight: 600; }
+.turn .mech { font-size: 12px; margin: 4px 0; }
+.turn .insight { color: var(--mut); font-size: 12.5px; border-left: 3px solid var(--line);
+                 padding-left: 8px; margin-top: 6px; }
 """
 
 
@@ -264,6 +274,92 @@ def _sql_card(rec: dict) -> str:
   )
 
 
+def _fetch_session(app: str, user: str, session_id: str, port: int = 8001):
+  import urllib.request
+
+  url = f"http://127.0.0.1:{port}/apps/{app}/users/{user}/sessions/{session_id}"
+  try:
+    with urllib.request.urlopen(url, timeout=5) as r:
+      return json.loads(r.read())
+  except Exception:
+    return None
+
+
+def _session_timeline(session: dict) -> str:
+  """Render the session's ACTUAL flow: one card per user turn, classified by
+  the mechanism that answered it, linked to the artifact it touched."""
+  import re
+
+  turns, cur = [], None
+  for e in session.get("events", []):
+    content = e.get("content") or {}
+    texts = [
+        p.get("text", "") for p in content.get("parts") or [] if p.get("text")
+    ]
+    blob = " ".join(texts)
+    if e.get("author") == "user" and blob.strip():
+      cur = {"ask": blob.strip(), "beats": []}
+      turns.append(cur)
+    elif cur is not None and blob:
+      cur["beats"].append(blob)
+
+  cards = []
+  for i, t in enumerate(turns, 1):
+    beats = " ".join(t["beats"])
+    if "Frozen SQL replay" in beats:
+      mech = (
+          '<span class="tag t-cons">🧊 FROZEN-SQL REPLAY</span> drafting LLM'
+          " skipped — deterministic numbers"
+      )
+    elif "Revising the frozen SQL" in beats:
+      mech = (
+          '<span class="tag t-audit">🛠 HUMAN REVISION</span> feedback'
+          " validated by a REAL dry-run, recorded in the artifact, then"
+          " executed"
+      )
+    elif "Authored plan" in beats:
+      mech = '<span class="tag t-ver">📝 AUTHORED FRESH</span> 1 planner call'
+    elif "Reusing frozen plan" in beats:
+      mech = (
+          '<span class="tag t-cons">♻️ FROZEN-PLAN REUSE</span> 0 planner calls'
+      )
+    elif "Conversational turn" in beats:
+      mech = (
+          '<span class="tag t-safe">💬 CONVERSATION</span> no workflow issued'
+      )
+    else:
+      mech = '<span class="tag t-safe">WORKFLOW</span>'
+    hash_m = re.search(r"validated SQL \(hash `([0-9a-f]+)`", beats)
+    rev_m = re.search(r"(\d+) human revision", beats)
+    extra = ""
+    if hash_m:
+      extra += f" · sql `{hash_m.group(1)}`"
+    if rev_m:
+      extra += f" · {rev_m.group(1)} revision(s) applied"
+    ins_m = re.search(r'"insight": "([^"]+)', beats)
+    insight = (
+        f'<div class="insight">{html.escape(ins_m.group(1)[:220])}</div>'
+        if ins_m
+        else ""
+    )
+    cards.append(
+        f'<div class="turn"><div class="num">{i}</div><div class="body">'
+        f'<div class="ask">“{html.escape(t["ask"][:160])}”</div>'
+        f'<div class="mech">{mech}{html.escape(extra)}</div>{insight}'
+        "</div></div>"
+    )
+  if not cards:
+    return ""
+  return (
+      '<div class="card"><h2 style="margin-top:0">▶️ This session, as it'
+      " actually ran</h2><div class='sub'>Read straight from the live ADK"
+      " session — each turn classified by the mechanism that answered it."
+      " The artifacts those turns created and reused are below.</div>"
+      + "".join(cards)
+      + "</div>"
+  )
+
+
 def main() -> str:
   envs = {}
   for fn in sorted(os.listdir(STORE)):
@@ -281,7 +377,20 @@ def main() -> str:
         with open(os.path.join(sql_dir, fn)) as f:
           sql_cards += _sql_card(json.load(f))
 
-  cards = sql_cards + "\n".join(_plan_card(k, v) for k, v in envs.items())
+  timeline = ""
+  if len(sys.argv) > 1:
+    sid = sys.argv[1]
+    app = sys.argv[2] if len(sys.argv) > 2 else "bq_ca_planner"
+    user = sys.argv[3] if len(sys.argv) > 3 else "user"
+    session = _fetch_session(app, user, sid)
+    if session:
+      timeline = _session_timeline(session)
+
+  cards = (
+      timeline
+      + sql_cards
+      + "\n".join(_plan_card(k, v) for k, v in envs.items())
+  )
   page = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Frozen Plan Inspector — RFC #93</title><style>{CSS}</style></head><body>
 <h1>Frozen Plan Inspector</h1>
