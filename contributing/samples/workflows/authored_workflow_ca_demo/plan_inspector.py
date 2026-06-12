@@ -225,6 +225,45 @@ def _plan_card(name: str, env: dict) -> str:
   return "\n".join(parts)
 
 
+def _sql_card(rec: dict) -> str:
+  revs = rec.get("revisions", [])
+  rev_rows = "".join(
+      f'<div class="kv"><b>revision #{i + 1}</b>'
+      f'<span class="tag t-audit">HUMAN FEEDBACK</span><br>'
+      f"<code>{html.escape(r.get('feedback', ''))}</code>"
+      '<div class="why">revised'
+      f' {html.escape(str(r.get("revised_at", ""))[:19])}'
+      f" — previous SQL preserved in the artifact:</div>"
+      "<pre"
+      f" style='max-height:120px'>{html.escape(r.get('previous_sql') or '')}</pre></div>"
+      for i, r in enumerate(revs)
+  )
+  return (
+      '<div class="card"><h2 style="margin-top:0">🧊 Frozen SQL — '
+      f"“{html.escape(rec.get('question', ''))}”</h2>"
+      "<b>The numbers, pinned</b> — replays of this exact question skip the"
+      " drafting LLM and run THIS statement (re-validated by a real dry-run"
+      " first, which doubles as warehouse-drift detection):"
+      f"<pre>{html.escape(rec.get('sql', ''))}</pre>"
+      + _kv(
+          "sql_hash · validated_at · engine",
+          f"{rec.get('sql_hash', '')[:16]} ·"
+          f" {str(rec.get('validated_at', ''))[:19]} ·"
+          f" {rec.get('engine', '')}",
+          "Numeric determinism: identical SQL means identical results on an"
+          " unchanged dataset — live-verified to the cent across runs and"
+          " sessions.",
+          "t-cons",
+          "CONSISTENT",
+      )
+      + (
+          rev_rows
+          or '<div class="kv"><b>revisions</b><br><code>none yet</code><div class="why">say “revise: &lt;feedback&gt;” in the demo — the change must pass the real dry-run before it lands, and the feedback is recorded here forever.</div></div>'
+      )
+      + "</div>"
+  )
+
+
 def main() -> str:
   envs = {}
   for fn in sorted(os.listdir(STORE)):
@@ -234,8 +273,15 @@ def main() -> str:
   if not envs:
     print("plan store is empty — run a demo session first", file=sys.stderr)
     raise SystemExit(1)
+  sql_dir = os.path.join(STORE, "sql")
+  sql_cards = ""
+  if os.path.isdir(sql_dir):
+    for fn in sorted(os.listdir(sql_dir)):
+      if fn.endswith(".json"):
+        with open(os.path.join(sql_dir, fn)) as f:
+          sql_cards += _sql_card(json.load(f))
 
-  cards = "\n".join(_plan_card(k, v) for k, v in envs.items())
+  cards = sql_cards + "\n".join(_plan_card(k, v) for k, v in envs.items())
   page = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Frozen Plan Inspector — RFC #93</title><style>{CSS}</style></head><body>
 <h1>Frozen Plan Inspector</h1>
@@ -256,6 +302,10 @@ same safety checks — only the data changes. Answers stop depending on the mode
 <div class="benefit b-safe"><b>🛡️ Safe</b>Closed capability vocabulary, typed bindings,
 plan-quality lints, fail-closed defensive import. No model-written code is ever stored or
 executed.</div>
+<div class="benefit b-cons"><b>🧊 Numerically deterministic</b>SQL freezing extends the
+freeze one level deeper: a question's dry-run-validated SQL becomes part of the artifact,
+so replays skip the drafting LLM entirely — same numbers, to the cent, across runs and
+sessions. Human feedback amends it through validation, with every revision recorded.</div>
 </div>
 
 <div class="story"><b>The consistency story in one line:</b> Session A authored these plans
