@@ -93,6 +93,24 @@ question away from SQL, the audit rejects the implausible insight, the
 tournament converges to `bar` and renders it as a Vega-Lite chart artifact. The fan-out and tournament scenarios execute
 against the **live** registry (their capabilities are deterministic mocks).
 
+## SQL freezing + human-feedback revision
+
+Plan freezing pins the *process*; **SQL freezing pins the numbers**. After a
+question's SQL passes the real dry-run, it's frozen to
+`ca_plan_store/sql/<question-digest>.json`. Re-ask the exact question (any
+session): the drafting LLM is **skipped**, the frozen SQL re-validates
+(doubling as warehouse-drift detection) and replays — live-verified
+identical results run-to-run. Then govern it with feedback:
+
+```text
+revise: exclude orders with status Cancelled or Returned
+```
+
+→ the SQL is revised to follow the feedback, must pass the REAL dry-run
+before it replaces the frozen artifact, and the feedback itself is recorded
+in the artifact's `revisions` history — who changed the query and why,
+auditable. A failed revision leaves the frozen SQL untouched.
+
 ## Notes
 
 - Honesty: like the security-audit demo, scenario recipes are

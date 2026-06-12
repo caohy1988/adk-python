@@ -70,6 +70,7 @@ sys.path.insert(
         "authored_workflow_spike",
     ),
 )
+from authoring import Binding  # noqa: E402
 from authoring import Capability  # noqa: E402
 from authoring import CapabilityRegistry  # noqa: E402
 from authoring import export_plan  # noqa: E402
@@ -79,6 +80,7 @@ from authoring import independence_facts  # noqa: E402
 from authoring import PlanImportError  # noqa: E402
 from authoring import sha256_hex  # noqa: E402
 from authoring import SpecInterpreter  # noqa: E402
+from authoring import StepRef  # noqa: E402
 from authoring import WorkflowSpec  # noqa: E402
 from authoring import WorkflowSpecValidator  # noqa: E402
 
@@ -844,9 +846,11 @@ def _registry() -> CapabilityRegistry:
               "draft_or_repair_sql",
               Sql,
               "Input JSON has a question, and possibly a prior sql + error"
-              " from a failed dry run. If there is an error, REPAIR the sql"
-              " using it; if the sql is valid (no error), return it"
-              " unchanged. Otherwise draft"
+              " from a failed dry run, and possibly human feedback. If"
+              " there is feedback, REVISE the sql to follow it exactly. If"
+              " there is an error, REPAIR the sql using it; if the sql is"
+              " valid (no error, no feedback), return it unchanged."
+              " Otherwise draft"
               " one BigQuery StandardSQL SELECT over the public dataset"
               " bigquery-public-data.thelook_ecommerce (fully-qualified"
               f" table names): {schema_blurb}. Output Sql, echoing the"
@@ -1190,6 +1194,22 @@ def _scenario_defs():
               " Output = the run_query step."
           ),
       ),
+      "revise": dict(
+          title="Revise the frozen SQL from human feedback",
+          shape=(
+              "feedback → draft_or_repair (REAL dry-run) → re-freeze → execute"
+          ),
+          triggers=(
+              "revise",
+              "update the sql",
+              "update the query",
+              "change the query",
+              "instead of",
+              "redefine",
+          ),
+          task={},
+          recipe="",
+      ),
       "adversarial": dict(
           title="Audit insights (adversarial verification)",
           shape="fan_out(skeptic) → step(keep_verified)",
@@ -1391,6 +1411,113 @@ def _store_plan(key: str, record: FrozenWorkflowRecord) -> str:
   return path
 
 
+_SQL_STORE = os.path.join(_PLAN_STORE, "sql")
+
+
+def _now_iso() -> str:
+  return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _q_digest(question: str) -> str:
+  return sha256_hex(re.sub(r"\s+", " ", (question or "").strip().lower()))[:16]
+
+
+def _load_frozen_sql(question: str):
+  """The dry-run-validated SQL frozen for this exact question, or None."""
+  if not question:
+    return None
+  path = os.path.join(_SQL_STORE, f"{_q_digest(question)}.json")
+  if not os.path.exists(path):
+    return None
+  try:
+    with open(path) as f:
+      return json.load(f)
+  except Exception:
+    return None
+
+
+def _freeze_sql(
+    question: str,
+    sql: str,
+    *,
+    engine: str = "bigquery",
+    bytes_processed: int = 0,
+    feedback: str | None = None,
+    previous: dict | None = None,
+) -> str:
+  """Freeze (or revise) the validated SQL for a question.
+
+  SQL freezing extends plan freezing one level deeper: the drafting LLM is
+  the remaining nondeterministic step in a frozen plan, so caching its
+  dry-run-validated output makes replays NUMERICALLY deterministic. A
+  human-feedback revision appends to `revisions` — the feedback itself
+  becomes part of the auditable artifact (who changed the query and why).
+  """
+  os.makedirs(_SQL_STORE, exist_ok=True)
+  path = os.path.join(_SQL_STORE, f"{_q_digest(question)}.json")
+  rec = (
+      dict(previous)
+      if previous
+      else {
+          "question": (question or "").strip(),
+          "revisions": [],
+      }
+  )
+  if previous is not None and feedback is not None:
+    rec.setdefault("revisions", []).append({
+        "feedback": feedback,
+        "previous_sql": previous.get("sql"),
+        "revised_at": _now_iso(),
+    })
+  rec.update({
+      "sql": sql,
+      "sql_hash": sha256_hex(sql),
+      "engine": engine,
+      "bytes_processed": int(bytes_processed or 0),
+      "validated_at": _now_iso(),
+  })
+  with open(path, "w") as f:
+    json.dump(rec, f, indent=1)
+  return path
+
+
+def _frozen_sql_spec() -> WorkflowSpec:
+  """The static replay plan for a frozen SQL: re-validate (REAL dry-run,
+  which doubles as warehouse-drift detection) -> execute -> chart ->
+  summarize. No drafting LLM anywhere — numerically deterministic given an
+  unchanged dataset."""
+  return WorkflowSpec(
+      goal="execute a frozen, human-auditable SQL",
+      steps=[
+          StepRef(
+              kind="step",
+              id="check",
+              capability="dry_run",
+              input=Binding(source="task"),
+          ),
+          StepRef(
+              kind="step",
+              id="rows",
+              capability="run_query",
+              input=Binding(source="step", step="check"),
+          ),
+          StepRef(
+              kind="step",
+              id="chart",
+              capability="render_chart",
+              input=Binding(source="step", step="rows"),
+          ),
+          StepRef(
+              kind="step",
+              id="sum",
+              capability="summarize_insight",
+              input=Binding(source="step", step="rows"),
+          ),
+      ],
+      output=Binding(source="step", step="sum"),
+  )
+
+
 def _load_stored_plan(key: str, registry, task):
   """Returns (spec, None) on a valid import, (None, reason) on a rejected
   or unreadable envelope, (None, None) when nothing is stored."""
@@ -1466,24 +1593,112 @@ async def plan_and_run(ctx: Context, node_input):
       f" ({', '.join(TABLES)}){task_note}."
   )
 
+  used_frozen_sql = False
+  if key == "revise":
+    # HUMAN FEEDBACK on the frozen SQL of the session's last question:
+    # revise (LLM, feedback-aware) -> re-validate (REAL dry-run) ->
+    # re-freeze with the feedback recorded in the revision history ->
+    # execute the revised query.
+    last_q = ctx.state.get("authored_workflow:ca:last_question")
+    rec = _load_frozen_sql(last_q) if last_q else None
+    if rec is None:
+      yield _msg(
+          "🛠️ Nothing to revise yet — ask a data question first; its"
+          " validated SQL gets frozen, and then your feedback can amend it."
+      )
+      yield Event(output={"scenario": "revise", "revised": False})
+      return
+    yield _msg(
+        f'🛠️ **Revising the frozen SQL** for: "{last_q}" (revision'
+        f" #{len(rec.get('revisions', [])) + 1})\nYour feedback:"
+        f" _{text.strip()}_\nCurrent SQL:\n```sql\n{rec['sql']}\n```"
+    )
+    raw = await ctx.run_node(
+        reg["draft_or_repair_sql"].build(),
+        node_input=json.dumps(
+            {"question": last_q, "sql": rec["sql"], "feedback": text.strip()}
+        ),
+        run_id="revise_sql",
+    )
+    new_sql = _sql_of(raw)
+    check = _bq_dry_run({"question": last_q, "sql": new_sql})
+    if not check.get("valid"):
+      yield _msg(
+          "🛑 The revised SQL failed the REAL dry-run —"
+          f" `{str(check.get('error'))[:200]}`. The frozen SQL is"
+          " UNCHANGED (a revision must validate before it replaces the"
+          " frozen artifact)."
+      )
+      yield Event(output={"scenario": "revise", "revised": False})
+      return
+    _freeze_sql(
+        last_q,
+        check["sql"],
+        engine=str(check.get("engine", "bigquery")),
+        bytes_processed=check.get("bytes_processed", 0),
+        feedback=text.strip(),
+        previous=rec,
+    )
+    yield _msg(
+        "🧊 **Re-frozen** — the feedback is now part of the artifact's"
+        " revision history (auditable: who changed the query and why)."
+        f"\nRevised SQL:\n```sql\n{check['sql']}\n```\nRunning it:"
+    )
+    spec = _frozen_sql_spec()
+    spec_hash = _hash(spec)
+    task = {"question": last_q, "sql": check["sql"]}
+    used_frozen_sql = True
+    reused = True
+
+  if not used_frozen_sql and key == "sequence":
+    rec = _load_frozen_sql(task.get("question", ""))
+    if rec is not None:
+      pre = _bq_dry_run({"question": task["question"], "sql": rec["sql"]})
+      if pre.get("valid"):
+        spec = _frozen_sql_spec()
+        spec_hash = _hash(spec)
+        task = {"question": task["question"], "sql": rec["sql"]}
+        used_frozen_sql = True
+        reused = True
+        yield _msg(
+            "🧊 **Frozen SQL replay** — this exact question was answered"
+            f" before; its validated SQL (hash `{rec['sql_hash'][:12]}`,"
+            f" validated {rec['validated_at'][:19]},"
+            f" {len(rec.get('revisions', []))} human revision(s)) is reused"
+            " — the drafting LLM is SKIPPED, so the numbers are"
+            " deterministic given an unchanged dataset. The real dry-run"
+            " just re-validated it (warehouse-drift check)."
+        )
+      else:
+        yield _msg(
+            "🧊 The frozen SQL for this question no longer validates"
+            f" (warehouse drift): `{str(pre.get('error'))[:160]}` —"
+            " re-authoring fresh."
+        )
+
+  if used_frozen_sql:
+    pass  # spec/task pinned above; skip plan-store/session reuse
+  else:
+    spec, source = None, None
   # 1. LOAD-OR-AUTHOR. Reuse order: this session's state -> the
   # CROSS-SESSION plan store (defensive import) -> author fresh.
-  spec, source = None, None
-  existing = ctx.state.get(state_key)
+  existing = None if used_frozen_sql else ctx.state.get(state_key)
   if existing:
     spec = WorkflowSpec.model_validate(existing)
     source = "session state"
-  else:
+  elif not used_frozen_sql:
     spec, reject = _load_stored_plan(key, reg, task)
     if spec is not None:
       source = "plan store (CROSS-SESSION import)"
       ctx.state[state_key] = spec.model_dump()  # cache for this session
-    elif reject:
+    elif reject:  # noqa: F821
       yield _msg(
           f"🛑 **Plan-store import rejected** for `{key}` — {reject}\n"
           "Drift never silently replays a stale plan; re-authoring fresh."
       )
-  if spec is not None:
+  if used_frozen_sql:
+    pass  # beats already emitted; spec/task/reused pinned
+  elif spec is not None:
     spec_hash = _hash(spec)
     reused = True
     fresh_input = task != sc["task"]
@@ -1614,6 +1829,33 @@ async def plan_and_run(ctx: Context, node_input):
   if isinstance(result, dict) and isinstance(result.get("insight"), str):
     # remembered so a later 'audit that insight' audits THIS, not canned data
     ctx.state["authored_workflow:ca:last_insight"] = result["insight"]
+  if key in ("sequence", "revise") and task.get("question"):
+    ctx.state["authored_workflow:ca:last_question"] = task["question"]
+  if key == "sequence" and not used_frozen_sql:
+    # SQL FREEZING: the drafting LLM was the last nondeterministic step in
+    # a frozen plan — freeze its dry-run-validated output so replays of
+    # this exact question are numerically deterministic (and feedback can
+    # amend it auditably).
+    checked = next(
+        (
+            v
+            for v in interp.state.values()
+            if isinstance(v, dict) and v.get("valid") is True and v.get("sql")
+        ),
+        None,
+    )
+    if checked:
+      _freeze_sql(
+          task["question"],
+          checked["sql"],
+          engine=str(checked.get("engine", "bigquery")),
+          bytes_processed=checked.get("bytes_processed", 0),
+      )
+      yield _msg(
+          "🧊 **SQL frozen** for this question — re-ask it (any session)"
+          " and the validated SQL replays with the drafting LLM skipped;"
+          " say `revise: <feedback>` to amend it with an audit trail."
+      )
   yield Event(
       output={
           "scenario": key,

@@ -1114,6 +1114,79 @@ def test_skeptic_verdicts_render_with_reasons():
   assert task == {"insights": ["sales doubled YoY"]}
 
 
+def test_sql_freezing_roundtrip_and_revision_history(tmp_path, monkeypatch):
+  # SQL freezing: the validated SQL for a question is a durable artifact;
+  # replays skip the drafting LLM (numeric determinism). Human feedback
+  # revisions append to an auditable history.
+  monkeypatch.setattr(demo, "_SQL_STORE", str(tmp_path))
+  q = "  What was REVENUE by region last quarter?  "
+  demo._freeze_sql(q, "SELECT 1", engine="bigquery", bytes_processed=42)
+  # normalized question text hits the same record
+  rec = demo._load_frozen_sql("what was revenue   by region last quarter?")
+  assert rec is not None and rec["sql"] == "SELECT 1"
+  assert rec["revisions"] == [] and rec["bytes_processed"] == 42
+  # a feedback revision replaces the SQL and RECORDS the feedback + old sql
+  demo._freeze_sql(
+      q,
+      "SELECT 2",
+      feedback="use calendar quarters, not trailing 90 days",
+      previous=rec,
+  )
+  rec2 = demo._load_frozen_sql(q)
+  assert rec2["sql"] == "SELECT 2"
+  assert len(rec2["revisions"]) == 1
+  assert rec2["revisions"][0]["previous_sql"] == "SELECT 1"
+  assert "calendar quarters" in rec2["revisions"][0]["feedback"]
+  # unknown question -> None
+  assert demo._load_frozen_sql("never asked") is None
+
+
+def test_frozen_sql_replay_plan_is_static_and_clean():
+  # The replay plan is STATIC (constant hash — no authoring) and contains
+  # no drafting step: dry_run -> run_query -> chart -> summarize.
+  spec = demo._frozen_sql_spec()
+  caps = [s.capability for s in spec.steps]
+  assert caps == ["dry_run", "run_query", "render_chart", "summarize_insight"]
+  assert "draft_or_repair_sql" not in caps and "nl2sql" not in caps
+  warnings = WorkflowSpecValidator(demo._registry()).validate(spec)
+  assert [w for w in warnings if w.startswith("plan-quality")] == []
+  h1 = demo.sha256_hex(spec.model_dump(mode="json"))
+  h2 = demo.sha256_hex(demo._frozen_sql_spec().model_dump(mode="json"))
+  assert h1 == h2  # deterministic replay plan
+
+
+@pytest.mark.asyncio
+async def test_frozen_sql_replay_skips_the_drafting_llm(monkeypatch):
+  monkeypatch.setitem(demo._BQ, "disabled", True)
+  out_holder = {}
+
+  @node(rerun_on_resume=True)
+  async def parent(ctx, node_input):
+    interp = SpecInterpreter(_stub_registry(), ctx)
+    out_holder["out"] = await interp.execute(
+        demo._frozen_sql_spec(),
+        {
+            "question": "revenue by region?",
+            "sql": "SELECT region, SUM(x) AS revenue ... GROUP BY region",
+        },
+    )
+    out_holder["n"] = interp.dispatch_count
+    yield Event(output={"_done": True})
+
+  wf = Workflow(name="t", edges=[("START", parent)])
+  ss = InMemorySessionService()
+  r = Runner(app_name="t", node=wf, session_service=ss)
+  s = await ss.create_session(app_name="t", user_id="u")
+  async for _ in r.run_async(
+      user_id="u",
+      session_id=s.id,
+      new_message=types.Content(parts=[types.Part(text="go")], role="user"),
+  ):
+    pass
+  assert out_holder["n"] == 4  # check, run, chart, summarize — NO draft
+  assert out_holder["out"] == {"insight": "US-West leads revenue."}
+
+
 def test_conversational_gate_routing():
   # Triggered messages bypass the gate (mode selectors stay deterministic);
   # untriggered messages go through the intent gate first — including the
@@ -1195,6 +1268,8 @@ def test_scenario_routing():
   assert demo._scenario_for("audit these insights") == "adversarial"
   assert demo._scenario_for("pick the best chart") == "tournament"
   assert demo._scenario_for("hello") == "sequence"  # default
+  assert demo._scenario_for("revise: use calendar quarters") == "revise"
+  assert demo._scenario_for("update the sql to exclude returns") == "revise"
   # overlapping triggers: specialized intent must beat the generic fallback
   # ("revenue by region" is a sequence trigger, but these aren't questions).
   assert (
@@ -1214,6 +1289,8 @@ def test_scenario_routing():
 def test_all_seven_shapes_validate_and_lint_clean():
   reg = demo._registry()
   for key in demo.SCENARIOS:
+    if key == "revise":  # custom feedback flow, not an authored shape
+      continue
     warnings = WorkflowSpecValidator(reg).validate(_expected_spec(key))
     lints = [w for w in warnings if w.startswith("plan-quality")]
     assert lints == [], f"{key}: {lints}"
