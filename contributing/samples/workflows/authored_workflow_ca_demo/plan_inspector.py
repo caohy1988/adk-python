@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen Plan Inspector — renders the plan store as a self-contained HTML page.
+"""RFC #93 evidence page — frozen workflows with frozen middle results.
 
-Reads every ``FrozenWorkflowRecord`` envelope in ``ca_plan_store/`` and writes
-``ca_plan_store/plan_inspector.html``: the plan's dataflow as a diagram, and
-every envelope field annotated with the guarantee it delivers (auditability,
-tamper evidence, version/contract drift detection, cross-session template
-reuse). Run from the repo root after a demo session has frozen some plans:
+Renders the plan store as a self-contained HTML pitch for the RFC: the
+model-authored typed plan is the centerpiece; validated INTERMEDIATE step
+results (here: the dry-run-checked SQL the drafting loop produced) freeze
+onto the step that produced them, so replays skip that step's LLM entirely;
+human feedback amends the frozen artifact through validation, with every
+revision recorded. SQL is the demonstrated instance — the mechanism is the
+RFC's general step-result freezing tier.
 
-    python contributing/samples/workflows/authored_workflow_ca_demo/plan_inspector.py
+    python plan_inspector.py [session-id] [app] [user]
     open ca_plan_store/plan_inspector.html
+
+With a session id, the page opens with that live session's actual flow,
+each turn classified by the RFC mechanism that answered it.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import sys
 
 STORE = os.path.join(os.getcwd(), "ca_plan_store")
@@ -36,19 +42,22 @@ STORE = os.path.join(os.getcwd(), "ca_plan_store")
 CSS = """
 :root { --ink:#1a1c1e; --mut:#5f6368; --line:#dadce0; --blue:#1a73e8;
         --green:#188038; --amber:#b06000; --purple:#7627bb; --red:#c5221f;
-        --bg:#f8f9fa; --card:#ffffff; }
+        --ice:#0277bd; --bg:#f8f9fa; --card:#ffffff; }
 * { box-sizing: border-box; }
 body { font: 14px/1.55 -apple-system, 'Segoe UI', Roboto, sans-serif;
        color: var(--ink); background: var(--bg); margin: 0; padding: 32px; }
 h1 { font-size: 24px; margin: 0 0 4px; }
 h2 { font-size: 18px; margin: 36px 0 10px; }
-.sub { color: var(--mut); margin-bottom: 24px; }
-.benefits { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0 8px; }
-.benefit { flex: 1 1 220px; background: var(--card); border: 1px solid var(--line);
-           border-radius: 10px; padding: 14px 16px; }
-.benefit b { display: block; margin-bottom: 4px; }
-.b-audit b { color: var(--blue); } .b-ver b { color: var(--purple); }
-.b-cons b { color: var(--green); } .b-safe b { color: var(--amber); }
+h3 { font-size: 14px; margin: 18px 0 6px; }
+.sub { color: var(--mut); margin-bottom: 18px; }
+.pitch { border-left: 4px solid var(--blue); background: #e8f0fe66;
+         padding: 12px 16px; border-radius: 0 10px 10px 0; margin: 14px 0; }
+.claims { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0 8px; }
+.claim { flex: 1 1 210px; background: var(--card); border: 1px solid var(--line);
+         border-radius: 10px; padding: 13px 15px; }
+.claim b { display: block; margin-bottom: 4px; }
+.c1 b { color: var(--blue); } .c2 b { color: var(--purple); }
+.c3 b { color: var(--ice); } .c4 b { color: var(--green); } .c5 b { color: var(--amber); }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
         padding: 20px 22px; margin: 14px 0; }
 .tag { display: inline-block; font-size: 11px; font-weight: 600; border-radius: 99px;
@@ -57,6 +66,7 @@ h2 { font-size: 18px; margin: 36px 0 10px; }
 .t-ver   { background:#f3e8fd; color: var(--purple); }
 .t-cons  { background:#e6f4ea; color: var(--green); }
 .t-safe  { background:#fef7e0; color: var(--amber); }
+.t-ice   { background:#e1f5fe; color: var(--ice); }
 .kv { margin: 6px 0; padding: 8px 10px; border-left: 3px solid var(--line);
       background: var(--bg); border-radius: 0 6px 6px 0; }
 .kv code { font: 12px/1.5 ui-monospace, Menlo, monospace; word-break: break-all; }
@@ -65,18 +75,20 @@ h2 { font-size: 18px; margin: 36px 0 10px; }
 .node { border: 1.5px solid var(--blue); border-radius: 8px; padding: 7px 12px;
         background: #e8f0fe; font: 12px ui-monospace, Menlo, monospace; }
 .node small { display: block; color: var(--mut); font-size: 10.5px; }
-.loopbox { border: 1.5px dashed var(--purple); border-radius: 10px; padding: 10px;
-           display: flex; gap: 10px; align-items: center; }
+.loopbox { border: 1.5px dashed var(--purple); border-radius: 10px;
+           padding: 14px 10px 10px; display: flex; gap: 10px;
+           align-items: center; position: relative; }
 .loopbox .lbl { color: var(--purple); font-size: 11px; font-weight: 700; }
+.loopbox.iced { border-color: var(--ice); background: #e1f5fe33; }
+.loopbox.iced::after { content: "❄️ result frozen — SKIPPED on replay";
+        position: absolute; top: -11px; right: 10px; font-size: 10px;
+        background: var(--ice); color: #fff; border-radius: 99px;
+        padding: 1px 8px; }
 .fanbox { border: 1.5px dashed var(--green); border-radius: 10px; padding: 10px; }
 .fanbox .lbl { color: var(--green); font-size: 11px; font-weight: 700; }
 .arrow { color: var(--mut); font-size: 18px; }
 pre { background: #202124; color: #e8eaed; border-radius: 10px; padding: 14px;
-      overflow: auto; font: 11.5px/1.5 ui-monospace, Menlo, monospace; max-height: 340px; }
-.story { border-left: 4px solid var(--green); background: #e6f4ea55; padding: 10px 14px;
-         border-radius: 0 8px 8px 0; margin: 10px 0; }
-.bad { border-left-color: var(--red); background: #fce8e655; }
-.bad b { color: var(--red); }
+      overflow: auto; font: 11.5px/1.5 ui-monospace, Menlo, monospace; max-height: 300px; }
 details summary { cursor: pointer; color: var(--blue); font-weight: 600; margin: 8px 0; }
 .turn { display: flex; gap: 14px; margin: 10px 0; }
 .turn .num { flex: 0 0 30px; height: 30px; border-radius: 50%; background: var(--blue);
@@ -88,10 +100,17 @@ details summary { cursor: pointer; color: var(--blue); font-weight: 600; margin:
 .turn .mech { font-size: 12px; margin: 4px 0; }
 .turn .insight { color: var(--mut); font-size: 12.5px; border-left: 3px solid var(--line);
                  padding-left: 8px; margin-top: 6px; }
+.midresult { border: 1.5px solid var(--ice); border-radius: 10px;
+             background: #e1f5fe44; padding: 12px 14px; margin: 10px 0; }
+.midresult .q { font-weight: 600; }
+.rev { border-left: 3px solid var(--blue); background: var(--bg); padding: 8px 10px;
+       border-radius: 0 6px 6px 0; margin: 6px 0; font-size: 12.5px; }
 """
 
+_SQL_PRODUCER_HINTS = ("draft", "sqlgen", "sql", "loop")
 
-def _node(step) -> str:
+
+def _node(step, frozen_step_ids=()) -> str:
   kind = step.get("kind")
   if kind == "step":
     binding = step.get("input", {})
@@ -128,10 +147,11 @@ def _node(step) -> str:
     )
   if kind == "loop_until":
     body = " <span class='arrow'>→</span> ".join(
-        _node(s) for s in step.get("body", [])
+        _node(s, frozen_step_ids) for s in step.get("body", [])
     )
+    iced = " iced" if step.get("id") in frozen_step_ids else ""
     return (
-        f'<div class="loopbox"><span class="lbl">LOOP until'
+        f'<div class="loopbox{iced}"><span class="lbl">LOOP until'
         f" {html.escape(step.get('until_capability', '?'))} (max"
         f" {step.get('max_iters')})</span>{body}</div>"
     )
@@ -140,9 +160,9 @@ def _node(step) -> str:
   return f'<div class="node">{html.escape(str(kind))}</div>'
 
 
-def _flow(spec) -> str:
+def _flow(spec, frozen_step_ids=()) -> str:
   steps = " <span class='arrow'>→</span> ".join(
-      _node(s) for s in spec.get("steps", [])
+      _node(s, frozen_step_ids) for s in spec.get("steps", [])
   )
   return f'<div class="flow">{steps}</div>'
 
@@ -156,53 +176,97 @@ def _kv(label, value, why, tag, tag_label) -> str:
   )
 
 
-def _plan_card(name: str, env: dict) -> str:
+def _sql_producing_step_ids(spec) -> list:
+  """The plan steps whose validated results the store freezes (the drafting
+  loop in the ask-a-question plan)."""
+  ids = []
+  for s in spec.get("steps", []):
+    sid = str(s.get("id", "")).lower()
+    if s.get("kind") == "loop_until" and any(
+        h in sid for h in _SQL_PRODUCER_HINTS
+    ):
+      ids.append(s.get("id"))
+  return ids
+
+
+def _mid_result(rec: dict) -> str:
+  """A frozen middle result, attached to the plan that produced it."""
+  revs = rec.get("revisions", [])
+  rev_html = "".join(
+      f'<div class="rev"><b>revision #{i + 1} — human feedback:</b>'
+      f" {html.escape(r.get('feedback', ''))}"
+      f"<details><summary>previous artifact (preserved)</summary>"
+      f"<pre>{html.escape(r.get('previous_sql') or '')}</pre></details></div>"
+      for i, r in enumerate(revs)
+  )
+  return (
+      '<div class="midresult"><div class="q">❄️ Frozen middle result —'
+      f" question: “{html.escape(rec.get('question', ''))}”</div>"
+      f"<div style='font-size:12px;color:var(--mut)'>artifact hash"
+      f" <code>{rec.get('sql_hash', '')[:16]}</code> · validated"
+      f" {str(rec.get('validated_at', ''))[:19]} ·"
+      f" engine {html.escape(str(rec.get('engine', '')))} ·"
+      f" {len(revs)} human revision(s)</div>"
+      f"<details><summary>the validated artifact (SQL, in this instance)"
+      f"</summary><pre>{html.escape(rec.get('sql', ''))}</pre></details>"
+      + (rev_html or "")
+      + "</div>"
+  )
+
+
+def _plan_card(name: str, env: dict, mid_results=()) -> str:
   spec = env.get("spec", {})
-  caps = ", ".join(sorted(env.get("capability_versions", {})))
-  ch = env.get("capability_contract_hashes", {})
-  ch_short = {k: v[:12] for k, v in ch.items()}
+  frozen_ids = _sql_producing_step_ids(spec) if mid_results else []
   parts = [
-      f'<div class="card"><h2 style="margin-top:0">{html.escape(name)} — '
-      f"“{html.escape(spec.get('goal', ''))}”</h2>",
+      f'<div class="card"><h2 style="margin-top:0">Frozen workflow:'
+      f" {html.escape(name)} — “{html.escape(spec.get('goal', ''))}”</h2>",
       (
-          "<b>The plan, as data</b> — every box is a pre-approved capability;"
-          " every arrow is a typed binding the validator checked:"
+          "<b>Authored by the model ONCE, as typed data</b> — every box a"
+          " pre-approved capability, every arrow a typed binding the"
+          " validator checked. The plan replays across sessions with zero"
+          " planner calls:"
       ),
-      _flow(spec),
+      _flow(spec, frozen_ids),
+  ]
+  if mid_results:
+    parts.append(
+        "<h3>❄️ Frozen middle results of this workflow</h3>"
+        "<div class='sub' style='margin-bottom:6px'>The RFC's step-result"
+        " freezing tier: the ❄️ step's validated output is frozen WITH the"
+        " plan. On replay the step's LLM is skipped — the run is"
+        " numerically deterministic — and the artifact re-validates on"
+        " load (drift detection). Human feedback amends it THROUGH"
+        " validation, every revision recorded:</div>"
+    )
+    parts.extend(_mid_result(r) for r in mid_results)
+  parts += [
       _kv(
           "spec_hash",
           env.get("spec_hash", ""),
-          "Tamper evidence: every import recomputes sha256 over the spec and"
-          " rejects on mismatch. Change one character of the plan and it"
-          " will not load.",
+          "Tamper evidence: every import recomputes sha256 over the spec"
+          " and rejects on mismatch.",
           "t-audit",
           "AUDITABLE",
       ),
       _kv(
           "planner_model · created_at",
           f"{env.get('planner_model')} · {env.get('created_at')}",
-          "Provenance: which model authored this plan and when — the audit"
-          " trail starts at authoring, not at execution.",
+          "Authoring provenance: which model wrote this orchestration and"
+          " when.",
           "t-audit",
           "AUDITABLE",
       ),
       _kv(
-          "registry_version · capability_versions",
+          "registry + capability versions · contract hashes",
           f"registry v{env.get('registry_version')} · "
-          + json.dumps(env.get("capability_versions", {})),
-          "Versioning: the exact capability versions this plan was approved"
-          " against. The skeptic at v2 means a v1-era audit plan is REJECTED"
-          " on import and re-authored — semantics changed, so the plan must"
-          " too.",
-          "t-ver",
-          "VERSIONED",
-      ),
-      _kv(
-          "capability_contract_hashes",
-          json.dumps(ch_short),
-          "Drift detection without developer discipline: derived sha256 over"
-          " each capability's declared contract. A schema change nobody"
-          " version-bumped still refuses to load.",
+          + json.dumps(env.get("capability_versions", {}))
+          + " · "
+          + json.dumps({
+              k: v[:10]
+              for k, v in (env.get("capability_contract_hashes") or {}).items()
+          }),
+          "Drift detection: a capability whose contract changed since"
+          " freezing makes the plan refuse to load — loudly.",
           "t-ver",
           "VERSIONED",
       ),
@@ -210,68 +274,18 @@ def _plan_card(name: str, env: dict) -> str:
           "task_input_schema · task_input_digest",
           f"{json.dumps(env.get('task_input_schema'))} · "
           + str(env.get("task_input_digest", ""))[:16],
-          "Consistency across sessions: a NEW session imports this plan and"
-          " runs a NEW question through it (validated against the captured"
-          " schema) — same steps, same checks, same shape of answer. Zero"
-          " planner calls.",
+          "Template reuse: a new session validates ITS question against"
+          " the captured schema and runs the same governed pipeline.",
           "t-cons",
           "CONSISTENT",
       ),
-      _kv(
-          "validation",
-          json.dumps(env.get("validation", {})),
-          "Recorded but NEVER trusted: import re-validates against the"
-          " current registry. Lint waivers, if any, are recorded here too —"
-          " suppression is auditable.",
-          "t-safe",
-          "SAFE",
-      ),
       (
-          f"<details><summary>Full envelope JSON ({caps})</summary>"
+          "<details><summary>full frozen record (envelope JSON)</summary>"
           f"<pre>{html.escape(json.dumps(env, indent=2))}</pre></details>"
       ),
       "</div>",
   ]
   return "\n".join(parts)
-
-
-def _sql_card(rec: dict) -> str:
-  revs = rec.get("revisions", [])
-  rev_rows = "".join(
-      f'<div class="kv"><b>revision #{i + 1}</b>'
-      f'<span class="tag t-audit">HUMAN FEEDBACK</span><br>'
-      f"<code>{html.escape(r.get('feedback', ''))}</code>"
-      '<div class="why">revised'
-      f' {html.escape(str(r.get("revised_at", ""))[:19])}'
-      f" — previous SQL preserved in the artifact:</div>"
-      "<pre"
-      f" style='max-height:120px'>{html.escape(r.get('previous_sql') or '')}</pre></div>"
-      for i, r in enumerate(revs)
-  )
-  return (
-      '<div class="card"><h2 style="margin-top:0">🧊 Frozen SQL — '
-      f"“{html.escape(rec.get('question', ''))}”</h2>"
-      "<b>The numbers, pinned</b> — replays of this exact question skip the"
-      " drafting LLM and run THIS statement (re-validated by a real dry-run"
-      " first, which doubles as warehouse-drift detection):"
-      f"<pre>{html.escape(rec.get('sql', ''))}</pre>"
-      + _kv(
-          "sql_hash · validated_at · engine",
-          f"{rec.get('sql_hash', '')[:16]} ·"
-          f" {str(rec.get('validated_at', ''))[:19]} ·"
-          f" {rec.get('engine', '')}",
-          "Numeric determinism: identical SQL means identical results on an"
-          " unchanged dataset — live-verified to the cent across runs and"
-          " sessions.",
-          "t-cons",
-          "CONSISTENT",
-      )
-      + (
-          rev_rows
-          or '<div class="kv"><b>revisions</b><br><code>none yet</code><div class="why">say “revise: &lt;feedback&gt;” in the demo — the change must pass the real dry-run before it lands, and the feedback is recorded here forever.</div></div>'
-      )
-      + "</div>"
-  )
 
 
 def _fetch_session(app: str, user: str, session_id: str, port: int = 8001):
@@ -286,10 +300,6 @@ def _fetch_session(app: str, user: str, session_id: str, port: int = 8001):
 
 
 def _session_timeline(session: dict) -> str:
-  """Render the session's ACTUAL flow: one card per user turn, classified by
-  the mechanism that answered it, linked to the artifact it touched."""
-  import re
-
   turns, cur = [], None
   for e in session.get("events", []):
     content = e.get("content") or {}
@@ -308,24 +318,30 @@ def _session_timeline(session: dict) -> str:
     beats = " ".join(t["beats"])
     if "Frozen SQL replay" in beats:
       mech = (
-          '<span class="tag t-cons">🧊 FROZEN-SQL REPLAY</span> drafting LLM'
-          " skipped — deterministic numbers"
+          '<span class="tag t-ice">❄️ STEP-RESULT REPLAY</span> the'
+          " workflow ran with its drafting step SKIPPED — the frozen"
+          " middle result reused; numbers deterministic"
       )
     elif "Revising the frozen SQL" in beats:
       mech = (
-          '<span class="tag t-audit">🛠 HUMAN REVISION</span> feedback'
-          " validated by a REAL dry-run, recorded in the artifact, then"
-          " executed"
+          '<span class="tag t-audit">🛠 HUMAN-GOVERNED REVISION</span>'
+          " feedback applied to the frozen middle result THROUGH a real"
+          " dry-run, recorded in the artifact, then executed"
       )
     elif "Authored plan" in beats:
-      mech = '<span class="tag t-ver">📝 AUTHORED FRESH</span> 1 planner call'
+      mech = (
+          '<span class="tag t-ver">📝 MODEL AUTHORED THE WORKFLOW</span>'
+          " once — typed plan, validated, frozen (1 planner call)"
+      )
     elif "Reusing frozen plan" in beats:
       mech = (
-          '<span class="tag t-cons">♻️ FROZEN-PLAN REUSE</span> 0 planner calls'
+          '<span class="tag t-cons">♻️ FROZEN-WORKFLOW REPLAY</span> 0'
+          " planner calls — new data through the same governed pipeline"
       )
     elif "Conversational turn" in beats:
       mech = (
-          '<span class="tag t-safe">💬 CONVERSATION</span> no workflow issued'
+          '<span class="tag t-safe">💬 CONVERSATION</span> intent gate —'
+          " no workflow issued"
       )
     else:
       mech = '<span class="tag t-safe">WORKFLOW</span>'
@@ -333,7 +349,7 @@ def _session_timeline(session: dict) -> str:
     rev_m = re.search(r"(\d+) human revision", beats)
     extra = ""
     if hash_m:
-      extra += f" · sql `{hash_m.group(1)}`"
+      extra += f" · artifact `{hash_m.group(1)}`"
     if rev_m:
       extra += f" · {rev_m.group(1)} revision(s) applied"
     ins_m = re.search(r'"insight": "([^"]+)', beats)
@@ -351,10 +367,11 @@ def _session_timeline(session: dict) -> str:
   if not cards:
     return ""
   return (
-      '<div class="card"><h2 style="margin-top:0">▶️ This session, as it'
-      " actually ran</h2><div class='sub'>Read straight from the live ADK"
-      " session — each turn classified by the mechanism that answered it."
-      " The artifacts those turns created and reused are below.</div>"
+      '<div class="card"><h2 style="margin-top:0">▶️ The mechanism, live —'
+      " this session as it actually ran</h2><div class='sub'>Read straight"
+      " from the running ADK session. Watch the arc: the workflow answers"
+      " → a human amends its frozen middle result → the SAME workflow"
+      " replays carrying the revision.</div>"
       + "".join(cards)
       + "</div>"
   )
@@ -370,12 +387,12 @@ def main() -> str:
     print("plan store is empty — run a demo session first", file=sys.stderr)
     raise SystemExit(1)
   sql_dir = os.path.join(STORE, "sql")
-  sql_cards = ""
+  mid_results = []
   if os.path.isdir(sql_dir):
     for fn in sorted(os.listdir(sql_dir)):
       if fn.endswith(".json"):
         with open(os.path.join(sql_dir, fn)) as f:
-          sql_cards += _sql_card(json.load(f))
+          mid_results.append(json.load(f))
 
   timeline = ""
   if len(sys.argv) > 1:
@@ -386,47 +403,52 @@ def main() -> str:
     if session:
       timeline = _session_timeline(session)
 
-  cards = (
-      timeline
-      + sql_cards
-      + "\n".join(_plan_card(k, v) for k, v in envs.items())
-  )
-  page = f"""<!doctype html><html><head><meta charset="utf-8">
-<title>Frozen Plan Inspector — RFC #93</title><style>{CSS}</style></head><body>
-<h1>Frozen Plan Inspector</h1>
-<div class="sub">The live contents of <code>ca_plan_store/</code> — each file is a
-<b>FrozenWorkflowRecord</b>: a model-authored workflow, frozen as a durable, portable artifact.
-This page explains what each field buys you.</div>
+  # middle results attach to the workflow that produced them (sequence).
+  cards = timeline
+  for name, env in envs.items():
+    attach = mid_results if name == "sequence" else ()
+    cards += _plan_card(name, env, attach)
 
-<div class="benefits">
-<div class="benefit b-audit"><b>🔍 Auditable</b>The plan is data you can read, diff in a PR,
-and hand to a reviewer — who authored it, when, with which model, and exactly what runs in
-what order with what inputs. Turn-by-turn agent chatter leaves no such artifact.</div>
-<div class="benefit b-ver"><b>🏷️ Versioned</b>Registry + per-capability versions and derived
-contract hashes are sealed in. Capability changed since freezing? The plan refuses to load —
-loudly — instead of silently running stale semantics.</div>
-<div class="benefit b-cons"><b>♻️ Consistent</b>Authoring is the only nondeterministic step,
-and it happens once. Every session that imports this plan executes the same steps with the
-same safety checks — only the data changes. Answers stop depending on the model's mood.</div>
-<div class="benefit b-safe"><b>🛡️ Safe</b>Closed capability vocabulary, typed bindings,
-plan-quality lints, fail-closed defensive import. No model-written code is ever stored or
-executed.</div>
-<div class="benefit b-cons"><b>🧊 Numerically deterministic</b>SQL freezing extends the
-freeze one level deeper: a question's dry-run-validated SQL becomes part of the artifact,
-so replays skip the drafting LLM entirely — same numbers, to the cent, across runs and
-sessions. Human feedback amends it through validation, with every revision recorded.</div>
+  page = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>RFC #93 — Frozen Workflows with Frozen Middle Results</title>
+<style>{CSS}</style></head><body>
+<h1>RFC #93: Reproducible Model-Authored Workflows</h1>
+<div class="sub">Demonstrated live on BigQuery Conversational Analytics over
+<code>bigquery-public-data.thelook_ecommerce</code> — every artifact on this page is real,
+read from the running demo's plan store.</div>
+
+<div class="pitch"><b>The thesis:</b> a model should author orchestration <b>once</b>, as
+typed data — then the workflow, and the validated <b>middle results its steps produce</b>,
+freeze into durable artifacts. Replays skip the nondeterministic steps entirely; humans
+amend the artifacts through validation, never by re-prompting; and everything is
+auditable, versioned, and drift-checked. A chat agent gives you answers. This gives you a
+<b>governed analytics asset</b>.</div>
+
+<div class="claims">
+<div class="claim c1"><b>📝 Authored once</b>The model emits a typed plan over a closed
+capability vocabulary — no code, no sandbox. Validated, lint-checked, frozen, exported.</div>
+<div class="claim c2"><b>🏷️ Versioned &amp; drift-checked</b>Registry, capability versions,
+and derived contract hashes seal in. Changed semantics → the plan refuses to load.</div>
+<div class="claim c3"><b>❄️ Middle results freeze too</b>The step that drafts SQL is the last
+nondeterministic step — so its dry-run-validated output freezes WITH the plan. Replays skip
+it: same numbers, to the cent, across sessions.</div>
+<div class="claim c4"><b>🛠 Human-governed</b>Feedback amends a frozen middle result through
+real validation; the feedback and the previous artifact are preserved in the record — a
+reviewed change, not a re-roll.</div>
+<div class="claim c5"><b>🔍 Auditable end to end</b>Who authored the plan, what it runs,
+which artifact answered, who revised it and why — all readable, diffable data.</div>
 </div>
 
-<div class="story"><b>The consistency story in one line:</b> Session A authored these plans
-(1 planner call each). Session B — tomorrow, another user, another machine — imports them,
-re-validates them, and runs new questions through them with <b>0 planner calls</b>: the
-same governed pipeline every time.</div>
-<div class="story bad"><b>The tamper story in one line:</b> edit one character of any
-<code>spec</code> below and the next import fails with <code>spec_hash mismatch</code>;
-change a capability's schema and it fails with <code>contract drift</code>. Drift never
-replays silently.</div>
-
 {cards}
+
+<div class="card"><h2 style="margin-top:0">Why this matters beyond SQL</h2>
+What froze here is a SQL statement — but the mechanism is general: <b>any step's validated
+output</b> can freeze the same way. A retrieved schema, a verified claim set, a chart
+specification, an extraction template — each one a middle result that today is re-rolled by
+an LLM on every run. The RFC's freezing tiers turn them into governed artifacts:
+<b>v1</b> the frozen plan (process determinism) · <b>v1.1</b> the exported envelope
+(portability + audit) · <b>v1.2</b> frozen step results (numeric determinism + human
+governance) · <b>v2</b> templates (approved reuse against new inputs).</div>
 </body></html>"""
 
   out = os.path.join(STORE, "plan_inspector.html")
