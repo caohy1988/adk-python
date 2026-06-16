@@ -3241,6 +3241,55 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
   # --- UPDATED CALLBACKS FOR V1 PARITY ---
 
+  def _resolve_same_session_pause_orphan(
+      self,
+      invocation_context: "InvocationContext",
+      function_call_id: Optional[str],
+  ) -> Optional[bool]:
+    """Same-session resolution of ``pause_orphan`` for a long-running resume.
+
+    Scans the in-memory session history for the originating paused
+    function call. This is a hot-path-safe, zero-I/O check: it never
+    issues a session-service or BigQuery read, so it adds no latency to
+    the resume path.
+
+    Returns:
+      * ``False`` — an event in this session's in-memory history carries
+        ``function_call_id`` in its ``long_running_tool_ids``, so the
+        producer emitted a pairable ``TOOL_PAUSED`` for it and this
+        completion is definitely not an orphan. Membership alone is
+        sufficient: the producer emits a ``TOOL_PAUSED`` for *every* id
+        in ``long_running_tool_ids`` — both the per-part path and the
+        fallback path that fires when the originating ``function_call``
+        part was rewritten away (e.g. by an ``after_model_callback``).
+        Requiring a surviving ``function_call`` part here would miss
+        that fallback case and diverge from what the producer wrote.
+      * ``None`` — unknown / not yet settled: there is no id to pair on,
+        no session history is available, or the id was not found in the
+        (possibly trimmed) in-memory history. Callers omit the
+        ``pause_orphan`` attribute in this case so consumers read it as
+        SQL NULL ("not yet determined").
+
+    Never returns ``True``. Declaring a true orphan requires the settled
+    fallback (an off-hot-path session-service / BigQuery reconciliation),
+    which is intentionally out of scope here so the resume path stays
+    free of added reads. A persistent ``None`` is what that future
+    fallback upgrades to ``True``.
+    """
+    if not function_call_id:
+      return None
+    session = getattr(invocation_context, "session", None)
+    events = getattr(session, "events", None) if session is not None else None
+    if not events:
+      return None
+    for event in events:
+      ids = getattr(event, "long_running_tool_ids", None)
+      if ids and function_call_id in ids:
+        # The producer emitted a pairable TOOL_PAUSED for this id (per
+        # part or via the rewritten-away fallback), so it is not orphan.
+        return False
+    return None
+
   @_safe_callback
   async def on_user_message_callback(
       self,
@@ -3300,8 +3349,6 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           # tool calls complete inside the agent run via
           # after_tool_callback, so a function_response inside a user
           # message is the resume side of a previously-paused tool.
-          # Stamp the pair keys; pause_orphan / registry semantics
-          # are intentionally deferred.
           if not part.function_response.id:
             logger.debug(
                 "User-message function_response for tool %s has no id;"
@@ -3309,17 +3356,26 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
                 " TOOL_PAUSED row.",
                 part.function_response.name,
             )
+          adk_extras = {
+              "pause_kind": "tool",
+              "function_call_id": part.function_response.id,
+          }
+          # pause_orphan: stamped False only when this session's history
+          # proves the completion pairs with a real pause. Omitted (->
+          # SQL NULL = "unknown / not yet settled") otherwise. True is
+          # reserved for the off-hot-path settled fallback so the resume
+          # path stays free of session-service / BigQuery reads.
+          pause_orphan = self._resolve_same_session_pause_orphan(
+              invocation_context, part.function_response.id
+          )
+          if pause_orphan is not None:
+            adk_extras["pause_orphan"] = pause_orphan
           await self._log_event(
               "TOOL_COMPLETED",
               callback_ctx,
               raw_content=content_dict,
               is_truncated=is_truncated,
-              event_data=EventData(
-                  adk_extras={
-                      "pause_kind": "tool",
-                      "function_call_id": part.function_response.id,
-                  },
-              ),
+              event_data=EventData(adk_extras=adk_extras),
           )
 
   @_safe_callback
