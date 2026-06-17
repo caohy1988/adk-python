@@ -8815,3 +8815,160 @@ class TestUnmatchedLongRunningIdFallback:
     rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
     pauses = [r for r in rows if r["event_type"] == "TOOL_PAUSED"]
     assert len(pauses) == 1
+
+
+class TestWorkflowNodeBoundaries:
+  """#207 — WORKFLOW_NODE_STARTING / WORKFLOW_NODE_COMPLETED derivation.
+
+  Drives the real on_event_callback (which records nodes + emits
+  STARTING) and the after-run drain helper (which emits COMPLETED for
+  terminal, non-paused nodes), then asserts the captured rows.
+  """
+
+  def _event(self, path, *, long_running=None, ts=1000.0):
+    return event_lib.Event(
+        author="agent",
+        content=types.Content(role="model", parts=[types.Part(text="x")]),
+        node_info=event_lib.NodeInfo(path=path),
+        long_running_tool_ids=long_running,
+        actions=event_actions_lib.EventActions(),
+        timestamp=ts,
+    )
+
+  async def _observe(self, plugin, ic, *events):
+    bigquery_agent_analytics_plugin._workflow_nodes_ctx.set(None)
+    bigquery_agent_analytics_plugin.TraceManager.push_span(ic)
+    for ev in events:
+      await plugin.on_event_callback(invocation_context=ic, event=ev)
+
+  def _node_rows(self, rows, event_type):
+    out = []
+    for r in rows:
+      if r["event_type"] != event_type:
+        continue
+      adk = json.loads(r["attributes"])["adk"]
+      out.append(adk)
+    return out
+
+  @pytest.mark.asyncio
+  async def test_starting_emitted_once_per_node(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    await self._observe(
+        bq_plugin_inst,
+        invocation_context,
+        self._event("wf/A@1"),
+        self._event("wf/A@1"),  # same node twice
+        self._event("wf/B@1"),
+    )
+    await bq_plugin_inst.flush()
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    starts = self._node_rows(rows, "WORKFLOW_NODE_STARTING")
+    paths = sorted(s["node"]["path"] for s in starts)
+    assert paths == ["wf/A@1", "wf/B@1"]  # A not re-emitted
+
+  @pytest.mark.asyncio
+  async def test_empty_path_event_emits_no_node_row(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    await self._observe(bq_plugin_inst, invocation_context, self._event(""))
+    await bq_plugin_inst.flush()
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert not self._node_rows(rows, "WORKFLOW_NODE_STARTING")
+
+  @pytest.mark.asyncio
+  async def test_completed_drained_for_terminal_node(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    await self._observe(
+        bq_plugin_inst, invocation_context, self._event("wf/A@1", ts=1234.5)
+    )
+    await bq_plugin_inst._drain_workflow_nodes(
+        bigquery_agent_analytics_plugin.CallbackContext(invocation_context)
+    )
+    await bq_plugin_inst.flush()
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    done = self._node_rows(rows, "WORKFLOW_NODE_COMPLETED")
+    assert len(done) == 1
+    assert done[0]["node"]["path"] == "wf/A@1"
+    assert done[0]["workflow_node_status"] == "completed"
+
+  @pytest.mark.asyncio
+  async def test_paused_leaf_not_completed(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    await self._observe(
+        bq_plugin_inst,
+        invocation_context,
+        self._event("wf/A@1", long_running={"call-1"}),
+    )
+    await bq_plugin_inst._drain_workflow_nodes(
+        bigquery_agent_analytics_plugin.CallbackContext(invocation_context)
+    )
+    await bq_plugin_inst.flush()
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert not self._node_rows(rows, "WORKFLOW_NODE_COMPLETED")
+
+  @pytest.mark.asyncio
+  async def test_ancestor_of_paused_not_completed(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    # Parent wf/A@1, child wf/A@1/B@1; child pauses -> neither completes.
+    await self._observe(
+        bq_plugin_inst,
+        invocation_context,
+        self._event("wf/A@1"),
+        self._event("wf/A@1/B@1", long_running={"call-1"}),
+    )
+    await bq_plugin_inst._drain_workflow_nodes(
+        bigquery_agent_analytics_plugin.CallbackContext(invocation_context)
+    )
+    await bq_plugin_inst.flush()
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert not self._node_rows(rows, "WORKFLOW_NODE_COMPLETED")
+
+  @pytest.mark.asyncio
+  async def test_sibling_no_bleed(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    # A pauses; B is a separate terminal node -> B completes, A does not.
+    await self._observe(
+        bq_plugin_inst,
+        invocation_context,
+        self._event("wf/A@1", long_running={"call-1"}),
+        self._event("wf/B@1"),
+    )
+    await bq_plugin_inst._drain_workflow_nodes(
+        bigquery_agent_analytics_plugin.CallbackContext(invocation_context)
+    )
+    await bq_plugin_inst.flush()
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    done = sorted(
+        d["node"]["path"]
+        for d in self._node_rows(rows, "WORKFLOW_NODE_COMPLETED")
+    )
+    assert done == ["wf/B@1"]
