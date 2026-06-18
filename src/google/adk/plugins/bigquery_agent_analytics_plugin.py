@@ -3406,7 +3406,8 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     run_id = getattr(node_info, "run_id", None)
     parent_run_id = getattr(node_info, "parent_run_id", None)
     last_running = bool(getattr(source_event, "long_running_tool_ids", None))
-    ts = getattr(source_event, "timestamp", None)
+    raw_ts = getattr(source_event, "timestamp", None)
+    ts = float(raw_ts) if isinstance(raw_ts, (int, float)) else time.time()
 
     nodes = _workflow_nodes_ctx.get()
     if nodes is None:
@@ -3428,8 +3429,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           event_data=EventData(source_event=source_event),
       )
     else:
-      if ts is not None:
-        existing.last_event_ts = ts
+      existing.last_event_ts = ts
       existing.last_event_long_running = last_running
 
   async def _drain_workflow_nodes(self, callback_ctx: CallbackContext) -> None:
@@ -3472,9 +3472,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           event_data=EventData(
               timestamp_override=datetime.fromtimestamp(
                   prog.last_event_ts, timezone.utc
-              )
-              if prog.last_event_ts is not None
-              else None,
+              ),
               adk_extras={
                   "node": {
                       "path": prog.path,
