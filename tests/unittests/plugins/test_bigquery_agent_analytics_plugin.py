@@ -8380,11 +8380,13 @@ class TestAdkEnvelope:
     await bq_plugin_inst.on_event_callback(
         invocation_context=invocation_context, event=event
     )
-    await asyncio.sleep(0.01)
-    log_entry = await _get_captured_event_dict_async(
-        mock_write_client, dummy_arrow_schema
-    )
-    adk = json.loads(log_entry["attributes"])["adk"]
+    await bq_plugin_inst.flush()
+    # The event also triggers a WORKFLOW_NODE_STARTING row (#207); the C1
+    # envelope is asserted on the STATE_DELTA row this event produces.
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    state_rows = [r for r in rows if r["event_type"] == "STATE_DELTA"]
+    assert len(state_rows) == 1
+    adk = json.loads(state_rows[0]["attributes"])["adk"]
     assert adk["node"]["path"] == "wf/A@1/B@2"
     assert adk["node"]["run_id"] == "2"
     assert adk["node"]["parent_run_id"] == "1"
