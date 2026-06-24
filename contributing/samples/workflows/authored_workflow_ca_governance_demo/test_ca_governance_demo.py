@@ -159,30 +159,49 @@ async def test_nonmatching_question_refuses_in_strict():
 
 
 @pytest.mark.asyncio
-async def test_flexible_falls_back_validates_and_promotes_with_question(
+async def test_flexible_validates_and_runs_but_does_not_autopromote(
     tmp_path, monkeypatch
 ):
+  """FLEXIBLE generates + validates + runs, but the plan has NO promote
+  capability — nothing enters the governed pool from the workflow itself."""
   monkeypatch.setenv("CA_GOV_STORE", str(tmp_path))
   q = "What is the average order item sale price by product department?"
   h = await _run(demo.author_flexible_plan(), _stub_registry("flexible"),
                  {"question": q})
-  # the gate passed: nl2sql -> dry_run(valid) -> run_adhoc -> freeze -> summarize
+  # gate passed: nl2sql -> dry_run(valid) -> run_adhoc -> summarize
   assert h["out"].get("summary")
   assert h["state"]["check"]["valid"] is True
   assert h["state"]["adhoc"]["source"] == "adhoc"
-  assert h["state"]["freeze"]["promoted"] is True
-  # the promoted record keeps the ORIGINAL question (comment #2 regression).
-  assert h["state"]["freeze"]["question"] == q
-  pool = golden.load_pool()
-  assert any(rec.get("question") == q for rec in pool.values())
+  assert "freeze" not in h["state"]  # no auto-promote step exists
+  assert set(golden.load_pool()) == set(golden._SEED)  # pool NOT grown by the run
+  assert "freeze_verified" not in demo.flexible_registry()  # model can't self-promote
+
+
+def test_hitl_approval_promotes_pending_then_reject_clears(tmp_path, monkeypatch):
+  """Promotion is human-in-the-loop: a parked candidate enters the pool only on
+  approve, and reject discards it."""
+  monkeypatch.setenv("CA_GOV_STORE", str(tmp_path))
+  q = "What is the average sale price by department?"
+  golden.save_pending(q, "SELECT 1")
+  assert set(golden.load_pool()) == set(golden._SEED)  # pending != promoted
+  # approve -> enters the pool with the original question
+  rec = golden.approve_pending()
+  assert rec and rec["question"] == q
+  assert golden.get_pending() is None
+  assert any(r.get("question") == q for r in golden.load_pool().values())
+  # a second candidate, this time rejected, leaves the pool unchanged
+  before = set(golden.load_pool())
+  golden.save_pending("some other question", "SELECT 2")
+  golden.clear_pending()
+  assert golden.get_pending() is None
+  assert set(golden.load_pool()) == before
 
 
 @pytest.mark.asyncio
 async def test_flexible_gate_rejects_invalid_sql_no_run_no_freeze(
     tmp_path, monkeypatch
 ):
-  """Comment #3: the dry-run is a GATE — invalid generated SQL is neither run
-  nor promoted."""
+  """The dry-run is a GATE — invalid generated SQL is neither run nor parked."""
   monkeypatch.setenv("CA_GOV_STORE", str(tmp_path))
   q = "Delete everything please"
   reg = _stub_registry("flexible", nl2sql_sql="DELETE FROM orders")
@@ -190,7 +209,6 @@ async def test_flexible_gate_rejects_invalid_sql_no_run_no_freeze(
   assert h["out"].get("refused") is True
   assert h["state"]["check"]["valid"] is False
   assert "adhoc" not in h["state"]  # nothing ran
-  assert "freeze" not in h["state"]  # nothing promoted
   assert set(golden.load_pool()) == set(golden._SEED)  # pool unchanged
 
 
@@ -211,6 +229,12 @@ def test_registries_clean_and_typed():
     assert reg.open_map_warnings() == []
   assert "nl2sql" not in demo.golden_registry()
   assert "nl2sql" in demo.flexible_registry()
+
+
+def test_strip_mode_cleans_stored_question():
+  assert demo._strip_mode("revenue by dept (flexible)") == "revenue by dept"
+  assert demo._strip_mode("revenue by dept (Open Mode)") == "revenue by dept"
+  assert demo._strip_mode("revenue by dept") == "revenue by dept"
 
 
 def test_root_agent_importable_and_named():

@@ -27,11 +27,13 @@ So "golden-only" is just a registry without a SQL-drafting capability:
 
 ```
 STRICT (golden) : match_verified_query · run_frozen_query · summarize · refuse
-FLEXIBLE        : … + nl2sql · dry_run · run_adhoc · freeze_verified
+FLEXIBLE        : … + nl2sql · dry_run · run_adhoc · reject_invalid
 ```
 
-Flipping the governance dial is swapping the registry you hand the validator —
-auditable, diffable, testable. The model is never trusted to restrain itself.
+Neither registry has a promote capability — **a model-authored plan cannot write
+to the governed pool.** Flipping the governance dial is swapping the registry you
+hand the validator — auditable, diffable, testable. The model is never trusted to
+restrain itself, and it can never enlarge its own golden set.
 
 ## The beats
 
@@ -53,14 +55,19 @@ auditable, diffable, testable. The model is never trusted to restrain itself.
    **refuses** rather than guessing. `0 queries run`. *(A hard boundary that
    fails safe.)*
 
-5. **`What is the average sale price by product department? (flexible)`** — the
-   middle ground, live. No verified query matches, so FLEXIBLE generates SQL
-   under **semantic constraints**, **validates it with a real dry-run gate**
-   (invalid SQL is rejected — never run, never promoted), runs it, and
-   **promotes** the approved query into the governed pool. Re-ask in any mode
-   and it is now a governed hit. *(Constrained-yet-flexible + assisted
-   authoring — the governed set grows from real usage, and the answer is still
-   a frozen, auditable workflow, not a turn-by-turn agent run.)*
+5. **The middle ground + human-in-the-loop, live** — three turns:
+   - `What is the average sale price by product department? (flexible)` — no
+     verified query matches, so FLEXIBLE generates SQL under **semantic
+     constraints**, **validates it with a real dry-run gate** (invalid SQL is
+     rejected — never run), runs it, answers, and **parks it pending approval**.
+     The model has *no promote capability*, so it cannot add it to the pool.
+   - `approve` — a **human** signs off; the validated query **enters the governed
+     pool**. (`reject` would discard it.)
+   - `What is the average sale price by product department? (strict)` — the
+     *same* question is now a **governed hit**. *(Assisted authoring with
+     governed change control: the model proposes, a human approves, and the
+     golden set grows from real usage — every answer still a frozen, auditable
+     workflow, not a turn-by-turn agent run.)*
 
 6. **`…churn cohorts… (open mode)`** — the *same* question as beat 4, dial
    turned to OPEN, falls through to a **normal agentic agent** that autonomously
@@ -72,9 +79,11 @@ auditable, diffable, testable. The model is never trusted to restrain itself.
 
 Between "golden-only" and "anything goes" is the constrained-yet-flexible path:
 match a verified query first; on a miss, allow a **semantics/graph-constrained**
-`nl2sql`, **gate** it on a real dry-run, run it, then **promote** the approved
-result into the governed pool (`freeze_verified`). The governed set **grows from
-real usage** — assisted authoring — and every answer remains a frozen,
+`nl2sql`, **gate** it on a real dry-run, run it — then a **human approves** before
+the validated result enters the governed pool. The model never self-promotes
+(there is no promote capability). The governed set **grows from real usage**,
+under human change control — assisted authoring — and every answer remains a
+frozen,
 replayable, auditable workflow rather than an un-reconstructable turn-by-turn
 agent run.
 

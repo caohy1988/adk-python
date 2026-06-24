@@ -52,7 +52,9 @@ from google.genai import types  # noqa: E402
 
 from bq_ca_governance import agent as demo  # noqa: E402
 
-# beat key -> (one-line label, the user message that triggers it)
+# beat key -> (one-line label, message OR list of messages played in order).
+# The `flexible` beat is a multi-turn human-in-the-loop sequence:
+# ask -> human `approve` -> re-ask (now a governed hit).
 BEATS = {
     "diff": (
         "Governance is a registry, not a prompt",
@@ -71,8 +73,12 @@ BEATS = {
         "Show customer churn cohorts by signup acquisition channel (strict)",
     ),
     "flexible": (
-        "FLEXIBLE: golden-first, validated nl2sql promoted into the pool",
-        "What is the average sale price by product department? (flexible)",
+        "FLEXIBLE: generate + validate -> HUMAN approves -> governed hit",
+        [
+            "What is the average sale price by product department? (flexible)",
+            "approve",
+            "What is the average sale price by product department? (strict)",
+        ],
     ),
     "agentic": (
         "OPEN mode falls through to the normal agentic agent",
@@ -108,11 +114,13 @@ async def _main(beats):
   runner = Runner(app_name=app, node=demo.root_agent, session_service=ss)
   for key in beats:
     label, message = BEATS[key]
+    messages = message if isinstance(message, list) else [message]
     print("=" * 78)
     print(f"  BEAT: {label}")
-    print(f"  user> {message}")
     print("=" * 78)
-    await _send(runner, ss, app, message)
+    for msg in messages:
+      print(f"  user> {msg}\n")
+      await _send(runner, ss, app, msg)
 
 
 if __name__ == "__main__":

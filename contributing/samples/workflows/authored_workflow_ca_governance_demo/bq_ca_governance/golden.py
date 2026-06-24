@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from typing import Optional
 
 _D = "bigquery-public-data.thelook_ecommerce"
 
@@ -119,6 +120,57 @@ def promote(question: str, sql: str) -> dict:
   with open(os.path.join(_store_dir(), qid + ".json"), "w") as f:
     json.dump(rec, f, indent=1)
   return rec
+
+
+# --------------------------------------------------- human-in-the-loop (HITL)
+# A FLEXIBLE-generated, dry-run-validated query is NOT written to the governed
+# pool automatically — there is no promote capability in the registry, so the
+# model cannot self-promote. The validated candidate is parked here; a human
+# must explicitly `approve` it before it becomes a verified/golden query.
+# Single-slot by design (one candidate awaiting sign-off at a time).
+_PENDING = "pending_candidate.json"
+
+
+def _pending_path() -> str:
+  base = os.environ.get(
+      "CA_GOV_STORE",
+      os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ca_gov_store"),
+  )
+  os.makedirs(base, exist_ok=True)
+  return os.path.join(base, _PENDING)
+
+
+def save_pending(question: str, sql: str) -> dict:
+  """Park a validated candidate awaiting human approval."""
+  rec = {"question": question, "sql": sql}
+  with open(_pending_path(), "w") as f:
+    json.dump(rec, f, indent=1)
+  return rec
+
+
+def get_pending() -> Optional[dict]:
+  try:
+    with open(_pending_path()) as f:
+      return json.load(f)
+  except (OSError, ValueError):
+    return None
+
+
+def clear_pending() -> None:
+  try:
+    os.remove(_pending_path())
+  except OSError:
+    pass
+
+
+def approve_pending() -> Optional[dict]:
+  """Human sign-off: move the pending candidate into the governed pool."""
+  rec = get_pending()
+  if rec is None:
+    return None
+  promoted = promote(rec["question"], rec["sql"])
+  clear_pending()
+  return promoted
 
 
 _MATCH_MIN_OVERLAP = 2  # need >= 2 distinct keyword hits to count as governed
