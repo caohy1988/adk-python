@@ -34,7 +34,9 @@ import argparse
 import asyncio
 import logging
 import os
+import shutil
 import sys
+import tempfile
 
 logging.getLogger("google.adk").setLevel(logging.ERROR)
 
@@ -119,9 +121,30 @@ if __name__ == "__main__":
       "--beats", nargs="*", default=DEFAULT_ORDER,
       choices=list(BEATS), help="which beats to run, in order",
   )
+  ap.add_argument(
+      "--store", default=None,
+      help="verified-query store dir (default: a fresh temp dir per run, so the"
+      " FLEXIBLE promotion beat is repeatable; set CA_GOV_STORE to persist)",
+  )
+  ap.add_argument(
+      "--reset-store", action="store_true",
+      help="clear promoted (non-seed) verified queries before running",
+  )
   args = ap.parse_args()
+
+  # Rehearsal repeatability: the FLEXIBLE beat PROMOTES its query into the
+  # store, which would turn a re-run into a governed hit. Default to a fresh
+  # temp store so each headless run shows nl2sql -> dry_run -> promote. Pass
+  # --store / CA_GOV_STORE to persist (e.g. to share with `adk web`).
+  store = args.store or os.environ.get("CA_GOV_STORE") or tempfile.mkdtemp(
+      prefix="ca_gov_store_"
+  )
+  if args.reset_store:
+    shutil.rmtree(os.path.join(store, "verified"), ignore_errors=True)
+  os.environ["CA_GOV_STORE"] = store
+
   from bq_ca_governance import warehouse
 
   engine = "on" if warehouse.bq_available() else "mock"
-  print(f"model: {demo.MODEL} | bigquery: {engine}\n")
+  print(f"model: {demo.MODEL} | bigquery: {engine} | store: {store}\n")
   asyncio.run(_main(args.beats))

@@ -147,12 +147,11 @@ def dry_run(value) -> dict:
   sql = _qualify(sql_of(value))
   client = _client()
   if client is None:
-    return {
-        "sql": sql,
-        "valid": sql.strip().lower().startswith("select"),
-        "error": None,
-        "engine": "mock",
-    }
+    # The read-only guard above already confirmed a single SELECT/WITH query,
+    # so the mock dry-run must agree with what BigQuery would accept — including
+    # legal CTEs. (Don't re-check for a leading `select`: that would reject a
+    # valid `WITH ... SELECT` and diverge from the live backend.)
+    return {"sql": sql, "valid": True, "error": None, "engine": "mock"}
   from google.cloud import bigquery
 
   try:

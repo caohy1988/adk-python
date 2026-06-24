@@ -254,3 +254,12 @@ def test_read_only_guard_blocks_non_select(monkeypatch):
   assert warehouse.run_query(
       {"sql": "SELECT status, COUNT(*) AS orders FROM orders GROUP BY status"}
   )["engine"] == "mock"
+
+
+def test_mock_dry_run_accepts_cte():
+  """Mock dry-run must agree with BigQuery on a legal CTE (a `WITH ... SELECT`
+  must not be rejected just because it does not start with `select`)."""
+  from bq_ca_governance import warehouse
+
+  out = warehouse.dry_run({"sql": "WITH x AS (SELECT 1 AS n) SELECT * FROM x"})
+  assert out["valid"] is True and out["engine"] == "mock"

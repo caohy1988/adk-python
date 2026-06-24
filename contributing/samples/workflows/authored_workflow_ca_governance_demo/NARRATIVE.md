@@ -53,20 +53,30 @@ auditable, diffable, testable. The model is never trusted to restrain itself.
    **refuses** rather than guessing. `0 queries run`. *(A hard boundary that
    fails safe.)*
 
-5. **`…churn cohorts… (open mode)`** — the *same* question, dial turned to OPEN,
-   falls through to a **normal agentic agent** that autonomously queries
-   BigQuery and answers free-form. Powerful, but **not** a frozen, auditable
-   workflow — that is the explicit trade-off the customer chooses per their
-   policy. *(Both surfaces, one agent.)*
+5. **`What is the average sale price by product department? (flexible)`** — the
+   middle ground, live. No verified query matches, so FLEXIBLE generates SQL
+   under **semantic constraints**, **validates it with a real dry-run gate**
+   (invalid SQL is rejected — never run, never promoted), runs it, and
+   **promotes** the approved query into the governed pool. Re-ask in any mode
+   and it is now a governed hit. *(Constrained-yet-flexible + assisted
+   authoring — the governed set grows from real usage, and the answer is still
+   a frozen, auditable workflow, not a turn-by-turn agent run.)*
 
-## The middle ground (FLEXIBLE) and assisted authoring
+6. **`…churn cohorts… (open mode)`** — the *same* question as beat 4, dial
+   turned to OPEN, falls through to a **normal agentic agent** that autonomously
+   queries BigQuery and answers free-form. Powerful, but **not** a frozen,
+   auditable workflow — that is the explicit trade-off the customer chooses per
+   their policy. *(Both surfaces, one agent.)*
+
+## On the FLEXIBLE middle ground (beat 5)
 
 Between "golden-only" and "anything goes" is the constrained-yet-flexible path:
 match a verified query first; on a miss, allow a **semantics/graph-constrained**
-`nl2sql`, validate it (dry-run), run it, then **promote** the approved result
-into the governed pool (`freeze_verified`). The governed set **grows from real
-usage** — assisted authoring — and every answer remains a frozen, replayable,
-auditable workflow rather than an un-reconstructable turn-by-turn agent run.
+`nl2sql`, **gate** it on a real dry-run, run it, then **promote** the approved
+result into the governed pool (`freeze_verified`). The governed set **grows from
+real usage** — assisted authoring — and every answer remains a frozen,
+replayable, auditable workflow rather than an un-reconstructable turn-by-turn
+agent run.
 
 ## Why this is the right enterprise story
 
