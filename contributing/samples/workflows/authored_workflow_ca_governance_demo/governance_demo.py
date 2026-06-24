@@ -136,22 +136,29 @@ if __name__ == "__main__":
   )
   ap.add_argument(
       "--reset-store", action="store_true",
-      help="clear promoted (non-seed) verified queries before running",
+      help="clear promoted (non-seed) verified queries AND any pending"
+      " (un-approved) candidate before running",
   )
   args = ap.parse_args()
 
-  # Rehearsal repeatability: the FLEXIBLE beat PROMOTES its query into the
-  # store, which would turn a re-run into a governed hit. Default to a fresh
-  # temp store so each headless run shows nl2sql -> dry_run -> promote. Pass
-  # --store / CA_GOV_STORE to persist (e.g. to share with `adk web`).
+  # Rehearsal repeatability: the FLEXIBLE beat parks a candidate and (after
+  # `approve`) promotes it into the store, which would turn a re-run into a
+  # governed hit. Default to a fresh temp store so each headless run shows
+  # nl2sql -> dry_run -> pending. Pass --store / CA_GOV_STORE to persist
+  # (e.g. to share with `adk web`).
   store = args.store or os.environ.get("CA_GOV_STORE") or tempfile.mkdtemp(
       prefix="ca_gov_store_"
   )
-  if args.reset_store:
-    shutil.rmtree(os.path.join(store, "verified"), ignore_errors=True)
-  os.environ["CA_GOV_STORE"] = store
+  os.environ["CA_GOV_STORE"] = store  # set before any golden.* call
 
+  from bq_ca_governance import golden
   from bq_ca_governance import warehouse
+
+  if args.reset_store:
+    # Clear BOTH promoted queries and a stale pending candidate — otherwise a
+    # leftover candidate could be `approve`d into a freshly reset pool.
+    shutil.rmtree(os.path.join(store, "verified"), ignore_errors=True)
+    golden.clear_pending()
 
   engine = "on" if warehouse.bq_available() else "mock"
   print(f"model: {demo.MODEL} | bigquery: {engine} | store: {store}\n")

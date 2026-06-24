@@ -116,7 +116,8 @@ the human-in-the-loop promotion end to end. By default the driver uses a **fresh
 temp `CA_GOV_STORE` per run** (printed as `store: …`), so the beat always starts
 clean and stays repeatable. To instead **persist** the approved pool — e.g. to
 share it with `adk web` so an approved query becomes a governed hit there — point
-`--store` at a durable directory (and `--reset-store` to clear promotions first):
+`--store` at a durable directory (and `--reset-store` to clear promoted queries
+**and any un-approved pending candidate** first):
 
 ```bash
 python .../governance_demo.py \
