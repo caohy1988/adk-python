@@ -63,8 +63,13 @@ def _stub(name, fn):
   return build
 
 
-def _stub_registry(mode: str) -> CapabilityRegistry:
-  """The demo registry for `mode`, with the LLM capabilities stubbed."""
+_VALID_SQL = "SELECT status, COUNT(*) AS orders FROM orders GROUP BY status"
+
+
+def _stub_registry(mode: str, nl2sql_sql: str = _VALID_SQL) -> CapabilityRegistry:
+  """The demo registry for `mode`, with the LLM capabilities stubbed. The
+  stubbed nl2sql echoes the question (as the real schema now allows) so the
+  promoted record keeps it."""
   real = demo.golden_registry() if mode == "strict" else demo.flexible_registry()
   stubs = {
       "summarize": Capability(
@@ -76,7 +81,7 @@ def _stub_registry(mode: str) -> CapabilityRegistry:
           name="nl2sql", input_kind="item", serialize_input=False,
           output_model=demo.Sql,
           build=_stub("nl2sql", lambda v: {
-              "sql": "SELECT status, COUNT(*) AS orders FROM orders GROUP BY status",
+              "sql": nl2sql_sql,
               "question": demo._obj(v).get("question", ""),
           }),
       ),
@@ -154,18 +159,39 @@ async def test_nonmatching_question_refuses_in_strict():
 
 
 @pytest.mark.asyncio
-async def test_flexible_falls_back_and_promotes(tmp_path, monkeypatch):
+async def test_flexible_falls_back_validates_and_promotes_with_question(
+    tmp_path, monkeypatch
+):
   monkeypatch.setenv("CA_GOV_STORE", str(tmp_path))
   q = "What is the average order item sale price by product department?"
   h = await _run(demo.author_flexible_plan(), _stub_registry("flexible"),
                  {"question": q})
-  # the miss path ran nl2sql -> dry_run -> run_adhoc -> freeze -> summarize
+  # the gate passed: nl2sql -> dry_run(valid) -> run_adhoc -> freeze -> summarize
   assert h["out"].get("summary")
+  assert h["state"]["check"]["valid"] is True
   assert h["state"]["adhoc"]["source"] == "adhoc"
   assert h["state"]["freeze"]["promoted"] is True
-  # and the pool now contains the promoted query
+  # the promoted record keeps the ORIGINAL question (comment #2 regression).
+  assert h["state"]["freeze"]["question"] == q
   pool = golden.load_pool()
   assert any(rec.get("question") == q for rec in pool.values())
+
+
+@pytest.mark.asyncio
+async def test_flexible_gate_rejects_invalid_sql_no_run_no_freeze(
+    tmp_path, monkeypatch
+):
+  """Comment #3: the dry-run is a GATE — invalid generated SQL is neither run
+  nor promoted."""
+  monkeypatch.setenv("CA_GOV_STORE", str(tmp_path))
+  q = "Delete everything please"
+  reg = _stub_registry("flexible", nl2sql_sql="DELETE FROM orders")
+  h = await _run(demo.author_flexible_plan(), reg, {"question": q})
+  assert h["out"].get("refused") is True
+  assert h["state"]["check"]["valid"] is False
+  assert "adhoc" not in h["state"]  # nothing ran
+  assert "freeze" not in h["state"]  # nothing promoted
+  assert set(golden.load_pool()) == set(golden._SEED)  # pool unchanged
 
 
 @pytest.mark.asyncio
@@ -196,3 +222,35 @@ def test_seed_golden_queries_match_their_own_questions():
   for qid, rec in golden._SEED.items():
     m = golden.fallback_match(rec["question"], pool)
     assert m["hit"] and m["query_id"] == qid
+
+
+def test_mode_routing_is_three_distinct_modes(monkeypatch):
+  monkeypatch.delenv("CA_GOV_MODE", raising=False)
+  assert demo._mode_from("revenue by country (strict)") == "strict"
+  assert demo._mode_from("revenue by country (flexible)") == "flexible"
+  assert demo._mode_from("revenue by country (open mode)") == "open"
+  assert demo._mode_from("revenue by country") == "strict"  # default
+  monkeypatch.setenv("CA_GOV_MODE", "open")
+  assert demo._mode_from("revenue by country") == "open"
+
+
+def test_read_only_guard_blocks_non_select(monkeypatch):
+  """Comment #4: DDL/DML and multi-statement SQL are rejected before execution
+  (and before the mock), so nothing is billed."""
+  from bq_ca_governance import warehouse
+
+  assert warehouse.read_only_violation("SELECT 1") is None
+  assert warehouse.read_only_violation(
+      "WITH x AS (SELECT 1) SELECT * FROM x") is None
+  assert warehouse.read_only_violation("DROP TABLE users")
+  assert warehouse.read_only_violation("DELETE FROM orders")
+  assert warehouse.read_only_violation("SELECT 1; DELETE FROM orders")
+  assert warehouse.read_only_violation("UPDATE orders SET status='x'")
+  # the guard is enforced by run_query / dry_run (engine 'guard', not executed)
+  assert warehouse.run_query({"sql": "DROP TABLE users"})["engine"] == "guard"
+  assert warehouse.dry_run({"sql": "DELETE FROM orders"})["valid"] is False
+  assert warehouse.query_thelook("INSERT INTO orders VALUES (1)")["error"]
+  # a legitimate read-only query still works against the mock warehouse.
+  assert warehouse.run_query(
+      {"sql": "SELECT status, COUNT(*) AS orders FROM orders GROUP BY status"}
+  )["engine"] == "mock"

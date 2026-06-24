@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from typing import Optional
 
 DATASET = "bigquery-public-data.thelook_ecommerce"
 _MAX_BYTES_BILLED = 2 * 1024**3  # 2 GB per query
@@ -82,6 +83,37 @@ def sql_of(value) -> str:
   return ""
 
 
+# Forbidden even when the statement happens to start with SELECT/WITH (e.g.
+# scripting, or DML hidden after a CTE). Enforced before BigQuery AND before the
+# mock, so the guard is exercised in tests without credentials.
+_FORBIDDEN = re.compile(
+    r"(?i)\b(insert|update|delete|merge|drop|create|alter|truncate|grant|"
+    r"revoke|call|load|export|begin|declare|set)\b"
+)
+
+
+def read_only_violation(sql) -> Optional[str]:
+  """Return a reason string if the SQL is not a single read-only SELECT/WITH
+  query, else None. Governance + cost safety: OPEN mode lets a model pass
+  arbitrary SQL, so DDL/DML, scripting, and multi-statement input are rejected
+  before anything is billed to GOOGLE_CLOUD_PROJECT."""
+  raw = sql_of(sql)
+  # strip full-line comments, then a trailing semicolon/whitespace.
+  body = "\n".join(
+      ln for ln in (raw or "").splitlines() if not ln.strip().startswith("--")
+  ).strip().rstrip(";").strip()
+  if not body:
+    return "empty SQL"
+  if ";" in body:
+    return "multiple statements are not allowed (single SELECT only)"
+  low = body.lower()
+  if not (low.startswith("select") or low.startswith("with")):
+    return "only read-only SELECT/WITH queries are allowed"
+  if _FORBIDDEN.search(body):
+    return "DDL/DML/scripting keywords are not allowed in a read-only query"
+  return None
+
+
 def _qualify(sql: str) -> str:
   """Fully qualify bare thelook table refs for real BigQuery."""
   s = (sql or "").replace("`", "")
@@ -108,6 +140,10 @@ def _jsonify(v):
 def dry_run(value) -> dict:
   """Validate SQL without running it. Real BigQuery dry-run when credentials
   allow (real errors, real bytes); otherwise a cheap syntactic check."""
+  violation = read_only_violation(value)
+  if violation:
+    return {"sql": sql_of(value), "valid": False,
+            "error": f"rejected: {violation}", "engine": "guard"}
   sql = _qualify(sql_of(value))
   client = _client()
   if client is None:
@@ -138,6 +174,9 @@ def dry_run(value) -> dict:
 def run_query(value) -> dict:
   """Execute a read-only SELECT. Real BigQuery (billed, capped) when
   credentials allow; the deterministic micro-warehouse otherwise."""
+  violation = read_only_violation(value)
+  if violation:
+    return {"rows": [], "engine": "guard", "error": f"rejected: {violation}"}
   sql = _qualify(sql_of(value))
   client = _client()
   if client is not None:

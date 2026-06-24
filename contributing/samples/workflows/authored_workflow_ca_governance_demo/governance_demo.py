@@ -23,8 +23,8 @@ rehearse, to run the demo when a browser/UI is awkward, or as a smoke test.
     export GOOGLE_CLOUD_LOCATION=global CA_GOV_MODEL=gemini-3.5-flash
     python contributing/samples/workflows/authored_workflow_ca_governance_demo/governance_demo.py
 
-    # Deterministic (no creds): forces the mock warehouse; LLM steps still
-    # need a model, so pass --no-llm to script only the non-LLM beats.
+    # No BigQuery (forces the mock warehouse). The diff and adversarial beats
+    # need no model, so they run without any credentials:
     CA_GOV_USE_BIGQUERY=0 python .../governance_demo.py --beats diff adversarial
 """
 
@@ -68,13 +68,17 @@ BEATS = {
         "Out-of-set question is refused in STRICT mode",
         "Show customer churn cohorts by signup acquisition channel (strict)",
     ),
+    "flexible": (
+        "FLEXIBLE: golden-first, validated nl2sql promoted into the pool",
+        "What is the average sale price by product department? (flexible)",
+    ),
     "agentic": (
         "OPEN mode falls through to the normal agentic agent",
         "Show customer churn cohorts by signup acquisition channel (open mode)",
     ),
 }
 
-DEFAULT_ORDER = ["diff", "adversarial", "hit", "refuse", "agentic"]
+DEFAULT_ORDER = ["diff", "adversarial", "hit", "refuse", "flexible", "agentic"]
 
 
 async def _send(runner, session_service, app, message: str):
@@ -116,8 +120,8 @@ if __name__ == "__main__":
       choices=list(BEATS), help="which beats to run, in order",
   )
   args = ap.parse_args()
-  print(
-      f"model: {demo.MODEL} | bigquery:"
-      f" {'on' if __import__('bq_ca_governance.warehouse', fromlist=['x']).bq_available() else 'mock'}\n"
-  )
+  from bq_ca_governance import warehouse
+
+  engine = "on" if warehouse.bq_available() else "mock"
+  print(f"model: {demo.MODEL} | bigquery: {engine}\n")
   asyncio.run(_main(args.beats))

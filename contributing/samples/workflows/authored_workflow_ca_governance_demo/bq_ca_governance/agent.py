@@ -138,6 +138,10 @@ class Refusal(BaseModel):
 
 class Sql(BaseModel):
   sql: str
+  # The originating question must survive nl2sql so the dry-run / run / freeze
+  # steps downstream can promote a verified query that keeps its question. It is
+  # part of the output schema (not just a passthrough) so the LLM can echo it.
+  question: str = ""
 
 
 class DryRunOut(BaseModel):
@@ -234,6 +238,21 @@ def _freeze_verified(value) -> dict:
   return {"promoted": True, "query_id": rec["id"], "question": m.get("question", "")}
 
 
+def _reject_invalid(value) -> dict:
+  """The FLEXIBLE gate's failure leaf: generated SQL that does not pass the
+  dry-run is neither run nor promoted."""
+  m = _obj(value)
+  return {
+      "refused": True,
+      "message": (
+          "The generated SQL failed dry-run validation, so it was NOT run and"
+          " NOT promoted to the governed pool."
+      ),
+      "question": m.get("question", ""),
+      "error": m.get("error"),
+  }
+
+
 # --------------------------------------------------------------- capabilities
 def _node_cap(name, fn, output_model) -> Capability:
   def build():
@@ -276,7 +295,8 @@ _NL2SQL_INSTRUCTION = (
     " and never write DML. (In production this step is bound to the dataset's"
     " semantic model / graph so joins and grains are constrained — the RFC's"
     " 'constrained yet flexible' middle ground.) The input is a JSON object"
-    " with a 'question' field. Return {\"sql\": <the query>}."
+    " with a 'question' field. Return {\"sql\": <the query>, \"question\":"
+    " <the original question, copied verbatim>}."
 )
 
 _SUMMARIZE_INSTRUCTION = (
@@ -319,6 +339,7 @@ def flexible_registry() -> CapabilityRegistry:
       _node_cap("dry_run", _dry_run, DryRunOut),
       _node_cap("run_adhoc", _run_adhoc, QueryRows),
       _node_cap("freeze_verified", _freeze_verified, Promotion),
+      _node_cap("reject_invalid", _reject_invalid, Refusal),
   ]
   return CapabilityRegistry(caps, version="flex-1")
 
@@ -435,9 +456,43 @@ def author_adversarial_plan() -> WorkflowSpec:
 
 
 def author_flexible_plan() -> WorkflowSpec:
-  """The middle ground: golden match first; on a miss, a gated nl2sql ->
-  dry_run -> run -> FREEZE (promote to the governed pool) -> summarize."""
+  """The middle ground: golden match first; on a miss, a gated nl2sql path.
+
+  The dry-run is a real GATE, not an observation: only SQL that passes is run
+  and promoted. Invalid generated SQL goes to ``reject_invalid`` — nothing is
+  run, nothing enters the governed pool.
+
+      match -> branch( hit  : run_frozen -> summarize
+                       miss : nl2sql -> dry_run
+                              -> branch( valid : run_adhoc -> freeze -> summarize
+                                         else  : reject_invalid ) )
+  """
   base = author_golden_plan()
+  gate = Branch(
+      kind="branch",
+      id="gate",
+      on=Binding(source="step", step="check", path="valid"),
+      routes=[
+          Route(
+              value="True",
+              block=[
+                  StepRef(kind="step", id="adhoc", capability="run_adhoc",
+                          input=Binding(source="step", step="check")),
+                  StepRef(kind="step", id="freeze", capability="freeze_verified",
+                          input=Binding(source="step", step="adhoc")),
+                  StepRef(kind="step", id="fsum", capability="summarize",
+                          input=Binding(source="step", step="adhoc")),
+              ],
+          ),
+          Route(
+              value="False",
+              block=[
+                  StepRef(kind="step", id="vreject", capability="reject_invalid",
+                          input=Binding(source="step", step="check")),
+              ],
+          ),
+      ],
+  )
   for route in base.steps[1].routes:
     if route.value == "False":
       route.block = [
@@ -445,14 +500,9 @@ def author_flexible_plan() -> WorkflowSpec:
                   input=Binding(source="step", step="match")),
           StepRef(kind="step", id="check", capability="dry_run",
                   input=Binding(source="step", step="gen")),
-          StepRef(kind="step", id="adhoc", capability="run_adhoc",
-                  input=Binding(source="step", step="check")),
-          StepRef(kind="step", id="freeze", capability="freeze_verified",
-                  input=Binding(source="step", step="adhoc")),
-          StepRef(kind="step", id="sum", capability="summarize",
-                  input=Binding(source="step", step="adhoc")),
+          gate,
       ]
-  base.goal = "golden first; constrained nl2sql fallback that grows the pool"
+  base.goal = "golden first; validated nl2sql fallback that grows the pool"
   return base
 
 
@@ -475,8 +525,17 @@ def _text_of(node_input) -> str:
 
 
 def _mode_from(text: str) -> str:
+  """The three governance modes are distinct:
+
+  * strict   — golden only; a miss is refused.
+  * flexible — golden first; a miss runs a VALIDATED nl2sql path that promotes
+               the approved query into the pool (still a frozen workflow).
+  * open     — golden first; a miss falls through to the free-form agentic agent.
+  """
   low = text.lower()
-  if any(k in low for k in ("open mode", "agentic", "flexible")):
+  if "flexible" in low:
+    return "flexible"
+  if any(k in low for k in ("open mode", "agentic", "open)")):
     return "open"
   if any(k in low for k in ("strict", "governed only", "golden only")):
     return "strict"
@@ -563,20 +622,31 @@ async def plan_and_run(ctx: Context, node_input):
     return
 
   # --- the governed model-authored workflow --------------------------------
-  reg = golden_registry()
-  spec = author_golden_plan()
+  # FLEXIBLE authors the gated nl2sql plan over the flexible registry; STRICT and
+  # OPEN author the golden plan (their miss handling differs AFTER execution).
+  if mode == "flexible":
+    reg, spec = flexible_registry(), author_flexible_plan()
+    plan_blurb = (
+        "`match → branch(hit: run frozen SQL | miss: nl2sql → dry_run →"
+        " branch(valid: run + freeze + summarize | else: reject))`"
+    )
+  else:
+    reg, spec = golden_registry(), author_golden_plan()
+    plan_blurb = (
+        "`match_verified_query → branch(hit: run the frozen approved SQL +"
+        " summarize | miss: refuse)`"
+    )
   warnings = WorkflowSpecValidator(reg).validate(spec)
   record = FrozenWorkflowRecord.freeze(
       spec, planner_model=MODEL, registry=reg, created_at=_now_iso()
   )
   yield _msg(
       f"## 🗂️ Governed workflow (mode: **{mode.upper()}**)\n\n"
-      "The planner authors a typed `WorkflowSpec` over the **golden registry**"
-      " — `match_verified_query → branch(hit: run the frozen approved SQL +"
-      " summarize | miss: refuse)`."
+      f"The planner authors a typed `WorkflowSpec` over the **{reg.version}**"
+      f" registry — {plan_blurb}."
   )
   yield _msg(
-      "✅ **Validated** against the governed registry"
+      "✅ **Validated** against the registry"
       f" ({'clean' if not warnings else '; '.join(warnings)}).\n"
       f"🔒 **Frozen** — spec_hash `{record.spec_hash[:12]}`,"
       f" {len(export_plan(record))} fields exported (portable, hash-verified,"
@@ -588,7 +658,8 @@ async def plan_and_run(ctx: Context, node_input):
   out = await interp.execute(spec, {"question": text})
   match = interp.state.get("match", {})
 
-  if not out.get("refused"):
+  # --- governed hit (shared by all modes) ----------------------------------
+  if match.get("hit"):
     rows = interp.state.get("run", {})
     yield _msg(
         f"🎯 **Governed hit** — matched verified query"
@@ -605,13 +676,41 @@ async def plan_and_run(ctx: Context, node_input):
                         "engine": rows.get("engine")})
     return
 
-  # miss
-  if mode != "open":
+  # --- miss handling, per mode ---------------------------------------------
+  if mode == "strict":
     yield _msg(
         f"🚫 **Refused (STRICT)** — {out.get('message')}\n\n_(best match score"
         f" {match.get('score')}, below threshold; 0 queries run.)_"
     )
     yield Event(output={"beat": "refused"})
+    return
+
+  if mode == "flexible":
+    check = interp.state.get("check", {})
+    if interp.state.get("freeze"):  # the gate passed: ran + promoted
+      rows = interp.state.get("adhoc", {})
+      promo = interp.state.get("freeze", {})
+      yield _msg(
+          "🛠️ **No verified query matched — FLEXIBLE generated one under"
+          " semantic constraints, then VALIDATED it** (dry-run engine:"
+          f" `{check.get('engine')}`, valid: {check.get('valid')}).\n\n📄"
+          f" **Result** (engine: `{rows.get('engine')}`):\n\n"
+          + _rows_preview(rows.get("rows", []))
+      )
+      yield _msg(
+          f"📝 {out.get('summary', '')}\n\n📈 **Promoted to the governed pool**"
+          f" as `{promo.get('query_id')}` (assisted authoring) — re-ask in any"
+          " mode and it is now a governed hit. _Still a frozen, auditable"
+          f" workflow — {interp.dispatch_count} dispatches._"
+      )
+      yield Event(output={"beat": "flexible_promoted",
+                          "query_id": promo.get("query_id")})
+    else:  # the gate rejected invalid generated SQL
+      yield _msg(
+          f"⛔ **FLEXIBLE gate rejected the generated SQL** — {out.get('message')}"
+          f"\n\n_(dry-run error: {check.get('error')}; 0 rows run, 0 promoted.)_"
+      )
+      yield Event(output={"beat": "flexible_rejected"})
     return
 
   # OPEN mode: fall through to the NORMAL agentic agent (ungoverned).
@@ -627,7 +726,8 @@ async def plan_and_run(ctx: Context, node_input):
   yield _msg(
       "💡 _Assisted authoring_: an analyst can promote this query into the"
       " governed pool (`freeze_verified`), and the next ask becomes a governed"
-      " hit served by the workflow above."
+      " hit served by the workflow above (this is exactly what FLEXIBLE"
+      " automates)."
   )
   yield Event(output={"beat": "agentic_fallback"})
 
