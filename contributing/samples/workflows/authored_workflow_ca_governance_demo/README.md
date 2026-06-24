@@ -100,6 +100,18 @@ python contributing/samples/workflows/authored_workflow_ca_governance_demo/gover
 python .../governance_demo.py --beats diff adversarial hit refuse flexible agentic
 ```
 
+By default the driver uses a **fresh temp `CA_GOV_STORE` per run** (printed as
+`store: …`), so beat 5 always re-promotes (`nl2sql → dry_run → freeze`) and
+rehearsals stay repeatable. To instead **persist** the promoted pool — e.g. to
+share it with `adk web` so a promoted query becomes a governed hit there — point
+`--store` at a durable directory (and `--reset-store` to clear promotions first):
+
+```bash
+python .../governance_demo.py \
+  --store contributing/samples/workflows/authored_workflow_ca_governance_demo/ca_gov_store \
+  --reset-store
+```
+
 ## 3. Correctness proof (no LLM, no BigQuery)
 
 ```bash
