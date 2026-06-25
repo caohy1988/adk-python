@@ -237,6 +237,32 @@ def test_strip_mode_cleans_stored_question():
   assert demo._strip_mode("revenue by dept") == "revenue by dept"
 
 
+def test_spec_ids_walks_nested_blocks():
+  ids = demo._spec_ids(demo.author_flexible_plan())
+  assert {"match", "route", "gen", "check", "gate", "adhoc", "fsum", "vreject"} <= ids
+  assert {"match", "route", "run", "sum", "deny"} <= demo._spec_ids(
+      demo.author_golden_plan())
+
+
+@pytest.mark.asyncio
+async def test_live_authoring_disabled_returns_none(monkeypatch):
+  """With CA_GOV_LIVE_PLANNER=0 the planner is skipped (caller uses fallback);
+  early-returns before touching ctx, so ctx=None is safe here."""
+  monkeypatch.setenv("CA_GOV_LIVE_PLANNER", "0")
+  reg = demo.golden_registry()
+  spec = await demo._author_live(
+      None, reg, demo._golden_plan_instruction(reg), "q", "planner",
+      {"match", "route"})
+  assert spec is None
+
+
+def test_planner_instructions_list_only_registry_caps():
+  gi = demo._golden_plan_instruction(demo.golden_registry())
+  assert "match_verified_query" in gi and "nl2sql" not in gi  # strict catalogue
+  fi = demo._flexible_plan_instruction(demo.flexible_registry())
+  assert "nl2sql" in fi  # flexible catalogue exposes the gated path
+
+
 def test_root_agent_importable_and_named():
   assert demo.root_agent.name == "bq_ca_governance"
 

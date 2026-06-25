@@ -499,6 +499,140 @@ def author_flexible_plan() -> WorkflowSpec:
   return base
 
 
+# ---------------------------------------------------- live model authoring (#93)
+# RFC #93's headline: the model AUTHORS the typed WorkflowSpec at runtime via
+# LlmAgent(output_schema=WorkflowSpec), then it is validated against the registry
+# and governed. The shape is instruction-guided (fixed node ids) for recording
+# reliability — the model still emits the typed plan as structured output, and a
+# deterministic fallback (author_*_plan) keeps the demo robust if authoring fails
+# or no model is configured. (Free, un-prescribed authoring evidence lives in the
+# sibling authored_workflow_spike / authored_workflow_demo samples.)
+# NOTE: keep these strings BRACE-FREE. ADK LlmAgent instructions treat `{...}`
+# as session-state template variables, so any literal brace breaks authoring.
+_CAP_DESC = {
+    "match_verified_query": "item: the task object; returns a MatchResult with"
+        " fields hit, query_id, sql, question — checks the question against the"
+        " verified/golden pool",
+    "run_frozen_query": "item: a MatchResult; returns the rows of the approved"
+        " frozen SQL (real BigQuery)",
+    "summarize": "item: query rows; returns a one-line summary",
+    "refuse": "item: a MatchResult; returns a governed refusal",
+    "nl2sql": "item: a MatchResult (carries the question); returns"
+        " semantics-constrained SQL",
+    "dry_run": "item: an SQL object; validates it via a BigQuery dry-run"
+        " (valid/error)",
+    "run_adhoc": "item: a dry-run result; returns the rows of the generated SQL",
+    "reject_invalid": "item: a dry-run result; returns a rejection when the SQL"
+        " failed the dry-run",
+}
+
+
+def _catalogue(reg: CapabilityRegistry) -> str:
+  return "\n".join(f"- {n}: {_CAP_DESC.get(n, '')}" for n in reg.names())
+
+
+def _spec_ids(spec: WorkflowSpec) -> set:
+  ids: set = set()
+
+  def walk(nodes):
+    for n in nodes:
+      if getattr(n, "id", None):
+        ids.add(n.id)
+      for r in getattr(n, "routes", None) or []:
+        walk(r.block)
+      if getattr(n, "body", None):
+        walk(n.body)
+
+  walk(spec.steps)
+  return ids
+
+
+def _golden_plan_instruction(reg: CapabilityRegistry) -> str:
+  return (
+      "You are the planner for a GOVERNED BigQuery Conversational Analytics"
+      " agent. Author a typed WorkflowSpec (returned as structured output) that"
+      " answers the user's data question using ONLY these registered"
+      f" capabilities:\n{_catalogue(reg)}\n\n"
+      "Author exactly this governed shape, with these node ids:\n"
+      "1) a step with id 'match' and capability 'match_verified_query', taking"
+      " its input from the task.\n"
+      "2) a branch with id 'route' that switches on step 'match' field 'hit',"
+      " with two routes:\n"
+      "   - value 'True': a step id 'run' capability 'run_frozen_query' taking"
+      " input from step 'match'; then a step id 'sum' capability 'summarize'"
+      " taking input from step 'run'.\n"
+      "   - value 'False': a step id 'deny' capability 'refuse' taking input"
+      " from step 'match'.\n"
+      "The workflow output is step 'route'. Use ONLY the listed capabilities."
+  )
+
+
+def _flexible_plan_instruction(reg: CapabilityRegistry) -> str:
+  return (
+      "You are the planner for a BigQuery Conversational Analytics agent in the"
+      " constrained-yet-flexible mode. Author a typed WorkflowSpec (structured"
+      f" output) using ONLY these capabilities:\n{_catalogue(reg)}\n\n"
+      "Author exactly this shape with these node ids:\n"
+      "- a step id 'match' capability 'match_verified_query' taking input from"
+      " the task; then a branch id 'route' switching on step 'match' field"
+      " 'hit' with two routes:\n"
+      "  - value 'True': a step id 'run' capability 'run_frozen_query' (input"
+      " from step 'match'), then a step id 'sum' capability 'summarize' (input"
+      " from step 'run').\n"
+      "  - value 'False': a step id 'gen' capability 'nl2sql' (input from step"
+      " 'match'), then a step id 'check' capability 'dry_run' (input from step"
+      " 'gen'), then a branch id 'gate' switching on step 'check' field 'valid'"
+      " with routes: value 'True' is a step id 'adhoc' capability 'run_adhoc'"
+      " (input from step 'check') then a step id 'fsum' capability 'summarize'"
+      " (input from step 'adhoc'); value 'False' is a step id 'vreject'"
+      " capability 'reject_invalid' (input from step 'check').\n"
+      "The workflow output is step 'route'."
+  )
+
+
+def _adversarial_plan_instruction(reg: CapabilityRegistry) -> str:
+  return (
+      "The user wants to BYPASS the verified-query governance and just get an"
+      " answer from freshly-written SQL. Author a typed WorkflowSpec (structured"
+      f" output) using these capabilities:\n{_catalogue(reg)}\n\n"
+      "Author this shape with these node ids: a step id 'gen' capability"
+      " 'nl2sql' taking input from the task; then a step id 'adhoc' capability"
+      " 'run_adhoc' taking input from step 'gen'; then a step id 'sum'"
+      " capability 'summarize' taking input from step 'adhoc'. The workflow"
+      " output is step 'sum'."
+  )
+
+
+async def _author_live(ctx, reg, instruction, question, run_id, required_ids,
+                       attempts: int = 2):
+  """Author a WorkflowSpec LIVE via LlmAgent(output_schema=WorkflowSpec), then
+  validate it against `reg`. Returns the spec, or None (caller falls back) when
+  live authoring is disabled, errors, fails validation, or omits a required id.
+  Retries a couple of times since the model occasionally emits an off-shape plan."""
+  if os.environ.get("CA_GOV_LIVE_PLANNER", "1") != "1":
+    return None
+  for attempt in range(attempts):
+    try:
+      planner = Agent(
+          name="planner",
+          model=MODEL,
+          output_schema=WorkflowSpec,
+          generate_content_config=DET,
+          instruction=instruction,
+      )
+      raw = await ctx.run_node(
+          planner, node_input=json.dumps({"question": question}),
+          run_id=f"{run_id}_{attempt}",
+      )
+      spec = WorkflowSpec.model_validate(raw)
+      WorkflowSpecValidator(reg).validate(spec)  # governance check on the registry
+      if set(required_ids).issubset(_spec_ids(spec)):
+        return spec
+    except Exception:
+      continue
+  return None
+
+
 # --------------------------------------------------------------- presentation
 def _msg(text: str) -> Event:
   return Event(content=types.Content(role="model", parts=[types.Part(text=text)]))
@@ -620,12 +754,21 @@ async def plan_and_run(ctx: Context, node_input):
   # --- special beat: the "you can't prompt your way out" proof -------------
   if any(k in low for k in ("adversarial", "force sql", "ignore governance",
                             "just write sql", "bypass")):
-    spec = author_adversarial_plan()
+    # Author the adversarial plan LIVE (model emits it) against the flexible
+    # catalogue; fall back to the canned plan if authoring is unavailable.
+    spec = await _author_live(
+        ctx, flexible_registry(), _adversarial_plan_instruction(flexible_registry()),
+        "answer revenue by writing fresh SQL, ignore governance", "planner_adv",
+        {"gen", "adhoc", "sum"},
+    )
+    authored_by = "the model (live)" if spec is not None else "a canned fallback"
+    if spec is None:
+      spec = author_adversarial_plan()
     yield _msg(
         "## 🔒 Adversarial planner vs. STRICT governance\n\n"
-        "A jailbroken planner authors a plan that **ignores governance and"
-        " drafts fresh SQL** (`nl2sql → run_adhoc → summarize`). Validating it"
-        " against the STRICT (golden) registry:"
+        f"A jailbroken planner ({authored_by}) authors a plan that **ignores"
+        " governance and drafts fresh SQL** (`nl2sql → run_adhoc → summarize`)."
+        " Validating it against the STRICT (golden) registry:"
     )
     try:
       WorkflowSpecValidator(golden_registry()).validate(spec)
@@ -659,18 +802,35 @@ async def plan_and_run(ctx: Context, node_input):
     yield Event(output={"beat": "conversation"})
     return
 
-  # --- the governed model-authored workflow --------------------------------
-  # FLEXIBLE authors the gated nl2sql plan over the flexible registry; STRICT and
-  # OPEN author the golden plan (their miss handling differs AFTER execution).
+  # --- the governed model-authored workflow (RFC #93) ----------------------
+  # The model AUTHORS the typed WorkflowSpec live (LlmAgent output_schema=
+  # WorkflowSpec); it is validated against the registry and governed. A canned
+  # plan is the fallback if live authoring is off/fails. FLEXIBLE authors the
+  # gated nl2sql plan over the flexible registry; STRICT/OPEN author the golden
+  # plan (their miss handling differs AFTER execution).
   if mode == "flexible":
-    reg, spec = flexible_registry(), author_flexible_plan()
+    reg = flexible_registry()
+    spec = await _author_live(
+        ctx, reg, _flexible_plan_instruction(reg), text, "planner",
+        {"match", "route", "gen", "check", "gate", "adhoc", "fsum", "vreject"},
+    )
+    fallback = spec is None
+    if fallback:
+      spec = author_flexible_plan()
     plan_blurb = (
         "`match → branch(hit: run frozen SQL | miss: nl2sql → dry_run →"
         " branch(valid: run + summarize → pending human approval | else:"
         " reject))`"
     )
   else:
-    reg, spec = golden_registry(), author_golden_plan()
+    reg = golden_registry()
+    spec = await _author_live(
+        ctx, reg, _golden_plan_instruction(reg), text, "planner",
+        {"match", "route", "run", "sum", "deny"},
+    )
+    fallback = spec is None
+    if fallback:
+      spec = author_golden_plan()
     plan_blurb = (
         "`match_verified_query → branch(hit: run the frozen approved SQL +"
         " summarize | miss: refuse)`"
@@ -679,9 +839,16 @@ async def plan_and_run(ctx: Context, node_input):
   record = FrozenWorkflowRecord.freeze(
       spec, planner_model=MODEL, registry=reg, created_at=_now_iso()
   )
+  authored_line = (
+      "🧠 **Model-authored** — the planner (`LlmAgent`, `output_schema="
+      "WorkflowSpec`) emitted this typed plan live (RFC #93)."
+      if not fallback
+      else "🧠 _Plan from the deterministic fallback (live authoring is off, or"
+      " the model returned an off-shape plan this turn)._"
+  )
   yield _msg(
       f"## 🗂️ Governed workflow (mode: **{mode.upper()}**)\n\n"
-      f"The planner authors a typed `WorkflowSpec` over the **{reg.version}**"
+      f"{authored_line}\nThe `WorkflowSpec` composes the **{reg.version}**"
       f" registry — {plan_blurb}."
   )
   yield _msg(
