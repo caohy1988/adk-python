@@ -160,7 +160,12 @@ after which the same question becomes a governed hit.
 - **Model authoring is real, but instruction-guided.** The plan is emitted by the
   model (`LlmAgent(output_schema=WorkflowSpec)`) and validated against the
   registry — but the prompt prescribes the *shape* (fixed node ids) so the demo
-  is reliable on camera, and an off-shape plan falls back to the canned one. The
+  is reliable on camera. The **🧠 Model-authored (live)** label is earned only
+  when the authored plan matches the **exact expected shape** for that mode
+  (`_is_golden_shape` / `_is_flexible_shape` / `_is_adversarial_shape` compare a
+  canonical signature — output binding, route values, branch condition, and the
+  capability/input wiring — not merely which node ids appear); any registry-valid
+  but off-shape plan falls back to the canned one and is labeled as a fallback. The
   *free*, un-prescribed decomposition evidence lives in the sibling samples
   (`authored_workflow_spike` demand gate + `authored_workflow_demo` free-authoring
   beat). The governance argument here does not depend on authoring style: it's the

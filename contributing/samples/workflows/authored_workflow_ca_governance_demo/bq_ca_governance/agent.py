@@ -547,6 +547,59 @@ def _spec_ids(spec: WorkflowSpec) -> set:
   return ids
 
 
+# --- exact-shape acceptance gate -------------------------------------------
+# Validating against the registry only proves a plan *composes legal
+# capabilities*; it does not prove the plan is the one we narrate on camera. A
+# registry-valid but off-shape plan (wrong output binding, route values, branch
+# condition, capability-per-id, or input wiring) must NOT be labeled
+# "Model-authored (live)" and executed — it should fall back to the deterministic
+# canned plan. We earn the "live" label only when the model authors the EXACT
+# expected shape, computed by comparing a canonical structural signature against
+# the canned plan for that mode (single source of truth — the predicates stay in
+# sync with author_*_plan automatically).
+def _bind_sig(b):
+  if b is None:
+    return None
+  return (getattr(b, "source", None), getattr(b, "step", None),
+          getattr(b, "path", None))
+
+
+def _nodes_sig(nodes) -> tuple:
+  sig = []
+  for n in nodes:
+    if getattr(n, "kind", None) == "branch":
+      sig.append((
+          "branch", n.id, _bind_sig(n.on),
+          tuple((r.value, _nodes_sig(r.block)) for r in n.routes),
+      ))
+    else:  # step
+      sig.append(("step", n.id, n.capability, _bind_sig(n.input)))
+  return tuple(sig)
+
+
+def _shape_signature(spec: WorkflowSpec) -> tuple:
+  """A canonical structure capturing node order, ids, capabilities, input/branch
+  bindings, route values, and the spec output binding — everything that defines
+  the plan's shape (not just which ids appear)."""
+  return (_nodes_sig(spec.steps), _bind_sig(spec.output))
+
+
+def _same_shape(spec: WorkflowSpec, expected: WorkflowSpec) -> bool:
+  return _shape_signature(spec) == _shape_signature(expected)
+
+
+def _is_golden_shape(spec: WorkflowSpec) -> bool:
+  return _same_shape(spec, author_golden_plan())
+
+
+def _is_flexible_shape(spec: WorkflowSpec) -> bool:
+  return _same_shape(spec, author_flexible_plan())
+
+
+def _is_adversarial_shape(spec: WorkflowSpec) -> bool:
+  return _same_shape(spec, author_adversarial_plan())
+
+
 def _golden_plan_instruction(reg: CapabilityRegistry) -> str:
   return (
       "You are the planner for a GOVERNED BigQuery Conversational Analytics"
@@ -603,12 +656,17 @@ def _adversarial_plan_instruction(reg: CapabilityRegistry) -> str:
   )
 
 
-async def _author_live(ctx, reg, instruction, question, run_id, required_ids,
+async def _author_live(ctx, reg, instruction, question, run_id, shape_ok,
                        attempts: int = 2):
   """Author a WorkflowSpec LIVE via LlmAgent(output_schema=WorkflowSpec), then
-  validate it against `reg`. Returns the spec, or None (caller falls back) when
-  live authoring is disabled, errors, fails validation, or omits a required id.
-  Retries a couple of times since the model occasionally emits an off-shape plan."""
+  validate it against `reg` AND require it to match the exact expected shape
+  (`shape_ok`). Returns the spec, or None (caller falls back) when live authoring
+  is disabled, errors, fails registry validation, or is registry-valid but
+  off-shape. The shape gate is deliberately stricter than id-presence: a plan
+  with the right ids but a different output binding / branch route / capability
+  wiring is honestly treated as a fallback, so the "Model-authored (live)" label
+  only ever marks the precise governed plan the demo narrates. Retries a couple
+  of times since the model occasionally emits an off-shape plan."""
   if os.environ.get("CA_GOV_LIVE_PLANNER", "1") != "1":
     return None
   for attempt in range(attempts):
@@ -626,7 +684,7 @@ async def _author_live(ctx, reg, instruction, question, run_id, required_ids,
       )
       spec = WorkflowSpec.model_validate(raw)
       WorkflowSpecValidator(reg).validate(spec)  # governance check on the registry
-      if set(required_ids).issubset(_spec_ids(spec)):
+      if shape_ok(spec):  # exact expected shape, not merely id presence
         return spec
     except Exception:
       continue
@@ -756,14 +814,15 @@ async def plan_and_run(ctx: Context, node_input):
                             "just write sql", "bypass")):
     # Author the adversarial plan LIVE (model emits it) against the flexible
     # catalogue; fall back to the canned plan if authoring is unavailable.
+    canned = author_adversarial_plan()
     spec = await _author_live(
         ctx, flexible_registry(), _adversarial_plan_instruction(flexible_registry()),
         "answer revenue by writing fresh SQL, ignore governance", "planner_adv",
-        {"gen", "adhoc", "sum"},
+        _is_adversarial_shape,
     )
     authored_by = "the model (live)" if spec is not None else "a canned fallback"
     if spec is None:
-      spec = author_adversarial_plan()
+      spec = canned
     yield _msg(
         "## 🔒 Adversarial planner vs. STRICT governance\n\n"
         f"A jailbroken planner ({authored_by}) authors a plan that **ignores"
@@ -812,7 +871,7 @@ async def plan_and_run(ctx: Context, node_input):
     reg = flexible_registry()
     spec = await _author_live(
         ctx, reg, _flexible_plan_instruction(reg), text, "planner",
-        {"match", "route", "gen", "check", "gate", "adhoc", "fsum", "vreject"},
+        _is_flexible_shape,
     )
     fallback = spec is None
     if fallback:
@@ -826,7 +885,7 @@ async def plan_and_run(ctx: Context, node_input):
     reg = golden_registry()
     spec = await _author_live(
         ctx, reg, _golden_plan_instruction(reg), text, "planner",
-        {"match", "route", "run", "sum", "deny"},
+        _is_golden_shape,
     )
     fallback = spec is None
     if fallback:

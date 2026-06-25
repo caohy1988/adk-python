@@ -252,7 +252,47 @@ async def test_live_authoring_disabled_returns_none(monkeypatch):
   reg = demo.golden_registry()
   spec = await demo._author_live(
       None, reg, demo._golden_plan_instruction(reg), "q", "planner",
-      {"match", "route"})
+      demo._is_golden_shape)
+  assert spec is None
+
+
+def test_shape_predicates_accept_canned_and_reject_cross_mode():
+  """Each canned plan is its own expected shape; another mode's plan is not."""
+  assert demo._is_golden_shape(demo.author_golden_plan())
+  assert demo._is_flexible_shape(demo.author_flexible_plan())
+  assert demo._is_adversarial_shape(demo.author_adversarial_plan())
+  assert not demo._is_golden_shape(demo.author_flexible_plan())
+  assert not demo._is_golden_shape(demo.author_adversarial_plan())
+  assert not demo._is_adversarial_shape(demo.author_golden_plan())
+
+
+def test_offshape_but_registry_valid_plan_fails_the_shape_gate():
+  """A plan with all the right ids/capabilities but a different OUTPUT binding is
+  still registry-valid — so the old id-presence gate would have accepted it — yet
+  it must fail the exact-shape gate so the live label + execution fall back."""
+  spec = demo.author_golden_plan()
+  spec.output = demo.Binding(source="step", step="match")  # was step 'route'
+  demo.WorkflowSpecValidator(demo.golden_registry()).validate(spec)  # still valid
+  assert {"match", "route", "run", "sum", "deny"} <= demo._spec_ids(spec)  # ids OK
+  assert not demo._is_golden_shape(spec)  # ...but not the narrated shape
+
+
+@pytest.mark.asyncio
+async def test_live_authoring_offshape_plan_falls_back(monkeypatch):
+  """With the live planner ON, a registry-valid but off-shape authored plan makes
+  `_author_live` return None so the caller honestly uses the canned fallback."""
+  monkeypatch.setenv("CA_GOV_LIVE_PLANNER", "1")
+  offshape = demo.author_golden_plan()
+  offshape.output = demo.Binding(source="step", step="match")
+
+  class _Ctx:
+    async def run_node(self, planner, node_input, run_id):
+      return offshape.model_dump()
+
+  reg = demo.golden_registry()
+  spec = await demo._author_live(
+      _Ctx(), reg, demo._golden_plan_instruction(reg), "q", "planner",
+      demo._is_golden_shape, attempts=1)
   assert spec is None
 
 
