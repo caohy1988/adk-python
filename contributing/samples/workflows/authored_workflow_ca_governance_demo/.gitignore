@@ -1,0 +1,3 @@
+# Runtime-generated verified-query / frozen-plan store (the demo's ArtifactService stand-in).
+ca_gov_store/
+__pycache__/
