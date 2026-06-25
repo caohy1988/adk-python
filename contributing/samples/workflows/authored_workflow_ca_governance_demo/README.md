@@ -5,6 +5,21 @@ the model-authored-workflow engine (RFC #93 / #92). It shows how to restrict CA
 to **governed ("golden"/verified) queries** — *structurally*, not with a prompt —
 while still falling back to a **normal agentic** answer when policy allows.
 
+> **Punchline.** A human-compiled workflow hardcodes one policy path; a
+> **model-authored** workflow lets the model adapt the plan to the question —
+> **while the registry prevents it from granting itself new authority**. The
+> model is allowed to author the workflow, but not to choose its own powers.
+
+Three points it makes to leadership:
+
+1. **Adaptive without losing control** — the model authors the workflow for the
+   question, but may compose only **approved capabilities**.
+2. **Governance is structural, not prompt-based** — STRICT does not expose
+   `nl2sql`, so even a *model-authored* SQL plan is rejected before anything runs.
+3. **A safe path from discovery to governance** — FLEXIBLE lets the model
+   generate and validate a candidate, but **only human approval** adds it to the
+   governed pool.
+
 > The control point is the engine's `CapabilityRegistry`: a model-authored
 > `WorkflowSpec` may only compose capabilities in the registry, and the
 > `WorkflowSpecValidator` **rejects** any plan that references one that is not.

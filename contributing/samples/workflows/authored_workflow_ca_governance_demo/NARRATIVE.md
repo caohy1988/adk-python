@@ -2,7 +2,39 @@
 
 A short narrative for walking a technical-leadership audience through the demo.
 It maps each beat to the argument it settles. (Generic framing — fill in your own
-customer examples when you present.)
+customer examples when you present.) Tell it **governance-first, model-authoring
+second** — the key line is:
+
+> **The model is allowed to author the workflow, but it is not allowed to choose
+> its own powers.**
+
+## Punchline
+
+> **A human-compiled workflow hardcodes one policy path; a model-authored
+> workflow lets the model adapt the plan to the question — while the registry
+> prevents it from granting itself new authority.**
+
+That is *why* model authoring earns its place here: it separates **who proposes
+the plan** (the model) from **who grants authority** (the registry + validator +
+human approval). The model authors; the registry limits; the validator enforces;
+the frozen record audits; the human approves promotion. Three points to land:
+
+1. **Adaptive without losing control** — the model authors the workflow for the
+   user's question, but it can only compose **approved capabilities**.
+2. **Governance is structural, not prompt-based** — STRICT does not expose
+   `nl2sql`, so even a *model-authored* SQL plan is rejected **before anything
+   runs** (beat 2).
+3. **A safe path from discovery to governance** — FLEXIBLE lets the model
+   generate and validate a candidate, but **only human approval** adds it to the
+   governed pool (beat 5).
+
+*Honest framing of point 1 on camera:* in **this** demo the plan *shape* is
+instruction-guided (and exact-shape-gated) for reliability, so what the model
+adapts per question is the **dial/mode, the match-vs-`nl2sql` branch it takes at
+runtime, and the SQL content** — not free structural decomposition. The
+unconstrained-authoring evidence lives in the sibling `authored_workflow_spike`
+/ `authored_workflow_demo` samples. The governance guarantee — *can't self-grant
+authority* — holds regardless of authoring style, which is the whole point.
 
 ## The ask, and why the obvious answer fails
 
