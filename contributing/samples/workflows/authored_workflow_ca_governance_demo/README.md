@@ -60,6 +60,11 @@ export GOOGLE_CLOUD_LOCATION=global
 export CA_GOV_MODEL=gemini-3.5-flash
 ```
 
+The plan is **authored live by the model** (`LlmAgent(output_schema=WorkflowSpec)`)
+and validated against the registry — RFC #93 in action. Set `CA_GOV_LIVE_PLANNER=0`
+to force the deterministic canned plans (e.g. for fully offline runs); the demo
+also falls back to them automatically if live authoring returns an off-shape plan.
+
 Real query execution is billed to `GOOGLE_CLOUD_PROJECT` with safety rails
 (`maximum_bytes_billed` = 2 GB/query, 500-row cap). Without credentials (or with
 `CA_GOV_USE_BIGQUERY=0`) execution degrades to a deterministic micro-warehouse —
@@ -92,6 +97,9 @@ revenue*, *how many orders in each status*, *monthly revenue trend*.
 
 What to point at as each one streams:
 
+- **🧠 Model-authored** — the planner (`LlmAgent`, `output_schema=WorkflowSpec`)
+  emitted this typed plan **live** (RFC #93); it's then governed by the registry.
+  (Shows the deterministic-fallback note instead when live authoring is off.)
 - **🗂️ authored plan** — a typed `WorkflowSpec` over the **golden registry**.
 - **✅ validation** — clean against the governed registry; the rejection in beat 2.
 - **🔒 freeze** — `spec_hash`, exported `FrozenWorkflowRecord` (portable,
@@ -149,6 +157,14 @@ after which the same question becomes a governed hit.
 - Seed golden queries are **real, schema-grounded SQL** validated against
   `thelook_ecommerce`. The frozen-plan store under `ca_gov_store/` stands in for
   an `ArtifactService`.
+- **Model authoring is real, but instruction-guided.** The plan is emitted by the
+  model (`LlmAgent(output_schema=WorkflowSpec)`) and validated against the
+  registry — but the prompt prescribes the *shape* (fixed node ids) so the demo
+  is reliable on camera, and an off-shape plan falls back to the canned one. The
+  *free*, un-prescribed decomposition evidence lives in the sibling samples
+  (`authored_workflow_spike` demand gate + `authored_workflow_demo` free-authoring
+  beat). The governance argument here does not depend on authoring style: it's the
+  **validator + registry** that enforce policy, regardless of who wrote the plan.
 - The point is not nl2sql quality; it is that **golden-only is enforced by the
   workflow engine, and a normal agentic answer is one dial-turn away.**
 

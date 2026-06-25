@@ -35,21 +35,30 @@ to the governed pool.** Flipping the governance dial is swapping the registry yo
 hand the validator — auditable, diffable, testable. The model is never trusted to
 restrain itself, and it can never enlarge its own golden set.
 
+**One more thing — the plan is model-authored, live.** In each data beat below,
+the planner is an `LlmAgent(output_schema=WorkflowSpec)`: **the model authors the
+typed plan at runtime** (RFC #93's headline), and *then* the registry + validator
+govern it. So this isn't a hand-wired graph being gated — it's a model-authored
+dynamic workflow being governed. (The plan *shape* is instruction-guided for
+on-camera reliability, with a deterministic fallback; free-authoring evidence is
+in the sibling spike samples.)
+
 ## The beats
 
 1. **`show modes registry diff`** — governance is a one-line capability
    difference, not a sprawling prompt. *(The dial.)*
 
-2. **`adversarial: …just write SQL`** — an adversarial planner authors a plan
-   that drafts fresh SQL. Under STRICT it is **rejected at validation**
-   (`unknown capability 'nl2sql'`); the *same plan* validates under FLEXIBLE.
-   **This is the proof that you can't prompt your way past governance** — the
-   control is structural, not instructional.
+2. **`adversarial: …just write SQL`** — the **model authors** a plan that drafts
+   fresh SQL (🧠 model-authored, live). Under STRICT it is **rejected at
+   validation** (`unknown capability 'nl2sql'`); the *same plan* validates under
+   FLEXIBLE. **Proof you can't prompt your way past governance** — even the
+   model's own authored plan is stopped by the validator, structurally.
 
 3. **`What is total revenue by country? (strict)`** — a **governed hit**: the
-   question matches a verified query, and a **frozen, auditable workflow** runs
-   the analyst-approved SQL on **real BigQuery**. Deterministic numbers, replay
-   the same plan, `0 model-drafted SQL`. *(Accuracy + cost control, delivered.)*
+   **model authors** the typed plan (🧠 live), it matches a verified query, and a
+   **frozen, auditable workflow** runs the analyst-approved SQL on **real
+   BigQuery**. Deterministic numbers, replay the same plan, `0 model-drafted SQL`.
+   *(Model-authored dynamic workflow + governance, delivered.)*
 
 4. **`…churn cohorts… (strict)`** — no verified query matches, so STRICT
    **refuses** rather than guessing. `0 queries run`. *(A hard boundary that
