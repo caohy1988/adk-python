@@ -3436,6 +3436,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # #321: when both payload columns are projected out, skip content parsing
     # entirely -- no inline summary, no parts, and (critically) no GCS offload
     # work for a row that retains neither payload column.
+    content_json: Any
+    content_parts: list[dict[str, Any]]
+    parser_truncated: bool
     if {"content", "content_parts"} <= self._denied_columns:
       content_json, content_parts, parser_truncated = None, [], False
     else:
