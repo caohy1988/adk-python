@@ -9109,3 +9109,104 @@ def test_enrich_attributes_no_otel_when_span_invalid(callback_context):
         bigquery_agent_analytics_plugin.EventData(), callback_context
     )
   assert "otel" not in attrs
+
+
+class _FakeTable:
+  """Minimal stand-in for a bigquery.Table for schema-upgrade tests."""
+
+  def __init__(self, schema, labels):
+    self.schema = schema
+    self.labels = labels
+
+
+def test_schema_upgrade_adds_columns_when_denylist_relaxed():
+  # Table was created under a restrictive projection (missing content +
+  # attributes) but its version label is current. Relaxing the denylist must
+  # still add the now-desired columns instead of early-returning on the label.
+  plugin = _make_offline_plugin(
+      bigquery_agent_analytics_plugin.BigQueryLoggerConfig()
+  )
+  full = bigquery_agent_analytics_plugin._get_events_schema()
+  plugin._schema = full  # desired = full schema (denylist relaxed)
+  plugin.full_table_id = "p.d.t"
+  plugin.client = mock.Mock()
+  projected = [f for f in full if f.name not in ("content", "attributes")]
+  existing = _FakeTable(
+      schema=list(projected),
+      labels={
+          bigquery_agent_analytics_plugin._SCHEMA_VERSION_LABEL_KEY: (
+              bigquery_agent_analytics_plugin._SCHEMA_VERSION
+          )
+      },
+  )
+  plugin._maybe_upgrade_schema(existing)
+  plugin.client.update_table.assert_called_once()
+  names = {f.name for f in existing.schema}
+  assert "content" in names and "attributes" in names
+
+
+def test_schema_upgrade_noop_when_current_and_complete():
+  plugin = _make_offline_plugin(
+      bigquery_agent_analytics_plugin.BigQueryLoggerConfig()
+  )
+  full = bigquery_agent_analytics_plugin._get_events_schema()
+  plugin._schema = full
+  plugin.full_table_id = "p.d.t"
+  plugin.client = mock.Mock()
+  existing = _FakeTable(
+      schema=list(full),
+      labels={
+          bigquery_agent_analytics_plugin._SCHEMA_VERSION_LABEL_KEY: (
+              bigquery_agent_analytics_plugin._SCHEMA_VERSION
+          )
+      },
+  )
+  plugin._maybe_upgrade_schema(existing)
+  plugin.client.update_table.assert_not_called()
+
+
+def test_attributes_denylist_with_custom_metadata_rejected():
+  with pytest.raises(ValueError):
+    _make_offline_plugin(
+        bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+            payload_column_denylist=["attributes"],
+            custom_metadata_allowlist=["citation_metadata"],
+        )
+    )
+
+
+def test_attributes_denylist_without_custom_metadata_ok():
+  plugin = _make_offline_plugin(
+      bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+          payload_column_denylist=["attributes"]
+      )
+  )
+  assert "attributes" in plugin._denied_columns
+
+
+def test_enrich_attributes_skips_otel_when_attributes_denied(callback_context):
+  plugin = _make_offline_plugin(
+      bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+          payload_column_denylist=["attributes"]
+      )
+  )
+  ctx = trace.SpanContext(
+      trace_id=0x1234567890ABCDEF1234567890ABCDEF,
+      span_id=0xFEEDFACECAFEBEEF,
+      is_remote=False,
+      trace_flags=trace.TraceFlags(trace.TraceFlags.SAMPLED),
+  )
+  fake_span = mock.Mock()
+  fake_span.get_span_context.return_value = ctx
+  with (
+      mock.patch.object(plugin, "_build_adk_envelope", return_value={}),
+      mock.patch.object(
+          bigquery_agent_analytics_plugin.trace,
+          "get_current_span",
+          return_value=fake_span,
+      ),
+  ):
+    attrs = plugin._enrich_attributes(
+        bigquery_agent_analytics_plugin.EventData(), callback_context
+    )
+  assert "otel" not in attrs

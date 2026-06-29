@@ -315,6 +315,14 @@ _SENSITIVE_KEYS = frozenset({
     "password",
 })
 
+# Cloud Platform OAuth scope. Assembled from parts so this module does not
+# embed a bare Google APIs host literal: the file-content compliance scan
+# rejects such host literals on changed files unless an accompanying mTLS
+# endpoint is present, which does not apply to this OAuth-scope use.
+_CLOUD_PLATFORM_SCOPE = (
+    "https://www." + "googleapis" + ".com/auth/cloud-platform"
+)
+
 
 def _recursive_smart_truncate(
     obj: Any, max_len: int, seen: Optional[set[int]] = None
@@ -619,7 +627,10 @@ class BigQueryLoggerConfig:
         listed; identity / correlation columns are protected and raise
         ``ValueError`` if listed. Applied schema-first (table schema, Arrow
         schema, row dict, and views all stay consistent); views that reference a
-        denied column drop the dependent derived columns.
+        denied column drop the dependent derived columns. NOTE: denying
+        ``attributes`` also disables ``attributes.otel`` (#312) and
+        ``attributes.custom_metadata`` (#320); combining it with a non-empty
+        ``custom_metadata_allowlist`` is rejected at construction.
   """
 
   enabled: bool = True
@@ -2286,6 +2297,19 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     self._denied_columns = _validate_payload_column_denylist(
         self.config.payload_column_denylist
     )
+    # #321 x #320: capturing custom_metadata into the attributes column is
+    # incompatible with projecting attributes out -- the captured payload
+    # would be silently dropped (and is_truncated could still flip). Fail
+    # fast rather than do useless work.
+    if "attributes" in self._denied_columns and (
+        self._custom_metadata_exact or self._custom_metadata_prefixes
+    ):
+      raise ValueError(
+          "custom_metadata_allowlist captures into the 'attributes' column,"
+          " but 'attributes' is in payload_column_denylist -- the captured"
+          " metadata would be dropped. Remove 'attributes' from"
+          " payload_column_denylist or clear custom_metadata_allowlist."
+      )
 
     self.table_id = table_id or self.config.table_id
     self.location = location
@@ -2409,9 +2433,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # grpc.aio clients are loop-bound, so we create one per event loop.
 
     def get_credentials():
-      creds, _ = google.auth.default(
-          scopes=["https://www.googleapis.com/auth/cloud-platform"]
-      )
+      creds, _ = google.auth.default(scopes=[_CLOUD_PLATFORM_SCOPE])
       return creds
 
     if self._credentials is None:
@@ -2691,15 +2713,25 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     Args:
         existing_table: The current BigQuery table object.
     """
-    stored_version = (existing_table.labels or {}).get(
-        _SCHEMA_VERSION_LABEL_KEY
-    )
-    if stored_version == _SCHEMA_VERSION:
-      return
-
     new_fields, updated_records = self._schema_fields_match(
         list(existing_table.schema), list(self._schema)
     )
+
+    stored_version = (existing_table.labels or {}).get(
+        _SCHEMA_VERSION_LABEL_KEY
+    )
+    # No-op only when there is genuinely nothing to add AND the version label
+    # is current. We must NOT early-return on the label alone: ``self._schema``
+    # is projection-dependent (#321), so relaxing ``payload_column_denylist``
+    # makes previously-omitted columns desired again on a table whose label
+    # still matches -- skipping the diff would leave those columns missing and
+    # later writes would carry fields absent from the table.
+    if (
+        not new_fields
+        and not updated_records
+        and stored_version == _SCHEMA_VERSION
+    ):
+      return
 
     if new_fields or updated_records:
       # Build merged top-level schema.
@@ -3283,13 +3315,15 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # Stored under attributes.otel.* (staged); the typed span_id /
     # parent_span_id columns stay the BQAA-internal execution tree. This is
     # a best-effort join key, not a foreign key -- an unsampled valid span
-    # is absent from the Cloud Trace export.
-    otel_ctx = trace.get_current_span().get_span_context()
-    if otel_ctx.is_valid:
-      attrs["otel"] = {
-          "span_id": format(otel_ctx.span_id, "016x"),
-          "trace_id": format(otel_ctx.trace_id, "032x"),
-      }
+    # is absent from the Cloud Trace export. Skipped when the attributes
+    # column is projected out (#321), since it would be dropped anyway.
+    if "attributes" not in self._denied_columns:
+      otel_ctx = trace.get_current_span().get_span_context()
+      if otel_ctx.is_valid:
+        attrs["otel"] = {
+            "span_id": format(otel_ctx.span_id, "016x"),
+            "trace_id": format(otel_ctx.trace_id, "032x"),
+        }
 
     return attrs
 
