@@ -36,6 +36,7 @@ import os
 os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 
 import random
+import re
 import time
 from types import MappingProxyType
 from typing import Any
@@ -606,6 +607,19 @@ class BigQueryLoggerConfig:
         views like ``v_llm_request``. Set a distinct prefix per table when
         multiple plugin instances share one dataset to avoid view-name
         collisions.
+      custom_metadata_allowlist: Keys to capture from ``event.custom_metadata``
+        into ``attributes.custom_metadata.*`` (#320). Entries are exact keys, or
+        explicit prefix patterns ending in ``*`` (e.g. ``"a2a:*"``). ``None`` /
+        empty preserves today's behavior (only the built-in ``a2a:*`` path runs).
+        Captured values pass the same safety pipeline (truncation, sensitive-key
+        redaction, circular-reference handling) as all other logged content.
+      payload_column_denylist: Payload columns to project OUT of the table at
+        write time (#321). Only the projectable payload columns
+        ``content`` / ``content_parts`` / ``attributes`` / ``latency_ms`` may be
+        listed; identity / correlation columns are protected and raise
+        ``ValueError`` if listed. Applied schema-first (table schema, Arrow
+        schema, row dict, and views all stay consistent); views that reference a
+        denied column drop the dependent derived columns.
   """
 
   enabled: bool = True
@@ -651,6 +665,18 @@ class BigQueryLoggerConfig:
   # to avoid view-name collisions (e.g. ``"v_staging"`` →
   # ``v_staging_llm_request``).
   view_prefix: str = "v"
+
+  # --- #320: generic custom_metadata capture (allowlist) ---
+  # Exact keys and/or explicit ``*``-suffixed prefix patterns to capture
+  # from ``event.custom_metadata`` into ``attributes.custom_metadata.*``.
+  # None/empty preserves today's behavior (only the built-in ``a2a:*`` path).
+  custom_metadata_allowlist: list[str] | None = None
+
+  # --- #321: physical column projection (denylist-first) ---
+  # Payload columns to omit from the table at write time.  Only the
+  # projectable payload columns are accepted; identity/correlation columns
+  # are protected (see ``_PROJECTABLE_PAYLOAD_COLUMNS``).
+  payload_column_denylist: list[str] | None = None
 
 
 # ==============================================================================
@@ -1727,15 +1753,23 @@ def _get_events_schema() -> list[bigquery.SchemaField]:
           "span_id",
           "STRING",
           mode="NULLABLE",
-          description="OpenTelemetry span ID for this specific operation.",
+          description=(
+              "BQAA-internal execution-tree span id for this operation. This is"
+              " the plugin's own correlation id used with parent_span_id to"
+              " reconstruct the agent/LLM/tool tree -- NOT the OpenTelemetry"
+              " span id, except on the root/invocation row where it may reuse"
+              " the ambient OTel span id. For span-level Cloud Trace"
+              " correlation use attributes.otel.span_id (best-effort)."
+          ),
       ),
       bigquery.SchemaField(
           "parent_span_id",
           "STRING",
           mode="NULLABLE",
           description=(
-              "OpenTelemetry parent span ID to reconstruct the operation"
-              " hierarchy."
+              "BQAA-internal parent execution-tree span id, used to reconstruct"
+              " the operation hierarchy. Points at another BQAA row, not an"
+              " OpenTelemetry parent span."
           ),
       ),
       bigquery.SchemaField(
@@ -1852,7 +1886,9 @@ def _get_events_schema() -> list[bigquery.SchemaField]:
               " additional event metadata. Includes enrichment fields like"
               " 'root_agent_name' (turn orchestration), 'model' (request"
               " model), 'model_version' (response version), and"
-              " 'usage_metadata' (detailed token counts)."
+              " 'usage_metadata' (detailed token counts). May also carry"
+              " 'otel' (best-effort ambient Cloud Trace span/trace ids) and"
+              " 'custom_metadata' (allowlisted event.custom_metadata keys)."
           ),
       ),
       bigquery.SchemaField(
@@ -1881,11 +1917,74 @@ def _get_events_schema() -> list[bigquery.SchemaField]:
           "BOOLEAN",
           mode="NULLABLE",
           description=(
-              "Boolean flag indicating if the 'content' field was truncated"
-              " because it exceeded the maximum allowed size."
+              "Boolean flag indicating if the content or metadata payload was"
+              " truncated because it exceeded the maximum allowed size. Set"
+              " when 'content', captured 'custom_metadata', or A2A metadata is"
+              " truncated; redaction of sensitive keys does not set this flag."
           ),
       ),
   ]
+
+
+# Payload columns eligible for physical projection (#321).  Every other
+# schema column is an identity / correlation / view-critical column and is
+# *protected* — it cannot be projected out, because the BQAA execution tree
+# and the per-event views depend on it.
+_PROJECTABLE_PAYLOAD_COLUMNS = frozenset(
+    {"content", "content_parts", "attributes", "latency_ms"}
+)
+
+
+def _validate_payload_column_denylist(
+    denylist: Optional[list[str]],
+) -> frozenset[str]:
+  """Validates ``payload_column_denylist`` and returns the denied set.
+
+  Only the projectable payload columns may be denied.  Anything else —
+  an identity/correlation column or an unknown name — is a hard error,
+  so a typo or an attempt to drop a join key fails loudly at construction
+  rather than producing malformed rows or broken views.
+  """
+  denied = frozenset(denylist or ())
+  invalid = denied - _PROJECTABLE_PAYLOAD_COLUMNS
+  if invalid:
+    raise ValueError(
+        "payload_column_denylist may only contain projectable payload"
+        f" columns {sorted(_PROJECTABLE_PAYLOAD_COLUMNS)}; got"
+        f" {sorted(invalid)}. Identity/correlation columns (timestamp,"
+        " event_type, session_id, invocation_id, trace_id, span_id,"
+        " parent_span_id, is_truncated, ...) are protected and cannot be"
+        " projected out."
+    )
+  return denied
+
+
+def _project_schema(
+    schema: list[bigquery.SchemaField], denied: frozenset[str]
+) -> list[bigquery.SchemaField]:
+  """Returns *schema* with denied columns removed (schema-first projection)."""
+  if not denied:
+    return schema
+  return [f for f in schema if f.name not in denied]
+
+
+def _parse_custom_metadata_allowlist(
+    allowlist: Optional[list[str]],
+) -> tuple[frozenset[str], tuple[str, ...]]:
+  """Splits the allowlist into exact keys and explicit prefix patterns (#320).
+
+  An entry ending in ``*`` is an explicit prefix pattern (the ``*`` is
+  stripped); every other entry matches exactly.  This keeps a plain key
+  like ``"citation_metadata"`` from being treated as a prefix.
+  """
+  exact: set[str] = set()
+  prefixes: list[str] = []
+  for entry in allowlist or ():
+    if entry.endswith("*"):
+      prefixes.append(entry[:-1])
+    else:
+      exact.add(entry)
+  return frozenset(exact), tuple(prefixes)
 
 
 # ==============================================================================
@@ -2179,6 +2278,15 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     if not self.config.view_prefix:
       raise ValueError("view_prefix must be a non-empty string.")
 
+    # #320: pre-parse the custom_metadata allowlist into exact keys + prefixes.
+    self._custom_metadata_exact, self._custom_metadata_prefixes = (
+        _parse_custom_metadata_allowlist(self.config.custom_metadata_allowlist)
+    )
+    # #321: validate (fail-closed on protected/unknown columns) the projection.
+    self._denied_columns = _validate_payload_column_denylist(
+        self.config.payload_column_denylist
+    )
+
     self.table_id = table_id or self.config.table_id
     self.location = location
 
@@ -2403,7 +2511,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
     self.full_table_id = f"{self.project_id}.{self.dataset_id}.{self.table_id}"
     if not self._schema:
-      self._schema = _get_events_schema()
+      # #321: project out denied payload columns schema-first, so the table
+      # schema, Arrow schema, row dict, and views all stay consistent.
+      self._schema = _project_schema(_get_events_schema(), self._denied_columns)
       await loop.run_in_executor(self._executor, self._ensure_schema_exists)
 
     if not self.parser:
@@ -2634,6 +2744,27 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           exc_info=True,
       )
 
+  def _project_view_columns(self, extra_cols: list[str]) -> list[str]:
+    """Drops derived view expressions that reference a denied column (#321).
+
+    Each entry is a ``"SQL_EXPR AS alias"`` string referencing payload
+    columns (``content`` / ``attributes`` / ``latency_ms``) as bare
+    identifiers.  When such a column is projected out, its dependent view
+    columns must go too, otherwise the view SQL references a non-existent
+    column and view creation fails.
+    """
+    if not self._denied_columns:
+      return list(extra_cols)
+    kept: list[str] = []
+    for expr in extra_cols:
+      if any(
+          re.search(rf"\b{re.escape(col)}\b", expr)
+          for col in self._denied_columns
+      ):
+        continue
+      kept.append(expr)
+    return kept
+
   def _create_analytics_views(self) -> None:
     """Creates per-event-type BigQuery views (idempotent).
 
@@ -2644,7 +2775,11 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     """
     for event_type, extra_cols in _EVENT_VIEW_DEFS.items():
       view_name = self.config.view_prefix + "_" + event_type.lower()
-      columns = ",\n  ".join(list(_VIEW_COMMON_COLUMNS) + extra_cols)
+      # #321: projection-aware views -- drop any derived column whose SQL
+      # references a denied payload column (content / attributes / latency_ms).
+      # Common columns are all protected, so they always remain.
+      projected_extra = self._project_view_columns(extra_cols)
+      columns = ",\n  ".join(list(_VIEW_COMMON_COLUMNS) + projected_extra)
       sql = _VIEW_SQL_TEMPLATE.format(
           project=self.project_id,
           dataset=self.dataset_id,
@@ -3143,7 +3278,61 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     if self.config.custom_tags:
       attrs["custom_tags"] = self.config.custom_tags
 
+    # #312: best-effort span-level Cloud Trace correlation. Capture the
+    # ambient OTel span context at row-emission time, ONLY when it is valid.
+    # Stored under attributes.otel.* (staged); the typed span_id /
+    # parent_span_id columns stay the BQAA-internal execution tree. This is
+    # a best-effort join key, not a foreign key -- an unsampled valid span
+    # is absent from the Cloud Trace export.
+    otel_ctx = trace.get_current_span().get_span_context()
+    if otel_ctx.is_valid:
+      attrs["otel"] = {
+          "span_id": format(otel_ctx.span_id, "016x"),
+          "trace_id": format(otel_ctx.trace_id, "032x"),
+      }
+
     return attrs
+
+  def _custom_metadata_allowed(self, key: Any) -> bool:
+    """Returns whether *key* matches the #320 allowlist (exact or prefix)."""
+    if not isinstance(key, str):
+      return False
+    if key in self._custom_metadata_exact:
+      return True
+    return any(key.startswith(p) for p in self._custom_metadata_prefixes)
+
+  def _capture_custom_metadata(
+      self, event_data: EventData, attributes: dict[str, Any]
+  ) -> bool:
+    """Captures allowlisted ``custom_metadata`` into ``attributes`` (#320).
+
+    Reads ``event.custom_metadata`` from the row's source Event, keeps only
+    allowlisted keys, runs them through the shared safety pipeline
+    (truncation + sensitive-key redaction + circular-reference handling),
+    and writes the result under ``attributes['custom_metadata']``.
+
+    The built-in ``a2a:*`` handling in ``on_event_callback`` is unaffected;
+    this is purely additive under a separate namespace.
+
+    Returns:
+        True if any captured value was truncated (so the caller can flip
+        ``is_truncated``).
+    """
+    source = event_data.source_event
+    meta = getattr(source, "custom_metadata", None) if source else None
+    if not meta:
+      return False
+    captured = {
+        k: v for k, v in meta.items() if self._custom_metadata_allowed(k)
+    }
+    if not captured:
+      return False
+    safe, truncated = _recursive_smart_truncate(
+        captured, self.config.max_content_length
+    )
+    if isinstance(safe, dict) and safe:
+      attributes["custom_metadata"] = safe
+    return bool(truncated)
 
   async def _log_event(
       self,
@@ -3207,6 +3396,14 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     latency_json = self._extract_latency(event_data)
     attributes = self._enrich_attributes(event_data, callback_context)
 
+    # #320: capture allowlisted custom_metadata into attributes.custom_metadata.
+    # Runs for every row emitted from a source Event (incl. AGENT_RESPONSE,
+    # which does not otherwise read custom_metadata), through the same safety
+    # pipeline. Truncation here also flips is_truncated.
+    if self._custom_metadata_exact or self._custom_metadata_prefixes:
+      meta_truncated = self._capture_custom_metadata(event_data, attributes)
+      is_truncated = is_truncated or meta_truncated
+
     # Serialize attributes to JSON string
     try:
       attributes_json = json.dumps(attributes)
@@ -3235,6 +3432,11 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         "error_message": event_data.error_message,
         "is_truncated": is_truncated,
     }
+
+    # #321: drop denied payload columns from the row so it matches the
+    # projected table / Arrow schema exactly (schema-first consistency).
+    if self._denied_columns:
+      row = {k: v for k, v in row.items() if k not in self._denied_columns}
 
     state = await self._get_loop_state()
     await state.batch_processor.append(row)
