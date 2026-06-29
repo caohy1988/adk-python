@@ -2545,14 +2545,28 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
       self.offloader = None
       if self.config.gcs_bucket_name:
-        self.offloader = GCSOffloader(
-            self.project_id,
-            self.config.gcs_bucket_name,
-            self._executor,
-            storage_client=storage.Client(
-                project=self.project_id, credentials=self._credentials
-            ),
-        )
+        if "content_parts" in self._denied_columns:
+          # #321: GCS offload stores its object reference in the
+          # ``content_parts`` column. With ``content_parts`` projected out,
+          # an upload would be orphaned -- payload leaks to GCS and incurs
+          # cost with no retained reference. Disable offload and keep
+          # content inline (truncated) instead.
+          logger.warning(
+              "GCS offload disabled: payload_column_denylist drops"
+              " 'content_parts', which holds the offloaded object reference;"
+              " large/binary content is kept inline (truncated) instead of"
+              " being uploaded to %s.",
+              self.config.gcs_bucket_name,
+          )
+        else:
+          self.offloader = GCSOffloader(
+              self.project_id,
+              self.config.gcs_bucket_name,
+              self._executor,
+              storage_client=storage.Client(
+                  project=self.project_id, credentials=self._credentials
+              ),
+          )
 
       self.parser = HybridContentParser(
           self.offloader,
@@ -3419,12 +3433,18 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       logger.warning("Parser not initialized; skipping event %s.", event_type)
       return
 
-    # Update parser's trace/span IDs for GCS pathing (reuse instance)
-    self.parser.trace_id = trace_id or "no_trace"
-    self.parser.span_id = span_id or "no_span"
-    content_json, content_parts, parser_truncated = await self.parser.parse(
-        raw_content
-    )
+    # #321: when both payload columns are projected out, skip content parsing
+    # entirely -- no inline summary, no parts, and (critically) no GCS offload
+    # work for a row that retains neither payload column.
+    if {"content", "content_parts"} <= self._denied_columns:
+      content_json, content_parts, parser_truncated = None, [], False
+    else:
+      # Update parser's trace/span IDs for GCS pathing (reuse instance)
+      self.parser.trace_id = trace_id or "no_trace"
+      self.parser.span_id = span_id or "no_span"
+      content_json, content_parts, parser_truncated = await self.parser.parse(
+          raw_content
+      )
     is_truncated = is_truncated or parser_truncated
 
     latency_json = self._extract_latency(event_data)
