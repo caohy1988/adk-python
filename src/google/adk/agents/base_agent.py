@@ -296,24 +296,24 @@ class BaseAgent(BaseNode, abc.ABC):
 
     ctx = self._create_invocation_context(parent_context)
     async with _instrumentation.record_agent_invocation(ctx, self):
-      if event := await self._handle_before_agent_callback(ctx):
-        yield event
-      if ctx.end_invocation:
-        return
-
       try:
+        if event := await self._handle_before_agent_callback(ctx):
+          yield event
+        if ctx.end_invocation:
+          return
+
         async with Aclosing(self._run_async_impl(ctx)) as agen:
           async for event in agen:
             yield event
+
+        if ctx.end_invocation:
+          return
+
+        if event := await self._handle_after_agent_callback(ctx):
+          yield event
       except Exception as e:
         await self._handle_agent_error_callback(ctx, e)
         raise
-
-      if ctx.end_invocation:
-        return
-
-      if event := await self._handle_after_agent_callback(ctx):
-        yield event
 
   @override
   async def _run_impl(
@@ -351,21 +351,21 @@ class BaseAgent(BaseNode, abc.ABC):
 
     ctx = self._create_invocation_context(parent_context)
     async with _instrumentation.record_agent_invocation(ctx, self):
-      if event := await self._handle_before_agent_callback(ctx):
-        yield event
-      if ctx.end_invocation:
-        return
-
       try:
+        if event := await self._handle_before_agent_callback(ctx):
+          yield event
+        if ctx.end_invocation:
+          return
+
         async with Aclosing(self._run_live_impl(ctx)) as agen:
           async for event in agen:
             yield event
+
+        if event := await self._handle_after_agent_callback(ctx):
+          yield event
       except Exception as e:
         await self._handle_agent_error_callback(ctx, e)
         raise
-
-      if event := await self._handle_after_agent_callback(ctx):
-        yield event
 
   async def _run_async_impl(
       self, ctx: InvocationContext

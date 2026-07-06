@@ -20,7 +20,6 @@ Validates RFC #5044: agent-level and runner-level error callbacks.
 import asyncio
 from typing import AsyncGenerator
 from typing import Optional
-from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
 from google.adk.agents.base_agent import BaseAgent
@@ -30,11 +29,10 @@ from google.adk.events.event import Event
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.plugins.plugin_manager import PluginManager
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.workflow._base_node import BaseNode
 from google.genai import types
 import pytest
 from typing_extensions import override
-
-from google.adk.workflow._base_node import BaseNode
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -212,6 +210,45 @@ class TestAgentErrorCallback:
       _ = [e async for e in agent.run_async(ctx)]
 
     assert not plugin.after_agent_called
+
+  @pytest.mark.asyncio
+  async def test_agent_error_callback_fires_on_before_callback_failure(self):
+    """Error callback fires when before_agent_callback raises.
+
+    The error handler wraps the full agent lifecycle, so lifecycle-callback
+    failures (not just _run_async_impl) are surfaced to on_agent_error_callback.
+    """
+    plugin = _ErrorTrackingPlugin()
+
+    def _boom(callback_context):
+      raise RuntimeError("before boom")
+
+    agent = _SuccessAgent(name="good_agent", before_agent_callback=_boom)
+    ctx = await _create_ctx(agent, plugins=[plugin])
+
+    with pytest.raises(RuntimeError, match="before boom"):
+      _ = [e async for e in agent.run_async(ctx)]
+
+    assert len(plugin.agent_errors) == 1
+    assert plugin.agent_errors[0][0] == "good_agent"
+    assert not plugin.after_agent_called
+
+  @pytest.mark.asyncio
+  async def test_agent_error_callback_fires_on_after_callback_failure(self):
+    """Error callback fires when after_agent_callback raises."""
+    plugin = _ErrorTrackingPlugin()
+
+    def _boom(callback_context):
+      raise RuntimeError("after boom")
+
+    agent = _SuccessAgent(name="good_agent", after_agent_callback=_boom)
+    ctx = await _create_ctx(agent, plugins=[plugin])
+
+    with pytest.raises(RuntimeError, match="after boom"):
+      _ = [e async for e in agent.run_async(ctx)]
+
+    assert len(plugin.agent_errors) == 1
+    assert plugin.agent_errors[0][0] == "good_agent"
 
   @pytest.mark.asyncio
   async def test_exception_is_reraised_after_agent_error_callback(self):

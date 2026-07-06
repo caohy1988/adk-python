@@ -45,6 +45,7 @@ from typing import Awaitable
 from typing import Callable
 from typing import Optional
 from typing import TYPE_CHECKING
+from typing import TypeVar
 import uuid
 import weakref
 
@@ -156,7 +157,12 @@ if hasattr(os, "register_at_fork"):
   os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
-def _safe_callback(func):
+_SafeCallbackT = TypeVar("_SafeCallbackT")
+
+
+def _safe_callback(
+    func: Callable[..., Awaitable[_SafeCallbackT]],
+) -> Callable[..., Awaitable[Optional[_SafeCallbackT]]]:
   """Decorator that catches and logs exceptions in plugin callbacks.
 
   Prevents plugin errors from propagating to the runner and crashing
@@ -164,7 +170,7 @@ def _safe_callback(func):
   """
 
   @functools.wraps(func)
-  async def wrapper(self, **kwargs):
+  async def wrapper(self, **kwargs) -> Optional[_SafeCallbackT]:
     try:
       return await func(self, **kwargs)
     except Exception:
