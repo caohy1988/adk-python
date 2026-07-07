@@ -750,3 +750,87 @@ class TestNodeRuntimeRunErrorCallback:
 
     assert len(plugin.run_errors) == 0
     assert plugin.after_run_called
+
+  @pytest.mark.asyncio
+  async def test_run_error_callback_fires_on_node_before_run_failure(self):
+    """A before_run_callback failure on the node path notifies on_run_error.
+
+    The setup hooks in _run_node_async run before the main event loop; their
+    failures must still be surfaced to on_run_error_callback.
+    """
+    from google.adk.runners import Runner
+
+    class _FailingBeforeRunPlugin(BasePlugin):
+
+      async def before_run_callback(
+          self, *, invocation_context: InvocationContext
+      ) -> Optional[types.Content]:
+        raise RuntimeError("before_run failed")
+
+    tracker = _ErrorTrackingPlugin()
+    runner = Runner(
+        app_name="test_app",
+        node=_CrashingNode(name="never_runs"),
+        session_service=InMemorySessionService(),
+        plugins=[_FailingBeforeRunPlugin(name="failing_before_run"), tracker],
+    )
+    session = await runner.session_service.create_session(
+        app_name="test_app", user_id="test_user"
+    )
+
+    with pytest.raises(RuntimeError, match="before_run failed"):
+      _ = [
+          e
+          async for e in runner.run_async(
+              user_id="test_user",
+              session_id=session.id,
+              new_message=types.Content(parts=[types.Part(text="hello")]),
+          )
+      ]
+
+    assert len(tracker.run_errors) == 1
+    # PluginManager wraps plugin exceptions with plugin/callback context.
+    assert "before_run failed" in str(tracker.run_errors[0])
+    # after_run stays success-only.
+    assert not tracker.after_run_called
+
+  @pytest.mark.asyncio
+  async def test_run_error_callback_fires_on_node_user_message_failure(self):
+    """An on_user_message_callback failure on the node path notifies on_run_error."""
+    from google.adk.runners import Runner
+
+    class _FailingUserMessagePlugin(BasePlugin):
+
+      async def on_user_message_callback(
+          self,
+          *,
+          invocation_context: InvocationContext,
+          user_message: types.Content,
+      ) -> Optional[types.Content]:
+        raise RuntimeError("user_message failed")
+
+    tracker = _ErrorTrackingPlugin()
+    runner = Runner(
+        app_name="test_app",
+        node=_CrashingNode(name="never_runs"),
+        session_service=InMemorySessionService(),
+        plugins=[_FailingUserMessagePlugin(name="failing_user_msg"), tracker],
+    )
+    session = await runner.session_service.create_session(
+        app_name="test_app", user_id="test_user"
+    )
+
+    with pytest.raises(RuntimeError, match="user_message failed"):
+      _ = [
+          e
+          async for e in runner.run_async(
+              user_id="test_user",
+              session_id=session.id,
+              new_message=types.Content(parts=[types.Part(text="hello")]),
+          )
+      ]
+
+    assert len(tracker.run_errors) == 1
+    # PluginManager wraps plugin exceptions with plugin/callback context.
+    assert "user_message failed" in str(tracker.run_errors[0])
+    assert not tracker.after_run_called

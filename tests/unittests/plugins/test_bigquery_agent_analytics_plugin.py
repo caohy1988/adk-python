@@ -1956,7 +1956,9 @@ class TestBigQueryAgentAnalyticsPlugin:
       raise error
     except RuntimeError:
       pass  # populate __traceback__
-    bigquery_agent_analytics_plugin.TraceManager.push_span(callback_context)
+    pushed_span_id = bigquery_agent_analytics_plugin.TraceManager.push_span(
+        callback_context, "agent"
+    )
     await bq_plugin_inst.on_agent_error_callback(
         agent=mock_agent,
         callback_context=callback_context,
@@ -1967,9 +1969,50 @@ class TestBigQueryAgentAnalyticsPlugin:
     log_entry = next(r for r in rows if r["event_type"] == "AGENT_ERROR")
     assert log_entry["error_message"] == "Agent crashed"
     assert log_entry["status"] == "ERROR"
+    # The agent span BQAA pushed is popped and attributed to the error row.
+    assert log_entry["span_id"] == pushed_span_id
     content = json.loads(log_entry["content"])
     assert "error_traceback" in content
     assert "RuntimeError: Agent crashed" in content["error_traceback"]
+
+  @pytest.mark.asyncio
+  async def test_on_agent_error_does_not_pop_foreign_invocation_span(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      mock_agent,
+      dummy_arrow_schema,
+  ):
+    """on_agent_error must not pop a span BQAA did not push for this agent.
+
+    Simulates another plugin's before_agent_callback raising before BQAA's
+    own before_agent_callback ran: the stack holds only the invocation root.
+    The guarded pop must leave the invocation span in place so the
+    subsequent INVOCATION_ERROR keeps correct span/latency data.
+    """
+    trace_manager = bigquery_agent_analytics_plugin.TraceManager
+    inv_span_id = trace_manager.push_span(callback_context, "invocation")
+
+    error = RuntimeError("other plugin's before_agent failed")
+    try:
+      raise error
+    except RuntimeError:
+      pass
+
+    await bq_plugin_inst.on_agent_error_callback(
+        agent=mock_agent,
+        callback_context=callback_context,
+        error=error,
+    )
+    await asyncio.sleep(0.05)
+
+    # The invocation root was NOT consumed by the agent-error pop.
+    assert trace_manager.get_current_span_id() == inv_span_id
+    # The AGENT_ERROR row is still emitted.
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    log_entry = next(r for r in rows if r["event_type"] == "AGENT_ERROR")
+    assert log_entry["error_message"] == "other plugin's before_agent failed"
 
   @pytest.mark.asyncio
   async def test_on_run_error_callback_logs_correctly(
@@ -1985,7 +2028,9 @@ class TestBigQueryAgentAnalyticsPlugin:
       raise error
     except ValueError:
       pass
-    bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        invocation_context, "invocation"
+    )
     await bq_plugin_inst.on_run_error_callback(
         invocation_context=invocation_context,
         error=error,

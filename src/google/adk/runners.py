@@ -498,27 +498,38 @@ class Runner:
         # Fresh: use user message as node_input
         node_input = new_message
 
-      # Run callbacks on user message
-      if new_message:
-        modified_user_message = (
-            await ic.plugin_manager.run_on_user_message_callback(
-                invocation_context=ic, user_message=new_message
-            )
-        )
-        if modified_user_message is not None:
-          new_message = modified_user_message
-          ic.user_content = new_message
+      # Failures in the setup hooks below (on_user_message_callback, the
+      # user-event session append, and before_run_callback) must also notify
+      # on_run_error_callback: they are part of runner execution even though
+      # they run before the main event loop. Notification-only; the original
+      # exception is always re-raised, and after_run stays success-only.
+      try:
+        # Run callbacks on user message
+        if new_message:
+          modified_user_message = (
+              await ic.plugin_manager.run_on_user_message_callback(
+                  invocation_context=ic, user_message=new_message
+              )
+          )
+          if modified_user_message is not None:
+            new_message = modified_user_message
+            ic.user_content = new_message
 
-      # Append user message to session for history
-      if new_message:
-        user_event = await self._append_user_event(
-            ic, new_message, state_delta=state_delta
-        )
-        if yield_user_message and user_event:
-          yield user_event
+        # Append user message to session for history
+        if new_message:
+          user_event = await self._append_user_event(
+              ic, new_message, state_delta=state_delta
+          )
+          if yield_user_message and user_event:
+            yield user_event
 
-      # Run before_run callbacks
-      await ic.plugin_manager.run_before_run_callback(invocation_context=ic)
+        # Run before_run callbacks
+        await ic.plugin_manager.run_before_run_callback(invocation_context=ic)
+      except Exception as e:
+        await ic.plugin_manager.run_on_run_error_callback(
+            invocation_context=ic, error=e
+        )
+        raise
 
       # 3. Start root node in background
       from .agents.base_agent import BaseAgent
