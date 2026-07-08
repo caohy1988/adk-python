@@ -604,19 +604,26 @@ class Runner:
         raise
       finally:
         # Success path (also caller early-stop via GeneratorExit, which is not
-        # an Exception): run after_run and compaction.
+        # an Exception): run after_run and compaction. _cleanup_root_task has
+        # already run in the inner finally above.
         if run_error is None:
           await ic.plugin_manager.run_after_run_callback(invocation_context=ic)
           if self.app and self.app.events_compaction_config:
             logger.debug('Running event compactor.')
             from google.adk.apps.compaction import _run_compaction_for_sliding_window
 
-            await _run_compaction_for_sliding_window(
-                self.app,
-                session,
-                self.session_service,
-                skip_token_compaction=ic.token_compaction_checked,
-            )
+            async with aclosing(
+                _run_compaction_for_sliding_window(
+                    self.app,
+                    session,
+                    self.session_service,
+                    skip_token_compaction=ic.token_compaction_checked,
+                )
+            ) as compaction_events:
+              async for compaction_event in compaction_events:
+                await self.session_service.append_event(
+                    session=session, event=compaction_event
+                )
 
   async def _run_node_live(
       self,
@@ -1168,12 +1175,18 @@ class Runner:
           logger.debug('Running event compactor.')
           from google.adk.apps.compaction import _run_compaction_for_sliding_window
 
-          await _run_compaction_for_sliding_window(
-              self.app,
-              invocation_context.session,
-              self.session_service,
-              skip_token_compaction=invocation_context.token_compaction_checked,
-          )
+          async with aclosing(
+              _run_compaction_for_sliding_window(
+                  self.app,
+                  invocation_context.session,
+                  self.session_service,
+                  skip_token_compaction=invocation_context.token_compaction_checked,
+              )
+          ) as compaction_events:
+            async for compaction_event in compaction_events:
+              await self.session_service.append_event(
+                  session=invocation_context.session, event=compaction_event
+              )
 
     async with aclosing(_run_with_trace(new_message, invocation_id)) as agen:
       async for event in agen:
