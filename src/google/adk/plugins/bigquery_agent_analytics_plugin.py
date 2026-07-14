@@ -439,7 +439,7 @@ def _sanitize_json_blob(
     depth: int = 0,
     max_len: int = -1,
     budget: Optional[list[int]] = None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, bool]:
   """Redacts sensitive keys inside a JSON-encoded string blob.
 
   Values such as cached credential JSON often reach attributes as opaque
@@ -447,13 +447,46 @@ def _sanitize_json_blob(
   FIRST: raw-substring prefilters are bypassable through JSON string
   escapes (e.g. ``"access\\u005ftoken"``), so any string that looks like a
   JSON container is parsed and its *decoded* keys inspected recursively —
-  arrays of credential objects included. Returns ``(value, changed)``;
+  arrays of credential objects included. Returns ``(value, changed,
+  truncated)`` where ``truncated`` reports content loss inside the blob
+  (depth/budget replacement discards payload, #6360 review round 6 P2-6);
   strings that do not parse, or that need no redaction, are returned
   unchanged (no cosmetic re-serialization).
   """
   stripped = value.lstrip("\ufeff \t\r\n")
+  if stripped.startswith('"'):
+    # A JSON-encoded STRING layer: json.dumps applied twice leaves the
+    # secret container quoted-and-escaped, which the container check
+    # below cannot see (#6360 review round 6 P1-3). Decode the layer and
+    # re-enter this sanitizer so a decoded string that turns out to be a
+    # container goes through the same redaction path. Layer recursion is
+    # bounded by the depth cap, and each decode strictly shrinks the
+    # string.
+    if depth >= _MAX_SANITIZE_DEPTH:
+      return "[UNPARSEABLE_JSON_BLOB]", True, True
+    if max_len != -1 and len(stripped) > max_len:
+      # Decoding would allocate beyond the configured limit. json.dumps
+      # emits literal braces, so an over-limit encoded container is
+      # recognizable from its prefix and fails closed; anything else is
+      # ordinary quoted prose, left to the caller's length truncation.
+      if stripped[1:2] in ("{", "["):
+        return "[UNPARSEABLE_JSON_BLOB]", True, True
+      return value, False, False
+    try:
+      decoded = json.loads(stripped)
+    except (TypeError, ValueError, RecursionError, MemoryError):
+      # Not a JSON document — ordinary prose that starts with a quote.
+      return value, False, False
+    if not isinstance(decoded, str):
+      return value, False, False
+    sanitized, changed, truncated = _sanitize_json_blob(
+        decoded, seen, depth + 1, max_len, budget
+    )
+    if not changed:
+      return value, False, False
+    return json.dumps(sanitized), True, truncated
   if not stripped.startswith(("{", "[")):
-    return value, False
+    return value, False, False
 
   # Enforce the configured content limit BEFORE materializing: json.loads
   # runs synchronously on the callback path and can allocate far beyond
@@ -461,7 +494,7 @@ def _sanitize_json_blob(
   # Truncating the raw JSON prefix instead could both retain a secret and
   # emit invalid JSON, so over-limit container blobs fail closed.
   if max_len != -1 and len(stripped) > max_len:
-    return "[UNPARSEABLE_JSON_BLOB]", True
+    return "[UNPARSEABLE_JSON_BLOB]", True, True
 
   # json.loads silently keeps only the LAST duplicate member, so a blob like
   # {"access_token":"SECRET","access_token":"x"} can compare equal after
@@ -482,15 +515,18 @@ def _sanitize_json_blob(
   try:
     parsed = json.loads(stripped, object_pairs_hook=_pairs_hook)
     if not isinstance(parsed, (dict, list)):
-      return value, False
+      return value, False, False
     # Redact only (max_len=-1): length truncation is applied by the caller
     # on the re-serialized string, keeping single responsibility per pass.
-    sanitized, _ = _recursive_smart_truncate(
+    # The nested truncation flag must survive: a depth/budget sentinel
+    # inside the blob discards payload, and dropping the bit made the row
+    # claim completeness (#6360 review round 6 P2-6).
+    sanitized, nested_truncated = _recursive_smart_truncate(
         parsed, -1, seen, depth + 1, budget
     )
-    if sanitized == parsed and not saw_duplicate_key:
-      return value, False
-    return json.dumps(sanitized), True
+    if sanitized == parsed and not saw_duplicate_key and not nested_truncated:
+      return value, False, False
+    return json.dumps(sanitized), True, nested_truncated
   except (TypeError, ValueError, RecursionError, MemoryError):
     # Container-shaped but unparseable — malformed JSON / trailing garbage
     # (a one-character suffix on valid credential JSON must not bypass
@@ -499,7 +535,7 @@ def _sanitize_json_blob(
     # (round 2 P2-5). None of these can be verified secret-free — and a
     # raw-substring fallback is bypassable via JSON string escapes — so
     # fail CLOSED to a sentinel.
-    return "[UNPARSEABLE_JSON_BLOB]", True
+    return "[UNPARSEABLE_JSON_BLOB]", True, True
 
 
 def _require_count(name: str, value: Any, minimum: int) -> None:
@@ -646,7 +682,7 @@ def _recursive_smart_truncate(
 
   try:
     if isinstance(obj, str):
-      obj, blob_replaced = _sanitize_json_blob(
+      obj, blob_replaced, blob_truncated = _sanitize_json_blob(
           obj, seen, depth, max_len, budget
       )
       if blob_replaced and obj == "[UNPARSEABLE_JSON_BLOB]":
@@ -654,7 +690,7 @@ def _recursive_smart_truncate(
         return obj, True
       if max_len != -1 and len(obj) > max_len:
         return obj[:max_len] + "...[TRUNCATED]", True
-      return obj, False
+      return obj, blob_truncated
     elif isinstance(obj, (bytes, bytearray)):
       # Credential JSON frequently travels as bytes; stringifying it in
       # the fallback bypassed blob redaction (#6360 review round 5 P1-4).
@@ -670,13 +706,22 @@ def _recursive_smart_truncate(
       # stringifying them in the fallback branch would bypass key redaction
       # (#6360 review round 2 P1-3). Always emits a plain sanitized dict.
       truncated_any = False
-      # Use dict comprehension for potentially slightly better performance,
-      # but explicit loop is fine for clarity given recursive nature.
       new_dict = {}
       for k, v in obj.items():
+        # Stop iterating once the work budget is exhausted: recursing on
+        # every remaining entry still did O(input) work and produced
+        # O(input) sentinel output, and directly-redacted entries consumed
+        # no budget at all, so a wide "temp:" mapping bypassed the bound
+        # entirely (#6360 review round 6 P2-5). One remainder sentinel
+        # stands in for everything dropped.
+        if budget[0] <= 0:
+          new_dict["[SANITIZE_BUDGET_EXCEEDED]"] = "[SANITIZE_BUDGET_EXCEEDED]"
+          truncated_any = True
+          break
         if isinstance(k, str):
           k_lower = k.lower()
           if k_lower in _SENSITIVE_KEYS or k_lower.startswith("temp:"):
+            budget[0] -= 1
             new_dict[k] = "[REDACTED]"
             continue
 
@@ -692,6 +737,11 @@ def _recursive_smart_truncate(
       new_list = []
       # Explicit loop to handle flag propagation
       for i in obj:
+        # Same bound as the mapping loop (#6360 review round 6 P2-5).
+        if budget[0] <= 0:
+          new_list.append("[SANITIZE_BUDGET_EXCEEDED]")
+          truncated_any = True
+          break
         val, trunc = _recursive_smart_truncate(
             i, max_len, seen, depth + 1, budget
         )
@@ -714,36 +764,56 @@ def _recursive_smart_truncate(
       )
     elif hasattr(obj, "model_dump") and callable(obj.model_dump):
       # Pydantic v2. Only recurse if the conversion made PROGRESS toward a
-      # JSON-native container: Mock-like objects answer every duck-typed
+      # JSON-native value: Mock-like objects answer every duck-typed
       # probe with another Mock-like object, and recursing on those churns
       # to the depth cap (falsely flagging truncation) instead of settling
-      # at the stringify fallback.
+      # at the stringify fallback. Progress includes SCALARS: a
+      # RootModel[str] dumps to a plain string that may itself be a
+      # credential blob, and falling through to str(obj) wrapped it in
+      # "root='...'" which bypassed blob redaction (#6360 review round 6
+      # P1-3).
       try:
         dumped = obj.model_dump()
-        if isinstance(dumped, (collections.abc.Mapping, list)):
+        if isinstance(
+            dumped,
+            (collections.abc.Mapping, list, tuple, str, bytes, bytearray),
+        ):
           return _recursive_smart_truncate(
               dumped, max_len, seen, depth + 1, budget
           )
+        if dumped is None or isinstance(dumped, (int, float, bool)):
+          return dumped, False
       except Exception:
         pass
     elif hasattr(obj, "dict") and callable(obj.dict):
-      # Pydantic v1 (same progress requirement as above).
+      # Pydantic v1 (same progress requirement as above, scalars included).
       try:
         dumped = obj.dict()
-        if isinstance(dumped, (collections.abc.Mapping, list)):
+        if isinstance(
+            dumped,
+            (collections.abc.Mapping, list, tuple, str, bytes, bytearray),
+        ):
           return _recursive_smart_truncate(
               dumped, max_len, seen, depth + 1, budget
           )
+        if dumped is None or isinstance(dumped, (int, float, bool)):
+          return dumped, False
       except Exception:
         pass
     elif hasattr(obj, "to_dict") and callable(obj.to_dict):
-      # Common pattern for custom objects (same progress requirement).
+      # Common pattern for custom objects (same progress requirement,
+      # scalars included).
       try:
         dumped = obj.to_dict()
-        if isinstance(dumped, (collections.abc.Mapping, list)):
+        if isinstance(
+            dumped,
+            (collections.abc.Mapping, list, tuple, str, bytes, bytearray),
+        ):
           return _recursive_smart_truncate(
               dumped, max_len, seen, depth + 1, budget
           )
+        if dumped is None or isinstance(dumped, (int, float, bool)):
+          return dumped, False
       except Exception:
         pass
     elif obj is None or isinstance(obj, (int, float, bool)):
@@ -3002,6 +3072,12 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # shutdown started; publishing a fresh writer state now would leak
       # it (#6360 review round 5 P1-2).
       raise RuntimeError("BigQuery plugin is shutting down.")
+    # Captured before any await: a shutdown() that starts (and even
+    # completes) while the writer below is being built bumps the
+    # generation, and the publication guard rechecks it — otherwise the
+    # new processor lands in the dict AFTER shutdown's snapshot/clear and
+    # leaks past close() (#6360 review round 6 P1-2).
+    generation = self._generation
     self._cleanup_stale_loop_states()
     if loop in self._loop_state_by_loop:
       return self._loop_state_by_loop[loop]
@@ -3052,7 +3128,28 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
     state = _LoopState(write_client, batch_processor)
     with self._loop_states_guard:
-      self._loop_state_by_loop[loop] = state
+      invalidated = self._is_shutting_down or self._generation != generation
+      if not invalidated:
+        self._loop_state_by_loop[loop] = state
+    if invalidated:
+      # shutdown() ran during construction; its snapshot cannot include
+      # this writer, so publishing it would leave a live processor and
+      # open transport behind after close() returns (#6360 review round 6
+      # P1-2). Tear the fresh instances down instead of publishing.
+      try:
+        await batch_processor.shutdown(timeout=self.config.shutdown_timeout)
+      except Exception:
+        logger.warning(
+            "Could not shut down writer created during shutdown.",
+            exc_info=True,
+        )
+      transport = getattr(write_client, "transport", None)
+      if transport:
+        try:
+          await transport.close()
+        except Exception:
+          pass
+      raise RuntimeError("BigQuery plugin is shutting down.")
 
     atexit.register(self._atexit_cleanup, weakref.proxy(batch_processor))
 
@@ -3207,6 +3304,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     exists, missing columns are added automatically (additive only).
     A ``adk_schema_version`` label is written for governance.
     """
+    assert self.client is not None  # _lazy_setup creates it before calling.
     try:
       existing_table = self.client.get_table(self.full_table_id)
       if self.config.auto_schema_upgrade:
@@ -3225,8 +3323,14 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       try:
         self.client.create_table(tbl)
       except cloud_exceptions.Conflict:
-        # Another process created it concurrently — still usable.
-        pass
+        # Another process created it concurrently — but there is no
+        # guarantee it used a compatible schema. Re-fetch and run the same
+        # readiness path as a pre-existing table; any failure here
+        # propagates so _ensure_started keeps _started=False and retries
+        # (#6360 review round 6 P1-4).
+        existing_table = self.client.get_table(self.full_table_id)
+        if self.config.auto_schema_upgrade:
+          self._maybe_upgrade_schema(existing_table)
       except Exception as e:
         # Fail setup (#6356 P1-4): returning normally here used to let the
         # plugin mark itself started against a missing table and silently
@@ -3547,8 +3651,18 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       self.client = None
     except Exception as e:
       logger.error("Error during shutdown: %s", e, exc_info=True)
-    self._is_shutting_down = False
-    self._started = False
+    finally:
+      # Cancellation-safe reset: PluginManager's close timeout cancels this
+      # coroutine, and asyncio.CancelledError is a BaseException that the
+      # handler above does not (and must not) swallow. Without the finally,
+      # a cancelled shutdown left _is_shutting_down=True forever, so the
+      # re-entry guard turned every later close() into a no-op and retained
+      # state could never be cleaned up (#6360 review round 6 P1-1). Any
+      # loop states not yet drained stay in _loop_state_by_loop, so a
+      # retried shutdown() re-snapshots and finishes the job; the
+      # cancellation itself propagates to the caller unchanged.
+      self._is_shutting_down = False
+      self._started = False
 
   def __getstate__(self) -> dict[str, Any]:
     """Custom pickling to exclude non-picklable runtime objects."""

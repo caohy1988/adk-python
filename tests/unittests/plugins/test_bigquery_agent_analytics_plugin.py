@@ -5261,15 +5261,59 @@ class TestSchemaAutoUpgrade:
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig()
     assert config.auto_schema_upgrade is True
 
-  def test_create_table_conflict_is_ignored(self):
-    """Race condition (Conflict) during create_table is silently handled."""
+  def test_create_table_conflict_refetches_concurrent_table(self):
+    """Conflict during create_table re-fetches the concurrently created
+    table instead of blindly trusting it (#6360 round 6 P1-4)."""
     plugin = self._make_plugin()
-    plugin.client.get_table.side_effect = cloud_exceptions.NotFound("not found")
+    existing = mock.MagicMock(spec=bigquery.Table)
+    existing.schema = plugin._schema
+    existing.labels = {}
+    plugin.client.get_table.side_effect = [
+        cloud_exceptions.NotFound("not found"),
+        existing,
+    ]
     plugin.client.create_table.side_effect = cloud_exceptions.Conflict(
         "already exists"
     )
     # Should not raise.
     plugin._ensure_schema_exists()
+    assert plugin.client.get_table.call_count == 2
+
+  def test_create_table_conflict_upgrades_incompatible_table(self):
+    """A concurrently created table missing required columns goes through
+    the normal upgrade path after Conflict (#6360 round 6 P1-4)."""
+    plugin = self._make_plugin(auto_schema_upgrade=True)
+    incompatible = mock.MagicMock(spec=bigquery.Table)
+    incompatible.schema = [bigquery.SchemaField("timestamp", "TIMESTAMP")]
+    incompatible.labels = {}
+    plugin.client.get_table.side_effect = [
+        cloud_exceptions.NotFound("not found"),
+        incompatible,
+    ]
+    plugin.client.create_table.side_effect = cloud_exceptions.Conflict(
+        "already exists"
+    )
+    plugin._ensure_schema_exists()
+    assert plugin.client.get_table.call_count == 2
+    plugin.client.update_table.assert_called_once()
+    updated_names = {
+        f.name for f in plugin.client.update_table.call_args[0][0].schema
+    }
+    assert "event_type" in updated_names
+
+  def test_create_table_conflict_refetch_failure_propagates(self):
+    """If the post-Conflict readiness check fails, setup must fail so
+    _ensure_started retries later (#6360 round 6 P1-4)."""
+    plugin = self._make_plugin(auto_schema_upgrade=True)
+    plugin.client.get_table.side_effect = [
+        cloud_exceptions.NotFound("not found"),
+        cloud_exceptions.ServiceUnavailable("control plane down"),
+    ]
+    plugin.client.create_table.side_effect = cloud_exceptions.Conflict(
+        "already exists"
+    )
+    with pytest.raises(cloud_exceptions.ServiceUnavailable):
+      plugin._ensure_schema_exists()
 
 
 class TestToolProvenance:
@@ -10791,9 +10835,118 @@ class TestIssue6356Hardening:
     plugin._started = True
     await plugin.close()
     assert plugin._started is False
-    assert plugin._is_shutting_down is False or True  # state consistent
+    assert plugin._is_shutting_down is False
     # And it routes through shutdown() semantics: counters remain queryable.
     assert isinstance(plugin.get_drop_stats(), dict)
+
+  @pytest.mark.asyncio
+  async def test_cancelled_close_releases_guard_and_allows_retry(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """A close() cancelled mid-drain (PluginManager's close timeout) must
+    release _is_shutting_down, re-raise the cancellation, and leave the
+    retained loop state retryable by a second close (#6360 round 6 P1-1)."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    loop = asyncio.get_running_loop()
+
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_shutdown(timeout=None):
+      del timeout
+      blocked.set()
+      await release.wait()
+
+    state = mock.MagicMock()
+    state.write_client = None
+    state.batch_processor = mock.MagicMock(
+        spec=bigquery_agent_analytics_plugin.BatchProcessor
+    )
+    state.batch_processor.shutdown = mock.AsyncMock(
+        side_effect=blocking_shutdown
+    )
+    state.batch_processor.get_drop_stats = mock.MagicMock(return_value={})
+    plugin._loop_state_by_loop[loop] = state
+
+    closer = asyncio.create_task(plugin.close())
+    await blocked.wait()
+    closer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await closer
+
+    # The guard is released and the undrained state is still retryable.
+    assert plugin._is_shutting_down is False
+    assert loop in plugin._loop_state_by_loop
+
+    # A second close now completes and removes the retained state.
+    state.batch_processor.shutdown = mock.AsyncMock()
+    await plugin.close()
+    assert plugin._is_shutting_down is False
+    assert loop not in plugin._loop_state_by_loop
+
+  @pytest.mark.asyncio
+  async def test_writer_built_during_shutdown_is_not_published(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """A shutdown() that completes while _get_loop_state() is mid-build
+    must not let the fresh writer be published afterwards; the new
+    processor and transport are torn down instead (#6360 round 6 P1-2)."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    plugin._credentials = mock.MagicMock(quota_project_id=None)
+
+    start_entered = asyncio.Event()
+    start_gate = asyncio.Event()
+    processor_shutdowns = []
+
+    async def gated_start(self):
+      del self
+      start_entered.set()
+      await start_gate.wait()
+
+    async def record_shutdown(self, timeout=None):
+      del self
+      processor_shutdowns.append(timeout)
+
+    transport = mock.MagicMock()
+    transport.close = mock.AsyncMock()
+    write_client = mock.MagicMock()
+    write_client.transport = transport
+
+    with (
+        mock.patch.object(
+            bigquery_agent_analytics_plugin.BatchProcessor,
+            "start",
+            gated_start,
+        ),
+        mock.patch.object(
+            bigquery_agent_analytics_plugin.BatchProcessor,
+            "shutdown",
+            record_shutdown,
+        ),
+        mock.patch.object(
+            bigquery_agent_analytics_plugin,
+            "BigQueryWriteAsyncClient",
+            return_value=write_client,
+        ),
+    ):
+      builder = asyncio.create_task(plugin._get_loop_state())
+      await start_entered.wait()
+      # shutdown() completes while the writer is still being built: its
+      # snapshot is empty, so only the publication guard can stop the leak.
+      await plugin.shutdown()
+      start_gate.set()
+      with pytest.raises(RuntimeError):
+        await builder
+
+    assert plugin._loop_state_by_loop == {}
+    assert processor_shutdowns, "fresh processor must be shut down"
+    transport.close.assert_awaited()
 
   def test_sanitizer_covers_bytes_bom_str_and_mapping_converters(self):
     """Round-5 P1-4 shapes: bytes/bytearray blobs, BOM-prefixed JSON,
@@ -10830,17 +10983,69 @@ class TestIssue6356Hardening:
     ):
       assert marker not in dumped, marker
 
-  def test_sanitizer_stops_at_node_budget(self):
-    """A very wide payload stops at the work budget and flags truncation
-    (#6360 review round 5 P2)."""
+  def test_double_encoded_and_rootmodel_blobs_are_redacted(self):
+    """Round-6 P1-3 shapes: JSON-encoded string layers (double/triple
+    json.dumps) and scalar model_dump() results (RootModel[str]) re-enter
+    the redaction path instead of bypassing it."""
+    import pydantic
+
     truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
-    wide = list(range(bigquery_agent_analytics_plugin._MAX_SANITIZE_NODES * 2))
+
+    double = json.dumps(json.dumps({"access_token": "DOUBLE-ENCODED-SECRET"}))
+    out, _ = truncate({"blob": double}, 10000)
+    assert "DOUBLE-ENCODED-SECRET" not in json.dumps(out)
+
+    triple = json.dumps(double)
+    out, _ = truncate({"blob": triple}, 10000)
+    assert "DOUBLE-ENCODED-SECRET" not in json.dumps(out)
+
+    root = pydantic.RootModel[str]('{"access_token":"ROOT-SECRET"}')
+    out, _ = truncate({"model": root}, 10000)
+    assert "ROOT-SECRET" not in json.dumps(out)
+
+    # Ordinary quoted prose (not a JSON document) is left untouched.
+    prose = '"hello" she said'
+    out, truncated = truncate({"s": prose}, 10000)
+    assert out["s"] == prose
+    assert truncated is False
+
+  def test_depth_truncated_json_blob_reports_truncation(self):
+    """Round-6 P2-6: a JSON blob rewritten with [MAX_DEPTH_EXCEEDED]
+    discards payload and must therefore report truncated=True."""
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+    deep = "[" * 60 + "]" * 60
+    out, truncated = truncate({"blob": deep}, 10000)
+    assert "[MAX_DEPTH_EXCEEDED]" in out["blob"]
+    assert truncated is True
+
+  def test_sanitizer_stops_at_node_budget(self):
+    """A very wide payload stops at the work budget, emits ONE remainder
+    sentinel, and the output stays bounded by the budget — iteration used
+    to continue over the full input, appending one sentinel per remaining
+    element (#6360 review round 5 P2, round 6 P2-5)."""
+    max_nodes = bigquery_agent_analytics_plugin._MAX_SANITIZE_NODES
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+
+    wide = list(range(max_nodes * 2))
     out, truncated = truncate({"wide": wide}, 10000)
     assert truncated
-    assert "[SANITIZE_BUDGET_EXCEEDED]" in str(out["wide"][-1]) or (
-        out["wide"].count("[SANITIZE_BUDGET_EXCEEDED]") > 0
-    )
-    assert len(out["wide"]) <= len(wide)
+    assert out["wide"][-1] == "[SANITIZE_BUDGET_EXCEEDED]"
+    assert out["wide"].count("[SANITIZE_BUDGET_EXCEEDED]") == 1
+    # Bounded output: budget entries plus the single remainder sentinel.
+    assert len(out["wide"]) <= max_nodes + 1
+
+  def test_sanitizer_budget_covers_directly_redacted_entries(self):
+    """Directly redacted keys (temp:/sensitive) consume budget too — a
+    wide temp: mapping used to bypass the bound entirely and report
+    truncated=False (#6360 review round 6 P2-5)."""
+    max_nodes = bigquery_agent_analytics_plugin._MAX_SANITIZE_NODES
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+
+    wide_temp = {f"temp:{i}": i for i in range(max_nodes * 2)}
+    out, truncated = truncate(wide_temp, 10000)
+    assert truncated
+    assert len(out) <= max_nodes + 1
+    assert "[SANITIZE_BUDGET_EXCEEDED]" in out
 
   @pytest.mark.asyncio
   async def test_stale_loop_cleanup_counts_queued_rows(
