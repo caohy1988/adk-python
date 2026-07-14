@@ -19,6 +19,8 @@ import dataclasses
 import json
 import logging
 import os
+import sys
+import threading
 from unittest import mock
 
 from google.adk.agents import base_agent
@@ -10602,10 +10604,12 @@ class TestIssue6356Hardening:
       dummy_arrow_schema,
       mock_asyncio_to_thread,
   ):
-    """A namedtuple in attributes serializes as a list, not a TypeError.
+    """A namedtuple in attributes serializes as a mapping, not a TypeError.
 
     Reconstructing tuple subclasses positionally raised in the final pass
-    and the safe callback dropped the entire row (#6360 review round 4 P2).
+    and the safe callback dropped the entire row (#6360 review round 4 P2);
+    round 7 P1-2 then required the mapping shape so field-name redaction
+    can run.
     """
     _ = mock_auth_default, mock_bq_client
     import collections
@@ -10629,7 +10633,291 @@ class TestIssue6356Hardening:
           mock_write_client, dummy_arrow_schema
       )
       attrs = json.loads(log_entry["attributes"])
-      assert attrs["point"] == [1, 2]
+      # Namedtuples serialize as a MAPPING so field-name redaction can run
+      # (#6360 round 7 P1-2 superseded the round-4 plain-list shape); the
+      # row is still emitted either way.
+      assert attrs["point"] == {"x": 1, "y": 2}
+
+  @pytest.mark.asyncio
+  async def test_setup_blocked_before_loop_state_does_not_leak(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """Round-7 P1-5: a shutdown() that completes while setup is blocked
+    creating the shared client must abort the resumed setup, publish
+    nothing, and release every resource the attempt created."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    plugin._credentials = mock.MagicMock(quota_project_id=None)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def gated_client(*args, **kwargs):
+      del args, kwargs
+      entered.set()
+      release.wait(10)
+      return mock.MagicMock()
+
+    with mock.patch(
+        "google.adk.plugins.bigquery_agent_analytics_plugin.bigquery.Client",
+        side_effect=gated_client,
+    ):
+      owner = asyncio.create_task(plugin._ensure_started())
+      while not entered.is_set():
+        await asyncio.sleep(0.01)
+      # Shutdown completes fully while setup is blocked in the executor.
+      await plugin.shutdown()
+      release.set()
+      await owner  # aborts internally; never raises to the caller
+
+    assert plugin._started is False
+    assert plugin.client is None
+    assert plugin._executor is None
+    assert plugin.parser is None
+    assert plugin.offloader is None
+    assert plugin._loop_state_by_loop == {}
+    assert plugin.get_drop_stats().get("shutdown_race", 0) >= 1
+    # The abort is not a service failure: no poisoned backoff window.
+    assert plugin._startup_error is None
+
+  def test_concurrent_shutdown_folds_counters_once(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """Round-7 P1-6: two threads racing into shutdown() must not both be
+    admitted — the same processors' drop counters were folded twice."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+
+    def make_state():
+      state = mock.MagicMock()
+      state.write_client = None
+      state.batch_processor = mock.MagicMock(
+          spec=bigquery_agent_analytics_plugin.BatchProcessor
+      )
+      state.batch_processor.shutdown = mock.AsyncMock()
+      state.batch_processor.get_drop_stats = mock.MagicMock(
+          return_value={"queue_full": 1}
+      )
+      return state
+
+    for _ in range(2):
+      fake_loop = mock.MagicMock(spec=asyncio.AbstractEventLoop)
+      fake_loop.is_closed.return_value = False
+      plugin._loop_state_by_loop[fake_loop] = make_state()
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def run_shutdown():
+      try:
+        barrier.wait(timeout=10)
+        # Short timeout: the mock "other" loops never actually drain, so
+        # the cross-loop future.result(timeout=...) always expires.
+        asyncio.run(plugin.shutdown(timeout=0.1))
+      except Exception as e:  # pylint: disable=broad-except
+        errors.append(e)
+
+    threads = [threading.Thread(target=run_shutdown) for _ in range(2)]
+    for t in threads:
+      t.start()
+    for t in threads:
+      t.join(timeout=30)
+      assert not t.is_alive()
+
+    assert not errors
+    # Two states, one queue_full each: exactly one shutdown owner folds
+    # them, so anything above 2 means double-folding.
+    assert plugin.get_drop_stats().get("queue_full", 0) == 2
+
+  def test_drop_counters_are_thread_safe(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """Round-7 P2-7: concurrent _count_local_drop() increments from
+    multiple threads must not lose updates."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    increments = 5_000
+    n_threads = 4
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-5)
+    try:
+
+      def worker():
+        for _ in range(increments):
+          plugin._count_local_drop("stress")
+
+      threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+      for t in threads:
+        t.start()
+      for t in threads:
+        t.join(timeout=60)
+        assert not t.is_alive()
+    finally:
+      sys.setswitchinterval(old_interval)
+
+    assert plugin.get_drop_stats()["stress"] == increments * n_threads
+
+  @pytest.mark.asyncio
+  async def test_cancelled_processor_shutdown_is_retryable(self):
+    """Round-7 P1-4: an externally cancelled BatchProcessor.shutdown()
+    (real processor, blocked writer) must not make later shutdown calls
+    re-raise the historical CancelledError; the retry completes and every
+    queued/in-flight row is accounted."""
+    bp = bigquery_agent_analytics_plugin.BatchProcessor(
+        write_client=mock.MagicMock(),
+        arrow_schema=None,
+        write_stream="s",
+        batch_size=1,
+        flush_interval=0.05,
+        retry_config=bigquery_agent_analytics_plugin.RetryConfig(),
+        queue_max_size=100,
+        shutdown_timeout=5.0,
+    )
+    write_entered = asyncio.Event()
+    write_release = asyncio.Event()
+
+    async def blocked_write(rows):
+      del rows
+      write_entered.set()
+      await write_release.wait()
+
+    with mock.patch.object(
+        bp, "_write_rows_with_retry", side_effect=blocked_write
+    ):
+      await bp.start()
+      await bp.append({"r": 1})
+      await write_entered.wait()  # worker is blocked mid-write (in-flight=1)
+      for i in range(3):
+        await bp.append({"r": i + 2})  # three rows stay queued
+
+      closer = asyncio.create_task(bp.shutdown(timeout=30))
+      await asyncio.sleep(0.05)  # let shutdown reach its wait_for
+      closer.cancel()
+      with pytest.raises(asyncio.CancelledError):
+        await closer
+
+      # The retry completes instead of re-raising the historical
+      # cancellation, and nothing is left queued.
+      await bp.shutdown(timeout=1)
+
+    assert bp._batch_processor_task.cancelled()
+    assert bp._queue.empty()
+    stats = bp.get_drop_stats()
+    # 3 queued rows (shutdown_cancelled) + 1 in-flight row counted by the
+    # cancelled worker (shutdown_timeout).
+    assert stats["shutdown_cancelled"] == 3
+    assert stats["shutdown_timeout"] == 1
+
+  def test_overlimit_and_garbage_quoted_blobs_fail_closed(self):
+    """Round-7 P1-1: over-limit multi-layer quoted JSON and a valid quoted
+    credential layer with trailing garbage must not republish the secret."""
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+
+    secret = "ROUND7-TRIPLE-SECRET-" + "x" * 300
+    triple = json.dumps(json.dumps(json.dumps({"access_token": secret})))
+    out, truncated = truncate({"blob": triple}, 64)
+    assert "ROUND7-TRIPLE-SECRET" not in json.dumps(out)
+    assert truncated
+
+    trailing = (
+        json.dumps(json.dumps({"access_token": "ROUND7-TRAIL-SECRET"}))
+        + " trailing"
+    )
+    out, truncated = truncate({"blob": trailing}, 10000)
+    assert "ROUND7-TRAIL-SECRET" not in json.dumps(out)
+    assert truncated
+
+    # Ordinary quoted prose — with or without a suffix — stays untouched.
+    for prose in ('"hello" she said', '"just a quote"'):
+      out, truncated = truncate({"s": prose}, 10000)
+      assert out["s"] == prose
+      assert truncated is False
+
+  @pytest.mark.asyncio
+  async def test_round7_shapes_redacted_at_row_boundary(
+      self,
+      mock_write_client,
+      invocation_context,
+      callback_context,
+      mock_auth_default,
+      mock_bq_client,
+      mock_to_arrow_schema,
+      dummy_arrow_schema,
+      mock_asyncio_to_thread,
+      caplog,
+  ):
+    """Round-7 P1-2/P1-3/P2-8/P2-9 shapes at the final row boundary: the
+    row is always emitted, no canary reaches the row or the logs,
+    unsupported keys fail closed, and discarded binary reports
+    is_truncated."""
+    _ = mock_auth_default, mock_bq_client
+    import collections
+    import types as types_module
+
+    Cred = collections.namedtuple("Cred", ["access_token"])
+
+    class Trap:
+
+      @property
+      def model_dump(self):
+        raise RuntimeError("ROUND7-PROPERTY-SECRET")
+
+    class SneakyStr(str):
+
+      def lstrip(self, *args):
+        return "plain"
+
+      def startswith(self, *args):
+        return False
+
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    ) as plugin:
+      await plugin._ensure_started()
+      mock_write_client.append_rows.reset_mock()
+      bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+      await plugin._log_event(
+          "STATE_DELTA",
+          callback_context,
+          event_data=bigquery_agent_analytics_plugin.EventData(
+              extra_attributes={
+                  "named": Cred("ROUND7-NAMED-SECRET"),
+                  "ns": types_module.SimpleNamespace(
+                      access_token="ROUND7-REPR-SECRET", note="ok"
+                  ),
+                  "trap": Trap(),
+                  "sneaky": SneakyStr('{"access_token":"ROUND7-STR-SUBCLASS"}'),
+                  "bad_key": {(1, 2): "value"},
+                  "binary": b"\xff\xfe",
+              },
+          ),
+      )
+      await asyncio.sleep(0.01)
+      log_entry = await _get_captured_event_dict_async(
+          mock_write_client, dummy_arrow_schema
+      )
+      dumped_row = json.dumps(log_entry, default=str)
+      for canary in (
+          "ROUND7-NAMED-SECRET",
+          "ROUND7-REPR-SECRET",
+          "ROUND7-PROPERTY-SECRET",
+          "ROUND7-STR-SUBCLASS",
+      ):
+        assert canary not in dumped_row, canary
+        assert canary not in caplog.text, canary
+      attrs = json.loads(log_entry["attributes"])
+      assert attrs["named"] == {"access_token": "[REDACTED]"}
+      assert attrs["ns"] == {"access_token": "[REDACTED]", "note": "ok"}
+      assert attrs["trap"] == "[UNSUPPORTED_OBJECT]"
+      assert attrs["bad_key"] == {"[UNSUPPORTED_KEY]": "value"}
+      assert attrs["binary"] == "[BINARY_DATA]"
+      assert log_entry["is_truncated"] is True
 
   def test_setup_future_leaves_no_loop_references(
       self, mock_auth_default, mock_bq_client

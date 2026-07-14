@@ -23,14 +23,19 @@ import contextvars
 import dataclasses
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
+import decimal
+import enum
 import functools
 import json
 import logging
 import math
 import mimetypes
 import os
+import pathlib
 import traceback as traceback_module
 
 # Enable gRPC fork support so child processes created via os.fork()
@@ -465,26 +470,47 @@ def _sanitize_json_blob(
     if depth >= _MAX_SANITIZE_DEPTH:
       return "[UNPARSEABLE_JSON_BLOB]", True, True
     if max_len != -1 and len(stripped) > max_len:
-      # Decoding would allocate beyond the configured limit. json.dumps
-      # emits literal braces, so an over-limit encoded container is
-      # recognizable from its prefix and fails closed; anything else is
-      # ordinary quoted prose, left to the caller's length truncation.
-      if stripped[1:2] in ("{", "["):
+      # Decoding would allocate beyond the configured limit, so classify
+      # from the prefix. One json.dumps layer puts a literal brace right
+      # after the quote; two-plus layers put an escape there (\" or \\),
+      # so a brace-only check let over-limit triple-encoded credentials
+      # through to the caller's raw truncation (#6360 review round 7
+      # P1-1). Anything that cannot be ruled out as an encoded JSON layer
+      # fails closed; the rest is ordinary quoted prose, left to the
+      # caller's length truncation.
+      if stripped[1:].lstrip(" \t\r\n")[:1] in ("{", "[", "\\", '"'):
         return "[UNPARSEABLE_JSON_BLOB]", True, True
       return value, False, False
+    suffix = ""
     try:
       decoded = json.loads(stripped)
-    except (TypeError, ValueError, RecursionError, MemoryError):
-      # Not a JSON document — ordinary prose that starts with a quote.
-      return value, False, False
+    except (TypeError, RecursionError, MemoryError):
+      return "[UNPARSEABLE_JSON_BLOB]", True, True
+    except ValueError:
+      # Not one complete JSON document. A valid quoted credential layer
+      # followed by trailing garbage still lands here, and classifying it
+      # as prose republished the secret (#6360 review round 7 P1-1):
+      # bounded-decode the LEADING string layer instead.
+      try:
+        decoded, end = json.JSONDecoder().raw_decode(stripped)
+      except ValueError:
+        # No leading JSON document at all — quoted prose.
+        return value, False, False
+      suffix = stripped[end:]
     if not isinstance(decoded, str):
       return value, False, False
+    if suffix.strip() and decoded.lstrip("\ufeff \t\r\n").startswith(
+        ("{", "[", '"')
+    ):
+      # A JSON string layer that unwraps toward a container, plus a
+      # non-JSON suffix this pass cannot verify — fail closed.
+      return "[UNPARSEABLE_JSON_BLOB]", True, True
     sanitized, changed, truncated = _sanitize_json_blob(
         decoded, seen, depth + 1, max_len, budget
     )
     if not changed:
       return value, False, False
-    return json.dumps(sanitized), True, truncated
+    return json.dumps(sanitized) + suffix, True, truncated
   if not stripped.startswith(("{", "[")):
     return value, False, False
 
@@ -625,6 +651,38 @@ _CLOUD_PLATFORM_SCOPE = (
 )
 
 
+def _safe_getattr(obj: Any, name: str) -> Any:
+  """getattr that cannot be weaponized by payload-controlled properties.
+
+  A bare ``hasattr``/``getattr`` probe evaluates properties, and hasattr
+  only swallows AttributeError — a property raising anything else escaped
+  the sanitizer entirely, dropping the telemetry row and leaking the
+  exception message (often containing the payload) into application logs
+  (#6360 review round 7 P1-3). Returns None on ANY failure.
+  """
+  try:
+    return getattr(obj, name, None)
+  except Exception:
+    return None
+
+
+# Stdlib scalar types whose str() form is canonical, side-effect free, and
+# cannot embed attribute state beyond the value itself. Only these keep the
+# stringify fallback; arbitrary objects' repr/str output is payload-
+# controlled (e.g. SimpleNamespace(access_token=...) prints its attributes
+# verbatim) and is no longer published (#6360 review round 7 P1-3).
+_SAFE_STR_TYPES: tuple[type, ...] = (
+    datetime,
+    date,
+    timedelta,
+    decimal.Decimal,
+    uuid.UUID,
+    pathlib.PurePath,
+    enum.Enum,
+    complex,
+)
+
+
 def _recursive_smart_truncate(
     obj: Any,
     max_len: int,
@@ -668,13 +726,22 @@ def _recursive_smart_truncate(
   if obj_id in seen:
     return "[CIRCULAR_REFERENCE]", False
 
+  # Converter attributes are fetched exactly once through _safe_getattr:
+  # hasattr() evaluates payload-controlled properties OUTSIDE any guard,
+  # and a property raising e.g. RuntimeError escaped the sanitizer, leaked
+  # its message into logs, and suppressed the whole row (#6360 review
+  # round 7 P1-3).
+  model_dump_fn = _safe_getattr(obj, "model_dump")
+  dict_fn = _safe_getattr(obj, "dict")
+  to_dict_fn = _safe_getattr(obj, "to_dict")
+
   # Track compound objects to detect cycles
   is_compound = (
       isinstance(obj, (dict, list, tuple, collections.abc.Mapping))
       or (dataclasses.is_dataclass(obj) and not isinstance(obj, type))
-      or hasattr(obj, "model_dump")
-      or hasattr(obj, "dict")
-      or hasattr(obj, "to_dict")
+      or model_dump_fn is not None
+      or dict_fn is not None
+      or to_dict_fn is not None
   )
 
   if is_compound:
@@ -682,6 +749,12 @@ def _recursive_smart_truncate(
 
   try:
     if isinstance(obj, str):
+      if type(obj) is not str:
+        # str subclasses can override lstrip/startswith/lower to
+        # misreport their content while json.dumps still serializes the
+        # real underlying value (#6360 review round 7 P1-3): normalize to
+        # the exact built-in string before any inspection.
+        obj = str.__str__(obj)
       obj, blob_replaced, blob_truncated = _sanitize_json_blob(
           obj, seen, depth, max_len, budget
       )
@@ -697,7 +770,9 @@ def _recursive_smart_truncate(
       try:
         decoded = bytes(obj).decode("utf-8")
       except UnicodeDecodeError:
-        return "[BINARY_DATA]", False
+        # The whole byte payload is discarded, so the row must report
+        # content loss (#6360 review round 7 P2-9).
+        return "[BINARY_DATA]", True
       return _recursive_smart_truncate(
           decoded, max_len, seen, depth + 1, budget
       )
@@ -707,6 +782,7 @@ def _recursive_smart_truncate(
       # (#6360 review round 2 P1-3). Always emits a plain sanitized dict.
       truncated_any = False
       new_dict = {}
+      unsupported_keys = 0
       for k, v in obj.items():
         # Stop iterating once the work budget is exhausted: recursing on
         # every remaining entry still did O(input) work and produced
@@ -719,11 +795,34 @@ def _recursive_smart_truncate(
           truncated_any = True
           break
         if isinstance(k, str):
+          if type(k) is not str:
+            # Same normalization as string values: a str-subclass key can
+            # misreport itself to the redaction check below (#6360 review
+            # round 7 P1-3).
+            k = str.__str__(k)
           k_lower = k.lower()
           if k_lower in _SENSITIVE_KEYS or k_lower.startswith("temp:"):
             budget[0] -= 1
             new_dict[k] = "[REDACTED]"
             continue
+        elif not (k is None or isinstance(k, (int, float, bool))):
+          # json.dumps rejects non-scalar keys even with default=str (it
+          # applies to values only), so one such key raised TypeError at
+          # serialization and silently dropped the whole telemetry row
+          # (#6360 review round 7 P2-8). The key's own repr can embed
+          # secrets, so it is not published either: fail the KEY closed
+          # (numbered to avoid collisions between multiple bad keys; a
+          # genuine attribute with the same sentinel name is overwritten,
+          # which only ever replaces payload with a sentinel) and keep
+          # the sanitized value.
+          unsupported_keys += 1
+          budget[0] -= 1
+          k = (
+              "[UNSUPPORTED_KEY]"
+              if unsupported_keys == 1
+              else f"[UNSUPPORTED_KEY_{unsupported_keys}]"
+          )
+          truncated_any = True
 
         val, trunc = _recursive_smart_truncate(
             v, max_len, seen, depth + 1, budget
@@ -733,6 +832,20 @@ def _recursive_smart_truncate(
         new_dict[k] = val
       return new_dict, truncated_any
     elif isinstance(obj, (list, tuple)):
+      fields = _safe_getattr(obj, "_fields") if isinstance(obj, tuple) else None
+      if (
+          isinstance(fields, tuple)
+          and len(fields) == len(obj)
+          and all(isinstance(f, str) for f in fields)
+      ):
+        # Namedtuples carry field NAMES (e.g. access_token) that the
+        # plain-list normalization below discarded, so the sensitive
+        # value survived positionally (#6360 review round 7 P1-2).
+        # Rebuild as a mapping from the class metadata (zip, not the
+        # overridable _asdict()) so key redaction runs.
+        return _recursive_smart_truncate(
+            dict(zip(fields, obj)), max_len, seen, depth + 1, budget
+        )
       truncated_any = False
       new_list = []
       # Explicit loop to handle flag propagation
@@ -762,18 +875,17 @@ def _recursive_smart_truncate(
       return _recursive_smart_truncate(
           as_dict, max_len, seen, depth + 1, budget
       )
-    elif hasattr(obj, "model_dump") and callable(obj.model_dump):
+    elif model_dump_fn is not None and callable(model_dump_fn):
       # Pydantic v2. Only recurse if the conversion made PROGRESS toward a
       # JSON-native value: Mock-like objects answer every duck-typed
       # probe with another Mock-like object, and recursing on those churns
       # to the depth cap (falsely flagging truncation) instead of settling
-      # at the stringify fallback. Progress includes SCALARS: a
-      # RootModel[str] dumps to a plain string that may itself be a
-      # credential blob, and falling through to str(obj) wrapped it in
-      # "root='...'" which bypassed blob redaction (#6360 review round 6
-      # P1-3).
+      # at the fallback. Progress includes SCALARS: a RootModel[str] dumps
+      # to a plain string that may itself be a credential blob, and
+      # falling through to the generic fallback bypassed blob redaction
+      # (#6360 review round 6 P1-3).
       try:
-        dumped = obj.model_dump()
+        dumped = model_dump_fn()
         if isinstance(
             dumped,
             (collections.abc.Mapping, list, tuple, str, bytes, bytearray),
@@ -785,10 +897,10 @@ def _recursive_smart_truncate(
           return dumped, False
       except Exception:
         pass
-    elif hasattr(obj, "dict") and callable(obj.dict):
+    elif dict_fn is not None and callable(dict_fn):
       # Pydantic v1 (same progress requirement as above, scalars included).
       try:
-        dumped = obj.dict()
+        dumped = dict_fn()
         if isinstance(
             dumped,
             (collections.abc.Mapping, list, tuple, str, bytes, bytearray),
@@ -800,11 +912,11 @@ def _recursive_smart_truncate(
           return dumped, False
       except Exception:
         pass
-    elif hasattr(obj, "to_dict") and callable(obj.to_dict):
+    elif to_dict_fn is not None and callable(to_dict_fn):
       # Common pattern for custom objects (same progress requirement,
       # scalars included).
       try:
-        dumped = obj.to_dict()
+        dumped = to_dict_fn()
         if isinstance(
             dumped,
             (collections.abc.Mapping, list, tuple, str, bytes, bytearray),
@@ -820,18 +932,35 @@ def _recursive_smart_truncate(
       # Basic types are safe
       return obj, False
 
-    # Fallback for unknown types: convert to string, then RE-ENTER the
-    # string sanitizer — an object whose __str__ returns credential JSON
-    # bypassed blob redaction otherwise (#6360 review round 5 P1-4).
-    # Truncating an object REPRESENTATION is not content truncation, so
-    # the flag is not propagated (pre-existing str(obj) semantics).
+    # Fallback for unknown types. Arbitrary str()/repr() output is
+    # payload-controlled and prints attribute values verbatim (e.g.
+    # SimpleNamespace(access_token=...)), so it is no longer published
+    # (#6360 review round 7 P1-3; supersedes the round-5 stringify
+    # fallback). Known-safe stdlib scalars keep their canonical string
+    # form; objects exposing instance state keep a structurally sanitized
+    # public view of vars(obj); everything else fails closed to a
+    # sentinel. Sentinel replacement discards content, so it reports
+    # truncation.
     try:
-      sanitized_repr, _ = _recursive_smart_truncate(
-          str(obj), max_len, seen, depth + 1, budget
-      )
-      return sanitized_repr, False
+      if isinstance(obj, _SAFE_STR_TYPES):
+        sanitized_repr, _ = _recursive_smart_truncate(
+            str(obj), max_len, seen, depth + 1, budget
+        )
+        return sanitized_repr, False
+      attrs = _safe_getattr(obj, "__dict__")
+      if isinstance(attrs, dict):
+        public_attrs = {
+            k: v
+            for k, v in attrs.items()
+            if isinstance(k, str) and not k.startswith("_")
+        }
+        if public_attrs:
+          return _recursive_smart_truncate(
+              public_attrs, max_len, seen, depth + 1, budget
+          )
+      return "[UNSUPPORTED_OBJECT]", True
     except Exception:
-      return "[UNSUPPORTED_OBJECT]", False
+      return "[UNSUPPORTED_OBJECT]", True
   finally:
     if is_compound:
       seen.remove(obj_id)
@@ -1513,6 +1642,7 @@ class BatchProcessor:
         "non_retryable": 0,
         "unexpected_error": 0,
         "shutdown_timeout": 0,
+        "shutdown_cancelled": 0,
     }
 
   async def flush(self) -> None:
@@ -1555,6 +1685,9 @@ class BatchProcessor:
       ``non_retryable``: BigQuery returned a non-retryable error (e.g. a
         schema mismatch).
       ``unexpected_error``: an unexpected exception aborted the write.
+      ``shutdown_timeout``: rows still queued when shutdown timed out.
+      ``shutdown_cancelled``: rows still queued when shutdown was
+        cancelled from outside (e.g. a host close timeout).
 
     Returns:
         A copy of the per-reason drop counters.
@@ -1843,6 +1976,22 @@ class BatchProcessor:
         )
         return
 
+  def _drain_queue_and_count(self, reason: str) -> int:
+    """Counts and discards everything still queued (loss accounting)."""
+    drained = 0
+    try:
+      while True:
+        item = self._queue.get_nowait()
+        if item is not _SHUTDOWN_SENTINEL:
+          drained += 1
+        self._queue.task_done()
+    except asyncio.QueueEmpty:
+      pass
+    if drained:
+      self._dropped[reason] += drained
+      logger.warning("%d queued row(s) dropped (%s).", drained, reason)
+    return drained
+
   async def shutdown(self, timeout: float = 5.0) -> None:
     """Shuts down the BatchProcessor, draining the queue.
 
@@ -1860,6 +2009,19 @@ class BatchProcessor:
       pass
 
     if self._batch_processor_task:
+      if self._batch_processor_task.done():
+        # A previous shutdown attempt already terminated the worker —
+        # possibly by external cancellation. Re-awaiting the task would
+        # re-raise its historical CancelledError on EVERY retry, so no
+        # later close could ever finish cleanup (#6360 review round 7
+        # P1-4). Treat the terminal worker as final and account for
+        # whatever is still queued.
+        self._drain_queue_and_count(
+            "shutdown_cancelled"
+            if self._batch_processor_task.cancelled()
+            else "shutdown_timeout"
+        )
+        return
       try:
         await asyncio.wait_for(self._batch_processor_task, timeout=timeout)
       except asyncio.TimeoutError:
@@ -1873,20 +2035,14 @@ class BatchProcessor:
         # Rows still queued after the timeout are lost: count them so the
         # loss is observable instead of silent (#6360 review round 2 P2-4).
         # The worker counts its own in-flight batch on cancellation.
-        drained = 0
-        try:
-          while True:
-            item = self._queue.get_nowait()
-            if item is not _SHUTDOWN_SENTINEL:
-              drained += 1
-            self._queue.task_done()
-        except asyncio.QueueEmpty:
-          pass
-        if drained:
-          self._dropped["shutdown_timeout"] += drained
-          logger.warning(
-              "%d queued row(s) dropped by shutdown timeout.", drained
-          )
+        self._drain_queue_and_count("shutdown_timeout")
+      except asyncio.CancelledError:
+        # EXTERNAL cancellation (e.g. PluginManager's close timeout):
+        # wait_for has already cancelled the worker. Account for queued
+        # rows now — a retry may never come — and preserve the caller's
+        # cancellation (#6360 review round 7 P1-4).
+        self._drain_queue_and_count("shutdown_cancelled")
+        raise
       except Exception as e:
         logger.error("Error during BatchProcessor shutdown: %s", e)
 
@@ -2903,6 +3059,11 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # before/outside any BatchProcessor (setup unavailable, formatter
     # failure). Merged into get_drop_stats() and survives shutdown.
     self._local_drop_counts: dict[str, int] = {}
+    # Guards every read-modify-write and snapshot of _local_drop_counts:
+    # events run on loops in different threads, and the unlocked
+    # increment/fold underreported losses under contention (#6360 review
+    # round 7 P2-7).
+    self._drop_counts_guard = threading.Lock()
     self._is_shutting_down = False
     # Guards _setup_future/_started/_setup_* transitions across threads;
     # held only for pointer swaps, never across an await.
@@ -2950,10 +3111,11 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       )
       # Preserve the dead processor's loss accounting before discarding it
       # (#6360 review round 2 P2-6), mirroring shutdown().
-      for reason, count in state.batch_processor.get_drop_stats().items():
-        self._local_drop_counts[reason] = (
-            self._local_drop_counts.get(reason, 0) + count
-        )
+      with self._drop_counts_guard:
+        for reason, count in state.batch_processor.get_drop_stats().items():
+          self._local_drop_counts[reason] = (
+              self._local_drop_counts.get(reason, 0) + count
+          )
       # Rows still queued on the dead loop can never be written: count
       # them instead of discarding silently (#6360 review round 5 P2).
       stale_rows = 0
@@ -2966,9 +3128,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         except asyncio.QueueEmpty:
           pass
       if stale_rows:
-        self._local_drop_counts["stale_loop"] = (
-            self._local_drop_counts.get("stale_loop", 0) + stale_rows
-        )
+        with self._drop_counts_guard:
+          self._local_drop_counts["stale_loop"] = (
+              self._local_drop_counts.get("stale_loop", 0) + stale_rows
+          )
         logger.warning(
             "%d queued row(s) lost with closed loop %s.", stale_rows, id(loop)
         )
@@ -3060,8 +3223,18 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       logger.warning("Content formatter failed: %s", e)
       return "[FORMATTING FAILED]", False
 
-  async def _get_loop_state(self) -> _LoopState:
+  async def _get_loop_state(
+      self, claimed_generation: Optional[int] = None
+  ) -> _LoopState:
     """Gets or creates the state for the current event loop.
+
+    Args:
+        claimed_generation: The lifecycle generation the caller claimed
+          BEFORE its own awaits (setup passes the generation captured by
+          `_ensure_started`). Without it, a setup blocked ahead of this
+          call sampled the post-shutdown generation on resume and
+          published a writer that shutdown's snapshot could never see
+          (#6360 review round 7 P1-5).
 
     Returns:
         The loop-specific state object containing clients and processors.
@@ -3077,7 +3250,13 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # generation, and the publication guard rechecks it — otherwise the
     # new processor lands in the dict AFTER shutdown's snapshot/clear and
     # leaks past close() (#6360 review round 6 P1-2).
-    generation = self._generation
+    generation = (
+        claimed_generation
+        if claimed_generation is not None
+        else self._generation
+    )
+    if self._generation != generation:
+      raise RuntimeError("BigQuery plugin is shutting down.")
     self._cleanup_stale_loop_states()
     if loop in self._loop_state_by_loop:
       return self._loop_state_by_loop[loop]
@@ -3180,22 +3359,34 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     Reasons are LOSS INCIDENTS, not uniformly dropped rows:
     ``formatter_failed`` means the row WAS written with its content
     replaced by a sentinel; ``setup_unavailable``, ``shutdown_race``,
-    ``shutdown_timeout``, and ``stale_loop`` mean the row was never
-    written. Counters persist across shutdown and loop cleanup.
+    ``shutdown_timeout``, ``shutdown_cancelled``, and ``stale_loop`` mean
+    the row was never written. Counters persist across shutdown and loop
+    cleanup.
 
     Returns:
         Per-reason counts: plugin-level incidents plus every live loop
         processor's counters (dead processors are folded in at
         shutdown/cleanup time).
     """
-    totals: dict[str, int] = dict(self._local_drop_counts)
+    with self._drop_counts_guard:
+      totals: dict[str, int] = dict(self._local_drop_counts)
     for state in list(self._loop_state_by_loop.values()):
       for reason, count in state.batch_processor.get_drop_stats().items():
         totals[reason] = totals.get(reason, 0) + count
     return totals
 
-  async def _lazy_setup(self, **kwargs: Any) -> None:
-    """Performs lazy initialization of BigQuery clients and resources."""
+  async def _lazy_setup(
+      self, claimed_generation: Optional[int] = None, **kwargs: Any
+  ) -> None:
+    """Performs lazy initialization of BigQuery clients and resources.
+
+    Args:
+        claimed_generation: The lifecycle generation claimed by the
+          owning `_ensure_started` before any await; forwarded to
+          `_get_loop_state` so a shutdown that completes mid-setup is
+          detected even when it finishes before the loop-state phase
+          begins (#6360 review round 7 P1-5).
+    """
     if self._started:
       return
     loop = asyncio.get_running_loop()
@@ -3262,7 +3453,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           connection_id=self.config.connection_id,
       )
 
-    await self._get_loop_state()
+    await self._get_loop_state(claimed_generation=claimed_generation)
 
   @staticmethod
   def _atexit_cleanup(batch_processor: "BatchProcessor") -> None:
@@ -3579,9 +3770,13 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     Args:
         timeout: Maximum time to wait for the queue to drain.
     """
-    if self._is_shutting_down:
-      return
     with self._setup_guard:
+      # Atomic admission (#6360 review round 7 P1-6): checked OUTSIDE the
+      # lock, two threads could both observe False, both claim shutdown,
+      # tear down the same snapshot twice, and double-fold identical drop
+      # counters. Exactly one caller per generation gets past this point.
+      if self._is_shutting_down:
+        return
       self._is_shutting_down = True
       # Invalidate any in-flight setup: its completion must not resurrect
       # _started after this method returns (#6360 review round 5 P1-2).
@@ -3629,11 +3824,12 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # Fold processor drop counters into the persistent plugin-level
       # counters before discarding loop state, so get_drop_stats() keeps
       # reporting losses after shutdown (#6360 review P2-5).
-      for state in states_snapshot.values():
-        for reason, count in state.batch_processor.get_drop_stats().items():
-          self._local_drop_counts[reason] = (
-              self._local_drop_counts.get(reason, 0) + count
-          )
+      with self._drop_counts_guard:
+        for state in states_snapshot.values():
+          for reason, count in state.batch_processor.get_drop_stats().items():
+            self._local_drop_counts[reason] = (
+                self._local_drop_counts.get(reason, 0) + count
+            )
       with self._loop_states_guard:
         self._loop_state_by_loop.clear()
 
@@ -3671,6 +3867,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     state["_setup_future"] = None
     state["_generation"] = 0
     state["_loop_states_guard"] = None
+    state["_drop_counts_guard"] = None
     state["client"] = None
     state["_loop_state_by_loop"] = {}
     state["_write_stream_name"] = None
@@ -3701,6 +3898,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     self._setup_future = None
     self._generation = 0
     self._loop_states_guard = threading.Lock()
+    self._drop_counts_guard = threading.Lock()
     # Pickles from older code bypass __init__, so re-validate the restored
     # configuration: e.g. a legacy retry_config with max_retries=NaN would
     # otherwise skip the write loop silently (#6360 review round 2 P2-7).
@@ -3751,6 +3949,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     self._setup_future = None
     self._generation = 0
     self._loop_states_guard = threading.Lock()
+    self._drop_counts_guard = threading.Lock()
     self.client = None
     self._loop_state_by_loop = {}
     self._write_stream_name = None
@@ -3766,7 +3965,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
   def _count_local_drop(self, reason: str) -> None:
     """Counts a row lost before/outside any BatchProcessor (#6356 P2)."""
-    self._local_drop_counts[reason] = self._local_drop_counts.get(reason, 0) + 1
+    with self._drop_counts_guard:
+      self._local_drop_counts[reason] = (
+          self._local_drop_counts.get(reason, 0) + 1
+      )
 
   async def close(self) -> None:
     """Releases all plugin resources (BasePlugin/PluginManager contract).
@@ -3865,7 +4067,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       return
 
     try:
-      await self._lazy_setup(**kwargs)
+      await self._lazy_setup(claimed_generation=claimed_generation, **kwargs)
     except asyncio.CancelledError:
       # Owner cancelled mid-setup: without this, the pending future was
       # never finalized and every later _ensure_started waited forever
@@ -3879,12 +4081,31 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         )
       raise
     except Exception as e:
+      aborted = False
       with self._setup_guard:
-        self._startup_error = e
-        self._setup_failures += 1
-        backoff = min(60.0, 2.0 ** min(self._setup_failures, 6))
-        self._setup_retry_at = time.monotonic() + backoff
-        self._setup_future = None
+        if self._generation != claimed_generation:
+          # shutdown() completed while setup was blocked; the failure is
+          # the abort itself, not a service error, so it must not poison
+          # the backoff window — and the partially created resources must
+          # be released (#6360 review round 7 P1-5).
+          aborted = True
+          self._setup_future = None
+        else:
+          self._startup_error = e
+          self._setup_failures += 1
+          backoff = min(60.0, 2.0 ** min(self._setup_failures, 6))
+          self._setup_retry_at = time.monotonic() + backoff
+          self._setup_future = None
+      if aborted:
+        if not setup_future.done():
+          setup_future.set_exception(
+              RuntimeError(
+                  "BigQuery plugin setup aborted: shutdown during setup."
+              )
+          )
+        self._count_local_drop("shutdown_race")
+        await self._teardown_aborted_setup()
+        return
       logger.error(
           "Failed to initialize BigQuery Plugin (attempt %d, next"
           " retry in %.0fs): %s",
@@ -3923,6 +4144,56 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           setup_future.set_result(None)
       if aborted:
         self._count_local_drop("shutdown_race")
+        # Setup fully succeeded but lost the generation race: everything
+        # it created outlives a shutdown that already returned — release
+        # it (#6360 review round 7 P1-5).
+        await self._teardown_aborted_setup()
+
+  async def _teardown_aborted_setup(self) -> None:
+    """Releases every resource created by a setup that crossed a shutdown.
+
+    A setup attempt that lost the generation race used to count the loss
+    and stop, leaving the freshly created shared client, executor,
+    parser/offloader, and any published loop state alive on a plugin
+    whose shutdown() had already returned (#6360 review round 7 P1-5).
+    """
+    try:
+      loop = asyncio.get_running_loop()
+    except RuntimeError:
+      loop = None
+    state = None
+    if loop is not None:
+      with self._loop_states_guard:
+        state = self._loop_state_by_loop.pop(loop, None)
+    if state is not None:
+      try:
+        await state.batch_processor.shutdown(
+            timeout=self.config.shutdown_timeout
+        )
+      except Exception:
+        pass
+      transport = getattr(state.write_client, "transport", None)
+      if transport:
+        try:
+          await transport.close()
+        except Exception:
+          pass
+    self.offloader = None
+    self.parser = None
+    client, self.client = self.client, None
+    executor, self._executor = self._executor, None
+    if client is not None:
+      try:
+        await asyncio.get_running_loop().run_in_executor(None, client.close)
+      except Exception:
+        pass
+    if executor is not None:
+      try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: executor.shutdown(wait=True)
+        )
+      except Exception:
+        pass
 
   @staticmethod
   def _resolve_ids(
