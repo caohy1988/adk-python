@@ -7784,7 +7784,12 @@ class TestMultiLoopShutdownDrainsOtherLoops:
       mock_to_arrow_schema,
       mock_asyncio_to_thread,
   ):
-    """Shutdown drains batch_processor.shutdown on non-current loops."""
+    """Shutdown drains batch_processor.shutdown on non-current loops.
+
+    Uses a REAL second loop: since #6360 round 10 P1-4 the drain task is
+    created inside the remote loop's own callback (no
+    run_coroutine_threadsafe), so the drain must actually execute there.
+    """
     plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
         project_id=PROJECT_ID,
         dataset_id=DATASET_ID,
@@ -7792,42 +7797,41 @@ class TestMultiLoopShutdownDrainsOtherLoops:
     )
     await plugin._ensure_started()
 
-    # Create a mock "other" loop with a mock batch processor.
-    other_loop = mock.MagicMock(spec=asyncio.AbstractEventLoop)
-    other_loop.is_closed.return_value = False
+    other_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=other_loop.run_forever, daemon=True)
+    thread.start()
+    try:
+      drain_thread_ids = []
 
-    mock_other_bp = mock.AsyncMock()
-    mock_other_write_client = mock.MagicMock()
-    mock_other_write_client.transport = mock.AsyncMock()
+      async def record_shutdown(timeout=None):
+        del timeout
+        drain_thread_ids.append(threading.get_ident())
 
-    other_state = bigquery_agent_analytics_plugin._LoopState(
-        write_client=mock_other_write_client,
-        batch_processor=mock_other_bp,
-    )
-    plugin._loop_state_by_loop[other_loop] = other_state
+      mock_other_bp = mock.MagicMock(
+          spec=bigquery_agent_analytics_plugin.BatchProcessor
+      )
+      mock_other_bp.shutdown = record_shutdown
+      mock_other_bp.get_drop_stats = mock.MagicMock(return_value={})
+      mock_other_write_client = mock.MagicMock()
+      mock_other_write_client.transport = mock.AsyncMock()
 
-    # Patch run_coroutine_threadsafe to verify it's called for
-    # the other loop's batch_processor.  Close the coroutine arg
-    # to avoid "coroutine was never awaited" RuntimeWarning.
-    mock_future = mock.MagicMock()
-    mock_future.result.return_value = None
+      other_state = bigquery_agent_analytics_plugin._LoopState(
+          write_client=mock_other_write_client,
+          batch_processor=mock_other_bp,
+      )
+      plugin._loop_state_by_loop[other_loop] = other_state
 
-    def _fake_run_coroutine_threadsafe(coro, loop):
-      coro.close()
-      return mock_future
+      await plugin.shutdown(timeout=5)
 
-    with mock.patch.object(
-        asyncio,
-        "run_coroutine_threadsafe",
-        side_effect=_fake_run_coroutine_threadsafe,
-    ) as mock_rcts:
-      await plugin.shutdown()
-
-      # Verify run_coroutine_threadsafe was called with
-      # the other loop.
-      mock_rcts.assert_called()
-      call_args = mock_rcts.call_args
-      assert call_args[0][1] is other_loop
+      # The drain ran on the OTHER loop's thread and the state was
+      # claimed after a clean completion.
+      assert drain_thread_ids == [thread.ident]
+      assert other_loop not in plugin._loop_state_by_loop
+      mock_other_write_client.transport.close.assert_awaited()
+    finally:
+      other_loop.call_soon_threadsafe(other_loop.stop)
+      thread.join(timeout=5)
+      other_loop.close()
 
 
 class TestCacheMetadataLogging:
@@ -10083,7 +10087,10 @@ class TestIssue6356Hardening:
             ),
         )
       assert "TOPSECRET-PAYLOAD" not in caplog.text
-      assert "ValueError" in caplog.text
+      # Round-10 P2-7: the message is CONSTANT — even the exception class
+      # name can be payload-derived, so it is no longer logged.
+      assert "Content formatter failed" in caplog.text
+      assert "ValueError" not in caplog.text
 
   @pytest.mark.asyncio
   async def test_shutdown_folds_processor_drops_into_stats(
@@ -10767,6 +10774,199 @@ class TestIssue6356Hardening:
       sys.setswitchinterval(old_interval)
 
     assert plugin.get_drop_stats()["stress"] == increments * n_threads
+
+  def test_unterminated_quoted_container_fails_closed(self):
+    """Round-10 P1-1: a quoted layer that visibly begins an encoded
+    container but is missing its final quote fails closed; unterminated
+    quoted prose passes through."""
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+
+    v = '"{\\"access_token\\":\\"R10-SECRET\\"}'
+    out, truncated = truncate({"cache": v}, 10000)
+    assert "R10-SECRET" not in json.dumps(out)
+    assert out["cache"] == "[UNPARSEABLE_JSON_BLOB]"
+    assert truncated is True
+
+    prose = '"unterminated prose without a container'
+    out, truncated = truncate({"s": prose}, 10000)
+    assert out["s"] == prose
+    assert truncated is False
+
+  @pytest.mark.asyncio
+  async def test_identity_formatter_preserves_native_shapes(
+      self,
+      mock_write_client,
+      invocation_context,
+      callback_context,
+      mock_auth_default,
+      mock_bq_client,
+      mock_to_arrow_schema,
+      dummy_arrow_schema,
+      mock_asyncio_to_thread,
+  ):
+    """Round-10 P1-2: an identity formatter must not destroy parser-native
+    shapes (dict/list) that it returns untransformed."""
+    _ = mock_auth_default, mock_bq_client
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=lambda content, event_type: content
+    )
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    ) as plugin:
+      await plugin._ensure_started()
+      mock_write_client.append_rows.reset_mock()
+      bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+      await plugin._log_event(
+          "STATE_DELTA",
+          callback_context,
+          raw_content={"response": "safe-dict-content"},
+          event_data=bigquery_agent_analytics_plugin.EventData(),
+      )
+      await asyncio.sleep(0.01)
+      log_entry = await _get_captured_event_dict_async(
+          mock_write_client, dummy_arrow_schema
+      )
+      assert "safe-dict-content" in json.dumps(log_entry, default=str)
+      assert (
+          bigquery_agent_analytics_plugin._FORMATTER_FAILED_SENTINEL
+          not in json.dumps(log_entry, default=str)
+      )
+      assert plugin.get_drop_stats().get("formatter_failed", 0) == 0
+
+  @pytest.mark.asyncio
+  async def test_waiter_retries_after_cancelled_owner_shutdown(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """Round-10 P1-3: a coalesced caller must not claim success when the
+    owning shutdown was cancelled mid-teardown; it retries ownership and
+    finishes the job."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    gate = asyncio.Event()
+    calls = []
+
+    async def gated_first_shutdown(timeout=None):
+      del timeout
+      calls.append(1)
+      if len(calls) == 1:
+        await gate.wait()
+
+    state = mock.MagicMock()
+    state.write_client = None
+    state.batch_processor = mock.MagicMock(
+        spec=bigquery_agent_analytics_plugin.BatchProcessor
+    )
+    state.batch_processor.shutdown = mock.AsyncMock(
+        side_effect=gated_first_shutdown
+    )
+    state.batch_processor.get_drop_stats = mock.MagicMock(return_value={})
+    plugin._loop_state_by_loop[asyncio.get_running_loop()] = state
+
+    owner = asyncio.create_task(plugin.shutdown(timeout=5))
+    await asyncio.sleep(0.05)
+    waiter = asyncio.create_task(plugin.shutdown())
+    await asyncio.sleep(0.05)
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await owner
+
+    # The waiter retried ownership and completed the teardown.
+    await asyncio.wait_for(waiter, timeout=5)
+    assert plugin._loop_state_by_loop == {}
+    assert len(calls) == 2
+
+  @pytest.mark.asyncio
+  async def test_slow_remote_drain_is_retained_without_close_errors(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """Round-10 P1-4: a remote drain still running at the deadline is
+    retained and keeps running remotely; the caller never closes a
+    coroutine it no longer owns (no 'coroutine already executing')."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    remote_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=remote_loop.run_forever, daemon=True)
+    thread.start()
+    try:
+      release = threading.Event()
+      drain_finished = threading.Event()
+
+      async def slow_drain(timeout=None):
+        del timeout
+        while not release.is_set():
+          await asyncio.sleep(0.01)
+        drain_finished.set()
+
+      bp = mock.MagicMock(spec=bigquery_agent_analytics_plugin.BatchProcessor)
+      bp.shutdown = slow_drain
+      bp.get_drop_stats = mock.MagicMock(return_value={})
+      state = mock.MagicMock()
+      state.write_client = None
+      state.batch_processor = bp
+      plugin._loop_state_by_loop[remote_loop] = state
+
+      await plugin.shutdown(timeout=0.2)
+      # Timed out: state retained, no ValueError from closing a running
+      # coroutine (shutdown would have logged/raised through its guard).
+      assert remote_loop in plugin._loop_state_by_loop
+      # The remote drain keeps running to completion on its own loop.
+      release.set()
+      assert drain_finished.wait(timeout=5)
+    finally:
+      remote_loop.call_soon_threadsafe(remote_loop.stop)
+      thread.join(timeout=5)
+      remote_loop.close()
+
+  @pytest.mark.asyncio
+  async def test_formatter_logs_never_carry_payload_derived_names(
+      self,
+      mock_write_client,
+      invocation_context,
+      callback_context,
+      mock_auth_default,
+      mock_bq_client,
+      mock_to_arrow_schema,
+      dummy_arrow_schema,
+      mock_asyncio_to_thread,
+      caplog,
+  ):
+    """Round-10 P2-7: formatter log lines are constant — payload-derived
+    result/exception CLASS NAMES never reach the logs."""
+    _ = mock_auth_default, mock_bq_client
+    secret_result_cls = type("R10_RESULT_SECRET", (), {})
+    secret_error_cls = type("R10_ERROR_SECRET", (Exception,), {})
+
+    outcomes = iter([secret_result_cls(), None])
+
+    def formatter(content, event_type):
+      del content, event_type
+      value = next(outcomes)
+      if value is None:
+        raise secret_error_cls()
+      return value
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=formatter
+    )
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    ) as plugin:
+      await plugin._ensure_started()
+      bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+      with caplog.at_level(logging.WARNING):
+        for _ in range(2):
+          await plugin._log_event(
+              "STATE_DELTA",
+              callback_context,
+              event_data=bigquery_agent_analytics_plugin.EventData(),
+          )
+      assert "R10_RESULT_SECRET" not in caplog.text
+      assert "R10_ERROR_SECRET" not in caplog.text
+      assert plugin.get_drop_stats().get("formatter_failed", 0) == 2
 
   def test_unicode_ws_and_bom_quoted_layers_fail_closed(self):
     """Round-8 P1-1: BOM/NBSP/EM-SPACE prefixes inside quoted JSON layers
