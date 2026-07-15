@@ -549,28 +549,37 @@ def _sanitize_json_blob(
       # a harmless quoted prefix ('"note" {"access_token":...}') (#6360
       # review round 8 P1-2). A literal container-token scan is sound for
       # RAW text that no later step decodes; a leading stray escape
-      # cannot be classified and fails closed. Everything else that is
-      # not itself a quoted document is ordinary prose ('"hello" she
-      # said') and passes through.
+      # cannot be classified and fails closed.
       return "[UNPARSEABLE_JSON_BLOB]", True, True
-    if stripped_suffix.startswith('"'):
-      # The suffix is ITSELF a quoted JSON document, whose decoded
-      # content can hide a container behind Unicode escapes
-      # ('"note" "\\u007b...access_token...\\u007d"') that the literal
-      # scan above cannot see (#6360 review round 11 P1-1). Recurse under
-      # the same depth/size bounds so it goes through full decoding.
-      s_sanitized, s_changed, s_truncated = _sanitize_json_blob(
-          stripped_suffix, seen, depth + 1, max_len, budget
-      )
-    else:
+    quote_idx = suffix.find('"')
+    if quote_idx == -1:
+      # Pure raw prose with no quoted fragment at all.
       s_sanitized, s_changed, s_truncated = suffix, False, False
+    else:
+      # ANY quoted fragment in the trailing text may be an encoded JSON
+      # document whose decoded content hides a container behind Unicode
+      # escapes — immediately ('"note" "\\u007b..."', round 11 P1-1) or
+      # after a stretch of prose ('"note" then "\\u007b..."', #6360
+      # review round 12 P1-1). Recurse on the tail starting at the first
+      # quote; the quoted branch walks ITS suffix the same way, so
+      # document/prose chains are covered to the depth cap. An escape in
+      # the prose gap could shift a consumer's parse boundaries and
+      # cannot be verified — fail closed.
+      gap = suffix[:quote_idx]
+      if "\\" in gap:
+        return "[UNPARSEABLE_JSON_BLOB]", True, True
+      tail = suffix[quote_idx:]
+      t_sanitized, s_changed, s_truncated = _sanitize_json_blob(
+          tail, seen, depth + 1, max_len, budget
+      )
+      s_sanitized = gap + t_sanitized if s_changed else suffix
     p_sanitized, p_changed, p_truncated = _sanitize_json_blob(
         decoded, seen, depth + 1, max_len, budget
     )
     if not p_changed and not s_changed:
       return value, False, False
     prefix_text = stripped[:end] if not p_changed else json.dumps(p_sanitized)
-    suffix_text = suffix if not s_changed else " " + s_sanitized
+    suffix_text = suffix if not s_changed else s_sanitized
     return prefix_text + suffix_text, True, p_truncated or s_truncated
   if not stripped.startswith(("{", "[")):
     return value, False, False
@@ -4047,23 +4056,26 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     Args:
         timeout: Maximum time to wait for the queue to drain.
     """
-    waiter: Optional["ConcurrentFuture[None]"] = None
-    with self._setup_guard:
-      # Atomic admission (#6360 review round 7 P1-6): checked OUTSIDE the
-      # lock, two threads could both observe False, both claim shutdown,
-      # tear down the same snapshot twice, and double-fold identical drop
-      # counters. Exactly one caller per generation gets past this point.
-      if self._is_shutting_down:
-        waiter = self._shutdown_future
-      else:
-        self._is_shutting_down = True
-        # Invalidate any in-flight setup: its completion must not
-        # resurrect _started after this method returns (#6360 review
-        # round 5 P1-2).
-        self._generation += 1
-        self._started = False
-        self._shutdown_future = ConcurrentFuture()
-    if waiter is not None:
+    while True:
+      waiter: Optional["ConcurrentFuture[None]"] = None
+      with self._setup_guard:
+        # Atomic admission (#6360 review round 7 P1-6): checked OUTSIDE
+        # the lock, two threads could both observe False, both claim
+        # shutdown, tear down the same snapshot twice, and double-fold
+        # identical drop counters. Exactly one caller per generation gets
+        # past this point.
+        if self._is_shutting_down:
+          waiter = self._shutdown_future
+        else:
+          self._is_shutting_down = True
+          # Invalidate any in-flight setup: its completion must not
+          # resurrect _started after this method returns (#6360 review
+          # round 5 P1-2).
+          self._generation += 1
+          self._started = False
+          self._shutdown_future = ConcurrentFuture()
+      if waiter is None:
+        break  # this caller owns the teardown below
       # Coalesce on the active owner: returning early made a concurrent
       # `await plugin.close()` claim completion microseconds into another
       # caller's teardown (#6360 review round 9 P1-5). shield: this
@@ -4071,11 +4083,12 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       try:
         await asyncio.shield(asyncio.wrap_future(waiter))
       except _ShutdownIncompleteError:
-        # The owner was cancelled mid-teardown; returning now would claim
-        # success while state is still live (#6360 review round 10 P1-3).
-        # Retry ownership: the owner's finally released the admission
-        # flag, so this call claims the next teardown.
-        await self.shutdown(timeout=timeout)
+        # The owner was cancelled or failed mid-teardown; returning now
+        # would claim success while state is still live (#6360 review
+        # round 10 P1-3). Retry ownership — as a LOOP, not recursion, so
+        # depth does not grow with the number of coalesced callers
+        # (#6360 review round 12 P1-3).
+        continue
       except Exception:
         pass
       return
@@ -4087,6 +4100,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     with self._loop_states_guard:
       states_snapshot = dict(self._loop_state_by_loop)
     teardown_completed = False
+    teardown_error: Optional[BaseException] = None
     try:
       # Correct Multi-Loop Shutdown:
       # 1. Shutdown current loop's processor directly.
@@ -4280,7 +4294,11 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # teardown_completed stays False: reporting success here let both
       # the owner and coalesced waiters return normally while the loop
       # state was still live (#6360 review round 11 P1-3). Waiters
-      # receive _ShutdownIncompleteError and retry ownership.
+      # receive _ShutdownIncompleteError and retry ownership; the OWNER
+      # re-raises after the finally so its caller sees the failure too —
+      # PluginManager.close() aggregates plugin close failures (#6360
+      # review round 12 P1-3).
+      teardown_error = e
       logger.error("Error during shutdown: %s", e, exc_info=True)
     finally:
       # Cancellation-safe reset: PluginManager's close timeout cancels this
@@ -4314,9 +4332,13 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         else:
           completion.set_exception(
               _ShutdownIncompleteError(
-                  "Owning shutdown was cancelled before teardown completed."
+                  "Owning shutdown did not complete teardown."
               )
           )
+    if teardown_error is not None:
+      # The owning caller must not report success over live state (#6360
+      # review round 12 P1-3).
+      raise teardown_error
 
   def __getstate__(self) -> dict[str, Any]:
     """Custom pickling to exclude non-picklable runtime objects."""
@@ -5118,15 +5140,20 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             # Normalize str subclasses to the exact built-in (#6360
             # round 9 P1-1 / round 7 P1-3).
             formatted = str.__str__(formatted)
-        elif formatted is not None and not isinstance(
-            formatted,
+        elif formatted is not None and not (
             # Every shape the parser handles NATIVELY: identity and
             # conditional formatters legitimately return these, and the
             # round-9 str/Content/None-only gate destroyed untransformed
             # LlmRequest/dict/list events (#6360 review round 10 P1-2).
-            # Only results that would reach the parser's arbitrary
-            # str(content) fallback fail closed.
-            (types.Content, types.Part, LlmRequest, dict, list),
+            # Model shapes require the EXACT class: a subclass can
+            # override an attribute the parser reads OUTSIDE this
+            # boundary and raise a payload-bearing exception into the
+            # safe callback's traceback log (#6360 review round 12
+            # P1-2). dict/list subclasses stay isinstance-based — the
+            # parser routes them through the hardened recursive
+            # sanitizer, whose protocol boundary already fails closed.
+            type(formatted) in (types.Content, types.Part, LlmRequest)
+            or isinstance(formatted, (dict, list))
         ):
           # The formatter is typed Any: a non-native result would reach
           # the parser's unconditional str(content) fallback OUTSIDE this

@@ -10775,6 +10775,130 @@ class TestIssue6356Hardening:
 
     assert plugin.get_drop_stats()["stress"] == increments * n_threads
 
+  def test_prose_then_encoded_document_redacted(self):
+    """Round-12 P1-1: an encoded credential document after a stretch of
+    raw prose in the suffix is still decoded and redacted."""
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+
+    v = '"note" then "\\u007b\\"access_token\\":\\"R12-SECRET\\"\\u007d"'
+    out, truncated = truncate({"b": v}, 10000)
+    assert "R12-SECRET" not in json.dumps(out)
+    assert "[REDACTED]" in out["b"]
+    del truncated
+
+    # A chain of prose and documents is walked to the depth cap.
+    chain = (
+        '"note" one "plain" two'
+        ' "\\u007b\\"refresh_token\\":\\"R12-CHAIN-SECRET\\"\\u007d"'
+    )
+    out, _ = truncate({"b": chain}, 10000)
+    assert "R12-CHAIN-SECRET" not in json.dumps(out)
+
+    # An escape hidden in a prose gap cannot be verified.
+    out, truncated = truncate({"s": '"note" \\then "x"'}, 10000)
+    assert out["s"] == "[UNPARSEABLE_JSON_BLOB]"
+    assert truncated is True
+
+    # Multi-quote prose still passes through.
+    prose = '"a" and then "b" happened'
+    out, truncated = truncate({"s": prose}, 10000)
+    assert out["s"] == prose
+    assert truncated is False
+
+  @pytest.mark.asyncio
+  async def test_native_subclass_formatter_result_fails_closed(
+      self,
+      mock_write_client,
+      invocation_context,
+      callback_context,
+      mock_auth_default,
+      mock_bq_client,
+      mock_to_arrow_schema,
+      dummy_arrow_schema,
+      mock_asyncio_to_thread,
+      caplog,
+  ):
+    """Round-12 P1-2: a SUBCLASS of a parser-native model shape from the
+    formatter fails closed at the boundary instead of reaching parser
+    attribute accesses outside it."""
+    _ = mock_auth_default, mock_bq_client
+
+    class SubRequest(llm_request_lib.LlmRequest):
+      pass
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=lambda content, event_type: SubRequest()
+    )
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    ) as plugin:
+      await plugin._ensure_started()
+      mock_write_client.append_rows.reset_mock()
+      bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+      with caplog.at_level(logging.WARNING):
+        await plugin._log_event(
+            "STATE_DELTA",
+            callback_context,
+            event_data=bigquery_agent_analytics_plugin.EventData(),
+        )
+      await asyncio.sleep(0.01)
+      log_entry = await _get_captured_event_dict_async(
+          mock_write_client, dummy_arrow_schema
+      )
+      assert (
+          bigquery_agent_analytics_plugin._FORMATTER_FAILED_SENTINEL
+          in log_entry["content"]
+      )
+      assert "SubRequest" not in caplog.text
+      assert plugin.get_drop_stats().get("formatter_failed", 0) == 1
+
+  @pytest.mark.asyncio
+  async def test_persistent_teardown_failure_raises_to_all_callers(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """Round-12 P1-3: a persistently failing teardown must not report
+    success to the owner or to retrying waiters."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def always_failing_drain(timeout=None):
+      del timeout
+      calls.append(1)
+      if len(calls) == 1:
+        entered.set()
+        await release.wait()
+      raise RuntimeError("drain always fails")
+
+    state = mock.MagicMock()
+    state.write_client = None
+    state.batch_processor = mock.MagicMock(
+        spec=bigquery_agent_analytics_plugin.BatchProcessor
+    )
+    state.batch_processor.shutdown = mock.AsyncMock(
+        side_effect=always_failing_drain
+    )
+    state.batch_processor.get_drop_stats = mock.MagicMock(return_value={})
+    plugin._loop_state_by_loop[asyncio.get_running_loop()] = state
+
+    owner = asyncio.create_task(plugin.shutdown(timeout=5))
+    await entered.wait()
+    waiter = asyncio.create_task(plugin.shutdown())
+    await asyncio.sleep(0.05)
+    release.set()
+    with pytest.raises(RuntimeError, match="drain always fails"):
+      await owner
+    # The retrying waiter becomes the owner, fails the same way, and
+    # surfaces the failure instead of returning success over live state.
+    with pytest.raises(RuntimeError, match="drain always fails"):
+      await asyncio.wait_for(waiter, timeout=5)
+    assert len(calls) == 2
+    assert plugin._loop_state_by_loop != {}
+
   def test_unicode_escaped_trailing_document_redacted(self):
     """Round-11 P1-1: a trailing quoted JSON document whose decoded
     content hides a container behind Unicode escapes is decoded and
@@ -10839,7 +10963,10 @@ class TestIssue6356Hardening:
     waiter = asyncio.create_task(plugin.shutdown())
     await asyncio.sleep(0.05)
     release.set()
-    await owner  # owner logs and returns
+    # Round-12 P1-3: the OWNER must not report success over live state —
+    # the teardown error propagates to its caller.
+    with pytest.raises(RuntimeError, match="first drain fails"):
+      await owner
     # The waiter must not have accepted the failed teardown as success:
     # it retries ownership, the second drain succeeds, state is claimed.
     await asyncio.wait_for(waiter, timeout=5)
