@@ -10775,6 +10775,119 @@ class TestIssue6356Hardening:
 
     assert plugin.get_drop_stats()["stress"] == increments * n_threads
 
+  def test_unicode_escaped_trailing_document_redacted(self):
+    """Round-11 P1-1: a trailing quoted JSON document whose decoded
+    content hides a container behind Unicode escapes is decoded and
+    redacted; quoted prose and prose suffixes stay untouched."""
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+
+    v = '"note" "\\u007b\\"access_token\\":\\"R11-SECRET\\"\\u007d"'
+    out, truncated = truncate({"b": v}, 10000)
+    assert "R11-SECRET" not in json.dumps(out)
+    assert "[REDACTED]" in out["b"]
+    del truncated
+
+    # A stray leading escape in the suffix cannot be classified.
+    out, truncated = truncate({"s": '"note" \\x'}, 10000)
+    assert out["s"] == "[UNPARSEABLE_JSON_BLOB]"
+    assert truncated is True
+
+    for prose in (
+        '"hello" she said',
+        '"a" and then "b" happened',
+        '"note" "just more prose"',
+    ):
+      out, truncated = truncate({"s": prose}, 10000)
+      assert out["s"] == prose
+      assert truncated is False
+
+  @pytest.mark.asyncio
+  async def test_waiter_retries_after_failed_owner_teardown(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """Round-11 P1-3: an ordinary teardown exception must not report
+    successful completion to coalesced waiters; they retry ownership."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def failing_first_drain(timeout=None):
+      del timeout
+      calls.append(1)
+      if len(calls) == 1:
+        entered.set()
+        await release.wait()
+        raise RuntimeError("first drain fails")
+
+    state = mock.MagicMock()
+    state.write_client = None
+    state.batch_processor = mock.MagicMock(
+        spec=bigquery_agent_analytics_plugin.BatchProcessor
+    )
+    state.batch_processor.shutdown = mock.AsyncMock(
+        side_effect=failing_first_drain
+    )
+    state.batch_processor.get_drop_stats = mock.MagicMock(return_value={})
+    plugin._loop_state_by_loop[asyncio.get_running_loop()] = state
+
+    owner = asyncio.create_task(plugin.shutdown(timeout=5))
+    await entered.wait()
+    waiter = asyncio.create_task(plugin.shutdown())
+    await asyncio.sleep(0.05)
+    release.set()
+    await owner  # owner logs and returns
+    # The waiter must not have accepted the failed teardown as success:
+    # it retries ownership, the second drain succeeds, state is claimed.
+    await asyncio.wait_for(waiter, timeout=5)
+    assert len(calls) == 2
+    assert plugin._loop_state_by_loop == {}
+
+  @pytest.mark.asyncio
+  @pytest.mark.filterwarnings("error::RuntimeWarning")
+  async def test_rejecting_task_factory_does_not_leak_coroutine(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """Round-11 P2-4: if the remote loop's task factory rejects task
+    creation, the drain coroutine is closed instead of leaking."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    remote_loop = asyncio.new_event_loop()
+
+    def rejecting_factory(loop, coro, **kwargs):
+      del loop, coro, kwargs
+      raise RuntimeError("factory rejects")
+
+    remote_loop.set_task_factory(rejecting_factory)
+    thread = threading.Thread(target=remote_loop.run_forever, daemon=True)
+    thread.start()
+    try:
+      state = mock.MagicMock()
+      state.write_client = None
+      bp = mock.MagicMock(spec=bigquery_agent_analytics_plugin.BatchProcessor)
+
+      async def drain(timeout=None):
+        del timeout
+
+      bp.shutdown = drain
+      bp.get_drop_stats = mock.MagicMock(return_value={})
+      state.batch_processor = bp
+      plugin._loop_state_by_loop[remote_loop] = state
+
+      await plugin.shutdown(timeout=2)
+      # The failed drain retains the state; no never-awaited warning
+      # (filterwarnings turns it into a hard error).
+      assert remote_loop in plugin._loop_state_by_loop
+    finally:
+      remote_loop.call_soon_threadsafe(remote_loop.stop)
+      thread.join(timeout=5)
+      remote_loop.close()
+
   def test_unterminated_quoted_container_fails_closed(self):
     """Round-10 P1-1: a quoted layer that visibly begins an encoded
     container but is missing its final quote fails closed; unterminated

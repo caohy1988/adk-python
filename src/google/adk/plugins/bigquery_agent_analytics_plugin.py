@@ -543,21 +543,35 @@ def _sanitize_json_blob(
       suffix = stripped[end:]
     if not isinstance(decoded, str):
       return value, False, False
-    if "{" in suffix or "[" in suffix:
-      # The unverified raw suffix can smuggle a credential container past
+    stripped_suffix = _strip_bom_ws(suffix)
+    if "{" in suffix or "[" in suffix or stripped_suffix.startswith("\\"):
+      # An unverified raw suffix can smuggle a credential container past
       # a harmless quoted prefix ('"note" {"access_token":...}') (#6360
-      # review round 8 P1-2). The suffix is published verbatim with no
-      # later decode step, so a literal container-token scan is sound
-      # here — unlike inside JSON documents, where escapes bypass
-      # raw-substring checks. Container-free suffixes are ordinary quoted
-      # prose ('"hello" she said') and pass through.
+      # review round 8 P1-2). A literal container-token scan is sound for
+      # RAW text that no later step decodes; a leading stray escape
+      # cannot be classified and fails closed. Everything else that is
+      # not itself a quoted document is ordinary prose ('"hello" she
+      # said') and passes through.
       return "[UNPARSEABLE_JSON_BLOB]", True, True
-    sanitized, changed, truncated = _sanitize_json_blob(
+    if stripped_suffix.startswith('"'):
+      # The suffix is ITSELF a quoted JSON document, whose decoded
+      # content can hide a container behind Unicode escapes
+      # ('"note" "\\u007b...access_token...\\u007d"') that the literal
+      # scan above cannot see (#6360 review round 11 P1-1). Recurse under
+      # the same depth/size bounds so it goes through full decoding.
+      s_sanitized, s_changed, s_truncated = _sanitize_json_blob(
+          stripped_suffix, seen, depth + 1, max_len, budget
+      )
+    else:
+      s_sanitized, s_changed, s_truncated = suffix, False, False
+    p_sanitized, p_changed, p_truncated = _sanitize_json_blob(
         decoded, seen, depth + 1, max_len, budget
     )
-    if not changed:
+    if not p_changed and not s_changed:
       return value, False, False
-    return json.dumps(sanitized) + suffix, True, truncated
+    prefix_text = stripped[:end] if not p_changed else json.dumps(p_sanitized)
+    suffix_text = suffix if not s_changed else " " + s_sanitized
+    return prefix_text + suffix_text, True, p_truncated or s_truncated
   if not stripped.startswith(("{", "[")):
     return value, False, False
 
@@ -4003,11 +4017,14 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       if not cf.set_running_or_notify_cancel():
         return  # cancelled before the callback ran; nothing was created
 
+      coro = processor.shutdown(timeout=drain_timeout)
       try:
-        task = target_loop.create_task(
-            processor.shutdown(timeout=drain_timeout)
-        )
+        task = target_loop.create_task(coro)
       except Exception as exc:
+        # e.g. a custom task factory rejecting creation: the coroutine
+        # exists but was never scheduled — close it here or it leaks as
+        # never-awaited (#6360 review round 11 P2-4).
+        coro.close()
         cf.set_exception(exc)
         return
 
@@ -4260,7 +4277,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           pass
       teardown_completed = True
     except Exception as e:
-      teardown_completed = True  # logged and swallowed: not retryable
+      # teardown_completed stays False: reporting success here let both
+      # the owner and coalesced waiters return normally while the loop
+      # state was still live (#6360 review round 11 P1-3). Waiters
+      # receive _ShutdownIncompleteError and retry ownership.
       logger.error("Error during shutdown: %s", e, exc_info=True)
     finally:
       # Cancellation-safe reset: PluginManager's close timeout cancels this
@@ -4272,15 +4292,22 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # loop states not yet drained stay in _loop_state_by_loop, so a
       # retried shutdown() re-snapshots and finishes the job; the
       # cancellation itself propagates to the caller unchanged.
-      self._is_shutting_down = False
-      self._started = False
+      # ONE guarded transition for the admission flag, lifecycle flags,
+      # and the completion-future swap: resetting _is_shutting_down
+      # before taking the guard let a new caller claim shutdown and
+      # install ITS future in the gap, after which this owner resolved
+      # the wrong future and a third caller could observe
+      # _is_shutting_down=True with no future and fall into overlapping
+      # teardown (#6360 review round 11 P1-2).
+      with self._setup_guard:
+        self._is_shutting_down = False
+        self._started = False
+        completion, self._shutdown_future = self._shutdown_future, None
       # Wake coalesced callers. Success is only reported when teardown
       # actually ran to completion: resolving unconditionally let an
       # uncancelled waiter return from close() while the owner was
       # cancelled mid-teardown and state was still live (#6360 review
       # round 10 P1-3). On the incomplete path waiters retry ownership.
-      with self._setup_guard:
-        completion, self._shutdown_future = self._shutdown_future, None
       if completion is not None and not completion.done():
         if teardown_completed:
           completion.set_result(None)
