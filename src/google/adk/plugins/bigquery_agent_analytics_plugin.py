@@ -451,15 +451,18 @@ def _strip_bom_ws(value: str) -> str:
 
   json.dumps round-trips arbitrary Unicode, so a decoded string layer can
   hide a credential container behind U+00A0/U+2003-style whitespace that an
-  ASCII-only lstrip never removes (#6360 review round 8 P1-1). Default
-  str.lstrip covers every Unicode whitespace; BOM (U+FEFF) is not
-  whitespace, so both are stripped to a fixed point.
+  ASCII-only lstrip never removes (#6360 review round 8 P1-1). One linear
+  index scan: the earlier alternating lstrip loop re-sliced the remaining
+  suffix per whitespace/BOM pair, going quadratic on a legal prefix and
+  pinning the callback event loop (#6360 review round 9 P1-3). str.isspace
+  covers every Unicode whitespace; BOM (U+FEFF) is not whitespace, so both
+  are tested per character.
   """
-  while True:
-    stripped = value.lstrip().lstrip("\ufeff")
-    if stripped == value:
-      return stripped
-    value = stripped
+  i = 0
+  n = len(value)
+  while i < n and (value[i].isspace() or value[i] == "\ufeff"):
+    i += 1
+  return value[i:] if i else value
 
 
 def _sanitize_json_blob(
@@ -734,7 +737,9 @@ _SAFE_STR_TYPES: tuple[type, ...] = (
     decimal.Decimal,
     uuid.UUID,
     pathlib.PurePath,
-    enum.Enum,
+    # NOTE: enum.Enum is handled FIRST in the dispatch (before the scalar
+    # branches), not here — value-backed members would otherwise never
+    # reach this fallback (#6360 review round 9 P1-2).
     complex,
 )
 
@@ -815,7 +820,15 @@ def _recursive_smart_truncate(
     seen.add(obj_id)
 
   try:
-    if isinstance(obj, str):
+    if isinstance(obj, enum.Enum):
+      # BEFORE the scalar branches: a StrEnum / (str, Enum) / bytes-backed
+      # member is also an instance of its mixin type, so scalar dispatch
+      # normalized it with str.__str__ and published the underlying VALUE
+      # instead of the member name (#6360 review round 9 P1-2).
+      return _recursive_smart_truncate(
+          _base_str(enum.Enum, obj), max_len, seen, depth + 1, budget
+      )
+    elif isinstance(obj, str):
       if type(obj) is not str:
         # str subclasses can override lstrip/startswith/lower to
         # misreport their content while json.dumps still serializes the
@@ -906,9 +919,16 @@ def _recursive_smart_truncate(
           # round 8 P2-10): the first writer keeps the plain key; later
           # colliders keep their (sanitized) value under an explicit
           # marker instead of silently overwriting or being dropped at
-          # JSON parse time.
+          # JSON parse time. The marker is re-allocated until unique — a
+          # single fixed marker could alias (and overwrite) a legitimate
+          # user key already named "[KEY_COLLISION_n]..." (#6360 review
+          # round 9 P2-9).
           unsupported_keys += 1
-          k = f"[KEY_COLLISION_{unsupported_keys}]{k}"
+          candidate = f"[KEY_COLLISION_{unsupported_keys}]{k}"
+          while candidate in new_dict:
+            unsupported_keys += 1
+            candidate = f"[KEY_COLLISION_{unsupported_keys}]{k}"
+          k = candidate
           truncated_any = True
 
         if redact_value:
@@ -3207,6 +3227,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # held only for pointer swaps, never across an await.
     self._setup_guard = threading.Lock()
     self._setup_future: Optional["ConcurrentFuture[None]"] = None
+    # Concurrent shutdown callers coalesce on the active owner's
+    # completion future instead of returning before teardown finished
+    # (#6360 review round 9 P1-5).
+    self._shutdown_future: Optional["ConcurrentFuture[None]"] = None
     # Lifecycle generation: shutdown() bumps it so an in-flight setup that
     # completes afterwards cannot resurrect _started (#6360 round 5 P1-2).
     self._generation = 0
@@ -3256,15 +3280,18 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       )
       # Rows still queued on the dead loop can never be written: count
       # them instead of discarding silently (#6360 review round 5 P2).
+      # O(1) accounting (qsize minus tracked sentinels): this method runs
+      # on the callback event loop via _get_loop_state(), and the old
+      # per-item drain of an unbounded dead queue stalled the callback
+      # linearly with queue depth (#6360 review round 9 P2-10). The dead
+      # queue's storage is released with the state itself.
       stale_rows = 0
       queue = getattr(state.batch_processor, "_queue", None)
+      sentinels = getattr(state.batch_processor, "_sentinel_count", 0)
       if isinstance(queue, asyncio.Queue):
-        try:
-          while True:
-            if queue.get_nowait() is not _SHUTDOWN_SENTINEL:
-              stale_rows += 1
-        except asyncio.QueueEmpty:
-          pass
+        if not isinstance(sentinels, int):
+          sentinels = 0
+        stale_rows = max(0, queue.qsize() - sentinels)
       if stale_rows:
         with self._drop_counts_guard:
           self._local_drop_counts["stale_loop"] = (
@@ -3550,18 +3577,28 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       except asyncio.CancelledError:
         # Cancelling the await does not stop the constructor thread; the
         # eventual client was silently discarded and its connection pool
-        # never closed (#6360 review round 8 P2-14). The concurrent
-        # future's callback runs in the worker thread when construction
-        # finishes, so the orphan is closed regardless of loop state.
+        # never closed (#6360 review round 8 P2-14). The close itself is
+        # dispatched to a fresh thread: when the future is ALREADY done,
+        # add_done_callback runs the callback synchronously in THIS
+        # (event-loop) thread, and a slow client.close() would extend the
+        # host's cancellation window (#6360 review round 9 P1-7).
         def _close_eventual(f: "ConcurrentFuture[Any]") -> None:
           try:
             eventual = f.result()
           except Exception:
             return
-          try:
-            eventual.close()
-          except Exception:
-            pass
+
+          def _close() -> None:
+            try:
+              eventual.close()
+            except Exception:
+              pass
+
+          threading.Thread(
+              target=_close,
+              name="bqaa-orphan-client-close",
+              daemon=True,
+          ).start()
 
         client_future.add_done_callback(_close_eventual)
         raise
@@ -3933,18 +3970,32 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     Args:
         timeout: Maximum time to wait for the queue to drain.
     """
+    waiter: Optional["ConcurrentFuture[None]"] = None
     with self._setup_guard:
       # Atomic admission (#6360 review round 7 P1-6): checked OUTSIDE the
       # lock, two threads could both observe False, both claim shutdown,
       # tear down the same snapshot twice, and double-fold identical drop
       # counters. Exactly one caller per generation gets past this point.
       if self._is_shutting_down:
-        return
-      self._is_shutting_down = True
-      # Invalidate any in-flight setup: its completion must not resurrect
-      # _started after this method returns (#6360 review round 5 P1-2).
-      self._generation += 1
-      self._started = False
+        waiter = self._shutdown_future
+      else:
+        self._is_shutting_down = True
+        # Invalidate any in-flight setup: its completion must not
+        # resurrect _started after this method returns (#6360 review
+        # round 5 P1-2).
+        self._generation += 1
+        self._started = False
+        self._shutdown_future = ConcurrentFuture()
+    if waiter is not None:
+      # Coalesce on the active owner: returning early made a concurrent
+      # `await plugin.close()` claim completion microseconds into another
+      # caller's teardown (#6360 review round 9 P1-5). shield: this
+      # waiter's own cancellation must not cancel the shared future.
+      try:
+        await asyncio.shield(asyncio.wrap_future(waiter))
+      except Exception:
+        pass
+      return
     t = timeout if timeout is not None else self.config.shutdown_timeout
     loop = asyncio.get_running_loop()
     # Stable snapshot: shutdown used to iterate the live dict, so a
@@ -3967,41 +4018,108 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # remote loop (#6360 review round 8 P1-6). One shared deadline
       # covers all remote drains; unfinished ones are cancelled and their
       # states left in place for a retry.
-      remote: list[tuple[asyncio.AbstractEventLoop, "asyncio.Future[Any]"]] = []
+      remote: list[
+          tuple[
+              asyncio.AbstractEventLoop,
+              "ConcurrentFuture[Any]",
+              Coroutine[Any, Any, None],
+              "asyncio.Future[Any]",
+          ]
+      ] = []
       for other_loop, state in states_snapshot.items():
         if other_loop is loop:
           continue
         if other_loop.is_closed():
-          # No drain is possible on a closed loop; the state is still
-          # claimable below (its rows are already lost and counted by
-          # stale-loop cleanup semantics).
+          # No drain is possible on a closed loop, but its queued rows
+          # are NOT guaranteed to have been counted — the state can enter
+          # this snapshot before _cleanup_stale_loop_states() ever ran
+          # (#6360 review round 9 P1-6). Account them in O(1) before the
+          # state is claimed below.
+          queue = getattr(state.batch_processor, "_queue", None)
+          sentinels = getattr(state.batch_processor, "_sentinel_count", 0)
+          if isinstance(queue, asyncio.Queue):
+            if not isinstance(sentinels, int):
+              sentinels = 0
+            stale_rows = max(0, queue.qsize() - sentinels)
+            if stale_rows:
+              with self._drop_counts_guard:
+                self._local_drop_counts["stale_loop"] = (
+                    self._local_drop_counts.get("stale_loop", 0) + stale_rows
+                )
+              logger.warning(
+                  "%d queued row(s) lost with closed loop %s.",
+                  stale_rows,
+                  id(other_loop),
+              )
           drained.append(other_loop)
           continue
+        # The coroutine is created eagerly; if the remote loop never runs
+        # its callback it must be closed explicitly or it leaks as
+        # never-awaited (#6360 review round 9 P2-8).
+        coro = state.batch_processor.shutdown(timeout=t)
         try:
-          cf = asyncio.run_coroutine_threadsafe(
-              state.batch_processor.shutdown(timeout=t),
-              other_loop,
-          )
-          remote.append((other_loop, asyncio.wrap_future(cf)))
+          cf = asyncio.run_coroutine_threadsafe(coro, other_loop)
         except Exception:
+          coro.close()
           logger.warning(
               "Could not drain batch processor on loop %s",
               other_loop,
           )
+          continue
+        remote.append((other_loop, cf, coro, asyncio.wrap_future(cf)))
       if remote:
-        done, pending = await asyncio.wait([f for _, f in remote], timeout=t)
-        del done
-        for other_loop, f in remote:
-          if f in pending:
-            f.cancel()
+        try:
+          done_set, pending = await asyncio.wait(
+              [wrapper for _, _, _, wrapper in remote], timeout=t
+          )
+        except asyncio.CancelledError:
+          # Host cancellation mid-wait: release every remote handle here —
+          # the pending-future handling below never runs, so unscheduled
+          # coroutines would otherwise leak as never-awaited (#6360
+          # review round 9 P2-8).
+          for _, cf, coro, wrapper in remote:
+            if cf.cancel():
+              coro.close()
+            wrapper.cancel()
+          raise
+        del done_set
+        for other_loop, cf, coro, wrapper in remote:
+          if wrapper in pending:
+            # Cancel the concurrent future FIRST: success means the
+            # remote callback never ran, so the coroutine was never
+            # scheduled and must be closed here (#6360 review round 9
+            # P2-8).
+            if cf.cancel():
+              coro.close()
+            wrapper.cancel()
             logger.warning(
                 "Batch processor drain on loop %s did not finish within"
                 " %.1fs; its state is retained for a retried close.",
                 other_loop,
                 t,
             )
-          else:
-            drained.append(other_loop)
+            continue
+          if wrapper.cancelled():
+            logger.warning(
+                "Batch processor drain on loop %s was cancelled; its"
+                " state is retained for a retried close.",
+                other_loop,
+            )
+            continue
+          # Retrieve the result: an unchecked failed drain both leaked
+          # "exception was never retrieved" and claimed/folded the state
+          # as if it had succeeded, silently abandoning its queued rows
+          # (#6360 review round 9 P1-4). Only clean completions claim.
+          exc = wrapper.exception()
+          if exc is not None:
+            logger.warning(
+                "Batch processor drain on loop %s failed (%s); its state"
+                " is retained for a retried close.",
+                other_loop,
+                type(exc).__name__,
+            )
+            continue
+          drained.append(other_loop)
 
       # 2/3. For every DRAINED state: close its transport, then claim it
       # out of the live dict and fold its counters in one atomic
@@ -4044,7 +4162,18 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       if self._executor:
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._executor = None
-      self.client = None
+      # Close (not just drop) the shared BigQuery client: discarding the
+      # reference leaked its HTTP transport, while the aborted-setup path
+      # already closed the same resource (#6360 review round 9 P2-11).
+      # Off-loop and bounded by the shutdown budget.
+      client, self.client = self.client, None
+      if client is not None:
+        try:
+          await asyncio.wait_for(
+              loop.run_in_executor(None, client.close), timeout=t
+          )
+        except Exception:
+          pass
     except Exception as e:
       logger.error("Error during shutdown: %s", e, exc_info=True)
     finally:
@@ -4059,12 +4188,19 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # cancellation itself propagates to the caller unchanged.
       self._is_shutting_down = False
       self._started = False
+      # Wake coalesced callers (even on cancellation — they can retry;
+      # #6360 review round 9 P1-5).
+      with self._setup_guard:
+        completion, self._shutdown_future = self._shutdown_future, None
+      if completion is not None and not completion.done():
+        completion.set_result(None)
 
   def __getstate__(self) -> dict[str, Any]:
     """Custom pickling to exclude non-picklable runtime objects."""
     state = self.__dict__.copy()
     state["_setup_guard"] = None
     state["_setup_future"] = None
+    state["_shutdown_future"] = None
     state["_generation"] = 0
     state["_loop_states_guard"] = None
     state["_drop_counts_guard"] = None
@@ -4096,6 +4232,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     self.__dict__.update(state)
     self._setup_guard = threading.Lock()
     self._setup_future = None
+    self._shutdown_future = None
     self._generation = 0
     self._loop_states_guard = threading.Lock()
     self._drop_counts_guard = threading.Lock()
@@ -4147,6 +4284,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # Clear all runtime state.
     self._setup_guard = threading.Lock()
     self._setup_future = None
+    self._shutdown_future = None
     self._generation = 0
     self._loop_states_guard = threading.Lock()
     self._drop_counts_guard = threading.Lock()
@@ -4842,7 +4980,28 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     timestamp = datetime.now(timezone.utc)
     if self.config.content_formatter:
       try:
-        raw_content = self.config.content_formatter(raw_content, event_type)
+        formatted = self.config.content_formatter(raw_content, event_type)
+        if isinstance(formatted, str):
+          if type(formatted) is not str:
+            # Normalize str subclasses to the exact built-in (#6360
+            # round 9 P1-1 / round 7 P1-3).
+            formatted = str.__str__(formatted)
+        elif formatted is not None and not isinstance(formatted, types.Content):
+          # The formatter is typed Any: a non-native result would reach
+          # the parser's unconditional str(content) fallback OUTSIDE this
+          # fail-closed boundary, where a payload-controlled __str__ can
+          # republish the original content or raise into the safe
+          # callback's traceback log (#6360 review round 9 P1-1). Only
+          # the result's TYPE is logged.
+          logger.warning(
+              "Content formatter returned unsupported type %s for event"
+              " %s; writing sentinel instead of original content.",
+              type(formatted).__name__,
+              event_type,
+          )
+          formatted = _FORMATTER_FAILED_SENTINEL
+          self._count_local_drop("formatter_failed")
+        raw_content = formatted
       except Exception as e:
         # Fail CLOSED (#6356 P1-1): the formatter is a redaction/privacy
         # boundary, so its failure must never fall back to the unformatted
