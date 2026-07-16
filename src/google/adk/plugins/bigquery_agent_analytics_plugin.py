@@ -465,6 +465,40 @@ def _strip_bom_ws(value: str) -> str:
   return value[i:] if i else value
 
 
+def _sanitize_free_text(
+    text: str,
+    seen: set[int],
+    depth: int,
+    max_len: int,
+    budget: Optional[list[int]],
+) -> tuple[str, bool, bool]:
+  """Handles text that may embed a JSON document ANYWHERE, not just at
+  its start: raw multi-document suffixes and decoded string layers.
+
+  A literal container token after prose cannot be verified (the text has
+  machine-encoded provenance, so a consumer may parse it) and fails
+  closed; a quoted fragment is walked through the full blob sanitizer
+  from the first quote (#6360 review rounds 12 P1-1 / 13 P1-2). A stray
+  escape in the prose gap could shift a consumer's parse boundaries and
+  also fails closed. Quote-free, container-free prose passes through.
+  """
+  if "{" in text or "[" in text:
+    return "[UNPARSEABLE_JSON_BLOB]", True, True
+  quote_idx = text.find('"')
+  if quote_idx == -1:
+    return text, False, False
+  gap = text[:quote_idx]
+  if "\\" in gap:
+    return "[UNPARSEABLE_JSON_BLOB]", True, True
+  tail = text[quote_idx:]
+  t_sanitized, changed, truncated = _sanitize_json_blob(
+      tail, seen, depth + 1, max_len, budget
+  )
+  if not changed:
+    return text, False, False
+  return gap + t_sanitized, True, truncated
+
+
 def _sanitize_json_blob(
     value: str,
     seen: set[int],
@@ -551,31 +585,32 @@ def _sanitize_json_blob(
       # RAW text that no later step decodes; a leading stray escape
       # cannot be classified and fails closed.
       return "[UNPARSEABLE_JSON_BLOB]", True, True
-    quote_idx = suffix.find('"')
-    if quote_idx == -1:
-      # Pure raw prose with no quoted fragment at all.
-      s_sanitized, s_changed, s_truncated = suffix, False, False
-    else:
-      # ANY quoted fragment in the trailing text may be an encoded JSON
-      # document whose decoded content hides a container behind Unicode
-      # escapes — immediately ('"note" "\\u007b..."', round 11 P1-1) or
-      # after a stretch of prose ('"note" then "\\u007b..."', #6360
-      # review round 12 P1-1). Recurse on the tail starting at the first
-      # quote; the quoted branch walks ITS suffix the same way, so
-      # document/prose chains are covered to the depth cap. An escape in
-      # the prose gap could shift a consumer's parse boundaries and
-      # cannot be verified — fail closed.
-      gap = suffix[:quote_idx]
-      if "\\" in gap:
-        return "[UNPARSEABLE_JSON_BLOB]", True, True
-      tail = suffix[quote_idx:]
-      t_sanitized, s_changed, s_truncated = _sanitize_json_blob(
-          tail, seen, depth + 1, max_len, budget
-      )
-      s_sanitized = gap + t_sanitized if s_changed else suffix
-    p_sanitized, p_changed, p_truncated = _sanitize_json_blob(
-        decoded, seen, depth + 1, max_len, budget
+    # ANY quoted fragment in the trailing text may be an encoded JSON
+    # document whose decoded content hides a container behind Unicode
+    # escapes — immediately ('"note" "\\u007b..."', round 11 P1-1) or
+    # after a stretch of prose ('"note" then "\\u007b..."', round 12
+    # P1-1): walk it with the shared free-text handling.
+    s_sanitized, s_changed, s_truncated = _sanitize_free_text(
+        suffix, seen, depth, max_len, budget
     )
+    if s_changed and s_sanitized == "[UNPARSEABLE_JSON_BLOB]":
+      return "[UNPARSEABLE_JSON_BLOB]", True, True
+    inner = _strip_bom_ws(decoded)
+    if inner.startswith(("{", "[", '"')):
+      p_sanitized, p_changed, p_truncated = _sanitize_json_blob(
+          decoded, seen, depth + 1, max_len, budget
+      )
+    else:
+      # The DECODED layer can hide a container after prose too
+      # ('"note \\u007b...access\\u005ftoken...\\u007d"' decodes to
+      # 'note {"access_token":...}') — the escapes are gone after this
+      # decode, so the same anywhere-in-text handling applies (#6360
+      # review round 13 P1-2).
+      p_sanitized, p_changed, p_truncated = _sanitize_free_text(
+          decoded, seen, depth + 1, max_len, budget
+      )
+      if p_changed and p_sanitized == "[UNPARSEABLE_JSON_BLOB]":
+        return "[UNPARSEABLE_JSON_BLOB]", True, True
     if not p_changed and not s_changed:
       return value, False, False
     prefix_text = stripped[:end] if not p_changed else json.dumps(p_sanitized)
@@ -3560,11 +3595,11 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     BatchProcessor.get_drop_stats for the meaning of each reason.
 
     Reasons are LOSS INCIDENTS, not uniformly dropped rows:
-    ``formatter_failed`` means the row WAS written with its content
-    replaced by a sentinel; ``setup_unavailable``, ``shutdown_race``,
-    ``shutdown_timeout``, ``shutdown_cancelled``, and ``stale_loop`` mean
-    the row was never written. Counters persist across shutdown and loop
-    cleanup.
+    ``formatter_failed`` and ``content_parse_failed`` mean the row WAS
+    written with its content replaced by a sentinel; ``setup_unavailable``,
+    ``shutdown_race``, ``shutdown_timeout``, ``shutdown_cancelled``, and
+    ``stale_loop`` mean the row was never written. Counters persist
+    across shutdown and loop cleanup.
 
     Returns:
         Per-reason counts: plugin-level incidents plus every live loop
@@ -4101,6 +4136,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       states_snapshot = dict(self._loop_state_by_loop)
     teardown_completed = False
     teardown_error: Optional[BaseException] = None
+    retained_remote_drains = 0
     try:
       # Correct Multi-Loop Shutdown:
       # 1. Shutdown current loop's processor directly.
@@ -4190,6 +4226,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         del done_set
         for other_loop, cf, wrapper in remote:
           if wrapper in pending:
+            retained_remote_drains += 1
             # If the remote callback has not run yet this prevents the
             # task from ever being created; if it HAS run, the running
             # drain simply continues remotely, bounded by its own
@@ -4205,6 +4242,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             )
             continue
           if wrapper.cancelled():
+            retained_remote_drains += 1
             logger.warning(
                 "Batch processor drain on loop %s was cancelled; its"
                 " state is retained for a retried close.",
@@ -4217,6 +4255,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           # (#6360 review round 9 P1-4). Only clean completions claim.
           exc = wrapper.exception()
           if exc is not None:
+            retained_remote_drains += 1
             logger.warning(
                 "Batch processor drain on loop %s failed (%s); its state"
                 " is retained for a retried close.",
@@ -4289,6 +4328,16 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           )
         except Exception:
           pass
+      if retained_remote_drains:
+        # An incompletely drained remote state means live processors and
+        # possibly queued rows survive this close: reporting success let
+        # both the owner and coalesced waiters return normally over live
+        # state (#6360 review round 13 P1-3, extending the round-12
+        # honest-completion contract to remote drains).
+        raise _ShutdownIncompleteError(
+            f"{retained_remote_drains} remote drain(s) did not complete;"
+            " their states are retained for a retried close."
+        )
       teardown_completed = True
     except Exception as e:
       # teardown_completed stays False: reporting success here let both
@@ -5205,11 +5254,30 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # Pass trace/span per call: the parser instance is shared, so storing
       # request identity on it lets concurrent events overwrite each other's
       # GCS object paths (#6356 P1-3).
-      content_json, content_parts, parser_truncated = await self.parser.parse(
-          raw_content,
-          trace_id=trace_id or "no_trace",
-          span_id=span_id or "no_span",
-      )
+      try:
+        content_json, content_parts, parser_truncated = await self.parser.parse(
+            raw_content,
+            trace_id=trace_id or "no_trace",
+            span_id=span_id or "no_span",
+        )
+      except Exception:
+        # Fail-closed, constant-log parse boundary (#6360 review round 13
+        # P1-1): the top-level formatter gate cannot see NESTED hostile
+        # model subclasses (pydantic preserves them through normal
+        # construction), whose attribute accesses raise payload-bearing
+        # exceptions inside the parser. Escaping here reached
+        # _safe_callback's traceback log and dropped the whole row.
+        logger.warning(
+            "Content parsing failed for event %s; writing sentinel"
+            " instead of content.",
+            event_type,
+        )
+        content_json, content_parts, parser_truncated = (
+            "[CONTENT_PARSE_FAILED]",
+            [],
+            True,
+        )
+        self._count_local_drop("content_parse_failed")
     is_truncated = is_truncated or parser_truncated
 
     latency_json = self._extract_latency(event_data)

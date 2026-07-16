@@ -10775,6 +10775,134 @@ class TestIssue6356Hardening:
 
     assert plugin.get_drop_stats()["stress"] == increments * n_threads
 
+  def test_prose_inside_encoded_string_fails_closed(self):
+    """Round-13 P1-2: a single valid encoded string whose DECODED content
+    hides a container after prose fails closed; ordinary quoted prose
+    (including inner quotes) passes through."""
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+
+    raw = '"note \\u007b\\"access\\u005ftoken\\":\\"R13-SECRET\\"\\u007d"'
+    out, truncated = truncate({"blob": raw}, 10000)
+    assert "R13-SECRET" not in json.dumps(out)
+    assert out["blob"] == "[UNPARSEABLE_JSON_BLOB]"
+    assert truncated is True
+
+    for prose in (
+        '"just quoted prose"',
+        json.dumps('he said "hi"'),
+    ):
+      out, truncated = truncate({"s": prose}, 10000)
+      assert out["s"] == prose
+      assert truncated is False
+
+  @pytest.mark.asyncio
+  async def test_nested_hostile_model_subclass_fails_closed(
+      self,
+      mock_write_client,
+      invocation_context,
+      callback_context,
+      mock_auth_default,
+      mock_bq_client,
+      mock_to_arrow_schema,
+      dummy_arrow_schema,
+      mock_asyncio_to_thread,
+      caplog,
+  ):
+    """Round-13 P1-1: a hostile model subclass NESTED inside an
+    exact-typed formatter result fails closed at the parse boundary — the
+    row is written with a sentinel and the payload-bearing exception
+    never reaches the logs."""
+    _ = mock_auth_default, mock_bq_client
+
+    class EvilPart(types.Part):
+
+      def __getattribute__(self, name):
+        if name == "file_data":
+          raise RuntimeError("R13-NESTED-SECRET")
+        return super().__getattribute__(name)
+
+    hostile = types.Content(parts=[EvilPart()])
+    assert type(hostile) is types.Content  # passes the exact-type gate
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=lambda content, event_type: hostile
+    )
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    ) as plugin:
+      await plugin._ensure_started()
+      mock_write_client.append_rows.reset_mock()
+      bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+      with caplog.at_level(logging.WARNING):
+        await plugin._log_event(
+            "STATE_DELTA",
+            callback_context,
+            event_data=bigquery_agent_analytics_plugin.EventData(),
+        )
+      await asyncio.sleep(0.01)
+      log_entry = await _get_captured_event_dict_async(
+          mock_write_client, dummy_arrow_schema
+      )
+      assert "R13-NESTED-SECRET" not in json.dumps(log_entry, default=str)
+      assert "R13-NESTED-SECRET" not in caplog.text
+      assert "[CONTENT_PARSE_FAILED]" in log_entry["content"]
+      assert log_entry["is_truncated"] is True
+      assert plugin.get_drop_stats().get("content_parse_failed", 0) == 1
+
+  @pytest.mark.asyncio
+  async def test_failed_remote_drain_fails_coalesced_waiter_too(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """Round-13 P1-3: a failed remote drain keeps teardown incomplete for
+    the coalesced waiter as well — neither caller reports success over
+    live state."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    remote_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=remote_loop.run_forever, daemon=True)
+    thread.start()
+    try:
+      entered = threading.Event()
+      release = threading.Event()
+
+      async def failing_drain(timeout=None):
+        del timeout
+        entered.set()
+        while not release.is_set():
+          await asyncio.sleep(0.01)
+        raise RuntimeError("remote drain fails")
+
+      bp = mock.MagicMock(spec=bigquery_agent_analytics_plugin.BatchProcessor)
+      bp.shutdown = failing_drain
+      bp.get_drop_stats = mock.MagicMock(return_value={})
+      state = mock.MagicMock()
+      state.write_client = None
+      state.batch_processor = bp
+      plugin._loop_state_by_loop[remote_loop] = state
+
+      owner = asyncio.create_task(plugin.shutdown(timeout=5))
+      while not entered.is_set():
+        await asyncio.sleep(0.01)
+      waiter = asyncio.create_task(plugin.shutdown())
+      await asyncio.sleep(0.05)
+      release.set()
+      with pytest.raises(
+          bigquery_agent_analytics_plugin._ShutdownIncompleteError
+      ):
+        await owner
+      # The retrying waiter hits the same persistent remote failure.
+      with pytest.raises(
+          bigquery_agent_analytics_plugin._ShutdownIncompleteError
+      ):
+        await asyncio.wait_for(waiter, timeout=10)
+      assert remote_loop in plugin._loop_state_by_loop
+    finally:
+      remote_loop.call_soon_threadsafe(remote_loop.stop)
+      thread.join(timeout=5)
+      remote_loop.close()
+
   def test_prose_then_encoded_document_redacted(self):
     """Round-12 P1-1: an encoded credential document after a stretch of
     raw prose in the suffix is still decoded and redacted."""
@@ -11006,7 +11134,11 @@ class TestIssue6356Hardening:
       state.batch_processor = bp
       plugin._loop_state_by_loop[remote_loop] = state
 
-      await plugin.shutdown(timeout=2)
+      # Round-13 P1-3: the failed drain keeps teardown incomplete.
+      with pytest.raises(
+          bigquery_agent_analytics_plugin._ShutdownIncompleteError
+      ):
+        await plugin.shutdown(timeout=2)
       # The failed drain retains the state; no never-awaited warning
       # (filterwarnings turns it into a hard error).
       assert remote_loop in plugin._loop_state_by_loop
@@ -11149,7 +11281,11 @@ class TestIssue6356Hardening:
       state.batch_processor = bp
       plugin._loop_state_by_loop[remote_loop] = state
 
-      await plugin.shutdown(timeout=0.2)
+      # Round-13 P1-3: the timed-out drain keeps teardown incomplete.
+      with pytest.raises(
+          bigquery_agent_analytics_plugin._ShutdownIncompleteError
+      ):
+        await plugin.shutdown(timeout=0.2)
       # Timed out: state retained, no ValueError from closing a running
       # coroutine (shutdown would have logged/raised through its guard).
       assert remote_loop in plugin._loop_state_by_loop
@@ -11844,7 +11980,12 @@ class TestIssue6356Hardening:
       plugin._loop_state_by_loop[remote_loop] = state
 
       with caplog.at_level(logging.WARNING):
-        await plugin.shutdown(timeout=2)
+        # Round-13 P1-3: a failed remote drain keeps teardown incomplete
+        # and surfaces to the owner instead of reporting success.
+        with pytest.raises(
+            bigquery_agent_analytics_plugin._ShutdownIncompleteError
+        ):
+          await plugin.shutdown(timeout=2)
 
       # Retained, not silently claimed as a successful drain.
       assert remote_loop in plugin._loop_state_by_loop
