@@ -465,6 +465,79 @@ def _strip_bom_ws(value: str) -> str:
   return value[i:] if i else value
 
 
+def _normalize_json_native(
+    obj: Any,
+    depth: int = 0,
+    budget: Optional[list[int]] = None,
+) -> tuple[Any, bool]:
+  """Coerces already-sanitized parser output to strictly JSON-native values.
+
+  A nested hostile model can defer its failure PAST parser sanitization —
+  e.g. an attribute that returns an object whose __repr__ raises — so the
+  payload detonated later during Arrow serialization's json.dumps/str
+  fallback (#6360 review round 14 P1-2). Unlike the full sanitizer, this
+  does NOT re-inspect strings: parser output is already truncated and
+  redacted, and re-running blob inspection would corrupt sentinels and
+  bracketed prose. It only guarantees nothing non-native survives
+  downstream. Returns ``(normalized, replaced_anything)``.
+  """
+  if budget is None:
+    budget = [_MAX_SANITIZE_NODES]
+  budget[0] -= 1
+  if budget[0] < 0:
+    return "[SANITIZE_BUDGET_EXCEEDED]", True
+  if depth >= _MAX_SANITIZE_DEPTH:
+    return "[MAX_DEPTH_EXCEEDED]", True
+  try:
+    if obj is None or type(obj) in (str, int, float, bool):
+      return obj, False
+    if isinstance(obj, str):
+      return str.__str__(obj), False
+    if isinstance(obj, bool):
+      return bool(obj), False
+    if isinstance(obj, int):
+      return int(obj), False
+    if isinstance(obj, float):
+      return float(obj), False
+    if isinstance(obj, dict):
+      out_dict: dict[str, Any] = {}
+      replaced = False
+      bad_keys = 0
+      for k, v in obj.items():
+        if budget[0] <= 0:
+          out_dict["[SANITIZE_BUDGET_EXCEEDED]"] = "[SANITIZE_BUDGET_EXCEEDED]"
+          replaced = True
+          break
+        if isinstance(k, str):
+          if type(k) is not str:
+            k = str.__str__(k)
+        else:
+          bad_keys += 1
+          k = f"[UNSUPPORTED_KEY_{bad_keys}]"
+          replaced = True
+        norm_v, v_replaced = _normalize_json_native(v, depth + 1, budget)
+        replaced = replaced or v_replaced
+        out_dict[k] = norm_v
+      return out_dict, replaced
+    if isinstance(obj, (list, tuple)):
+      out_list: list[Any] = []
+      replaced = False
+      for item in obj:
+        if budget[0] <= 0:
+          out_list.append("[SANITIZE_BUDGET_EXCEEDED]")
+          replaced = True
+          break
+        norm_item, item_replaced = _normalize_json_native(
+            item, depth + 1, budget
+        )
+        replaced = replaced or item_replaced
+        out_list.append(norm_item)
+      return out_list, replaced
+    return "[UNSUPPORTED_OBJECT]", True
+  except Exception:
+    return "[UNSUPPORTED_OBJECT]", True
+
+
 def _sanitize_free_text(
     text: str,
     seen: set[int],
@@ -541,15 +614,16 @@ def _sanitize_json_blob(
     if depth >= _MAX_SANITIZE_DEPTH:
       return "[UNPARSEABLE_JSON_BLOB]", True, True
     if len(stripped) > inspect_limit:
-      # Decoding would allocate beyond the limit, so classify from the
-      # prefix. One json.dumps layer puts a literal brace right after the
-      # quote; two-plus layers put an escape there (\" or \\), so a
-      # brace-only check let over-limit triple-encoded credentials
-      # through to the caller's raw truncation (#6360 review round 7
-      # P1-1). Anything that cannot be ruled out as an encoded JSON layer
-      # fails closed; the rest is ordinary quoted prose, left to the
-      # caller's length truncation.
-      if _strip_bom_ws(stripped[1:])[:1] in ("{", "[", "\\", '"'):
+      # Decoding would allocate beyond the limit, so classify the bounded
+      # prefix that will actually be EMITTED after the caller's raw
+      # truncation — a first-character check missed an escaped container
+      # hidden after a stretch of prose inside the emitted window (#6360
+      # review round 14 P1-1, refining rounds 7/8). Any container token
+      # or escape in that window means the truncated output could retain
+      # (escaped) credential material — fail closed. Escape-free,
+      # container-free prose is left to the caller's length truncation.
+      emitted = stripped[: max_len if max_len != -1 else inspect_limit]
+      if "{" in emitted or "[" in emitted or "\\" in emitted:
         return "[UNPARSEABLE_JSON_BLOB]", True, True
       return value, False, False
     suffix = ""
@@ -4203,6 +4277,12 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         try:
           cf = self._schedule_remote_drain(state.batch_processor, other_loop, t)
         except Exception:
+          # e.g. the loop closed between the is_closed() check and
+          # call_soon_threadsafe(). The state stays live, so teardown is
+          # NOT complete — without counting it, both the owner and
+          # coalesced waiters reported success over live state (#6360
+          # review round 14 P1-3).
+          retained_remote_drains += 1
           logger.warning(
               "Could not drain batch processor on loop %s",
               other_loop,
@@ -5259,6 +5339,22 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             raw_content,
             trace_id=trace_id or "no_trace",
             span_id=span_id or "no_span",
+        )
+        # Normalize the parser OUTPUT to strictly JSON-native values
+        # inside the same boundary (#6360 review round 14 P1-2): a nested
+        # hostile model can defer its failure PAST parse(), detonating in
+        # Arrow serialization's json.dumps/str fallback where
+        # _write_rows_with_retry logged the payload with a traceback and
+        # dropped the row as arrow_prep_failed.
+        content_json, norm_replaced_json = _normalize_json_native(content_json)
+        normalized_parts, norm_replaced_parts = _normalize_json_native(
+            content_parts
+        )
+        content_parts = (
+            normalized_parts if isinstance(normalized_parts, list) else []
+        )
+        parser_truncated = (
+            parser_truncated or norm_replaced_json or norm_replaced_parts
         )
       except Exception:
         # Fail-closed, constant-log parse boundary (#6360 review round 13

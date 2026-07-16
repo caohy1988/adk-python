@@ -10775,6 +10775,127 @@ class TestIssue6356Hardening:
 
     assert plugin.get_drop_stats()["stress"] == increments * n_threads
 
+  def test_overlimit_prose_prefixed_encoded_string_fails_closed(self):
+    """Round-14 P1-1: an over-limit quoted value whose EMITTED prefix
+    hides an escaped container after prose fails closed; escape-free
+    over-limit quoted prose still raw-truncates."""
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+
+    raw = (
+        '"note \\u007b\\"access\\u005ftoken\\":'
+        '\\"R14-OVERLIMIT-SECRET\\"\\u007d'
+        + "x" * 10050
+        + '"'
+    )
+    out, truncated = truncate({"blob": raw}, 10000)
+    assert "R14-OVERLIMIT-SECRET" not in json.dumps(out)
+    assert out["blob"] == "[UNPARSEABLE_JSON_BLOB]"
+    assert truncated is True
+
+    prose = '"' + "hello world " * 2000 + '"'
+    out, truncated = truncate({"s": prose}, 1000)
+    assert out["s"].endswith("...[TRUNCATED]")
+    assert truncated is True
+
+  @pytest.mark.asyncio
+  async def test_late_detonating_nested_model_normalized(
+      self,
+      mock_write_client,
+      invocation_context,
+      callback_context,
+      mock_auth_default,
+      mock_bq_client,
+      mock_to_arrow_schema,
+      dummy_arrow_schema,
+      mock_asyncio_to_thread,
+      caplog,
+  ):
+    """Round-14 P1-2: a nested model that parses cleanly but plants an
+    object whose __repr__ raises must be normalized inside the parse
+    boundary — the row survives Arrow preparation and the payload never
+    reaches the logs."""
+    _ = mock_auth_default, mock_bq_client
+
+    class LateBomb:
+
+      def __repr__(self):
+        raise RuntimeError("R14-LATE-SERIALIZE-SECRET")
+
+    class EvilContent(types.Content):
+
+      def __getattribute__(self, name):
+        if name == "role":
+          return LateBomb()
+        return super().__getattribute__(name)
+
+    hostile = llm_request_lib.LlmRequest(contents=[EvilContent(parts=[])])
+    assert type(hostile) is llm_request_lib.LlmRequest
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=lambda content, event_type: hostile
+    )
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    ) as plugin:
+      await plugin._ensure_started()
+      mock_write_client.append_rows.reset_mock()
+      bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+      with caplog.at_level(logging.WARNING):
+        await plugin._log_event(
+            "LLM_REQUEST",
+            callback_context,
+            event_data=bigquery_agent_analytics_plugin.EventData(),
+        )
+        await asyncio.sleep(0.01)
+      # The row survives Arrow preparation (exercised by the capture
+      # helper) with the hostile object replaced by a sentinel.
+      log_entry = await _get_captured_event_dict_async(
+          mock_write_client, dummy_arrow_schema
+      )
+      dumped = json.dumps(log_entry, default=str)
+      assert "R14-LATE-SERIALIZE-SECRET" not in dumped
+      assert "R14-LATE-SERIALIZE-SECRET" not in caplog.text
+      assert "[UNSUPPORTED_OBJECT]" in dumped
+      assert plugin.get_drop_stats().get("arrow_prep_failed", 0) == 0
+
+  @pytest.mark.asyncio
+  async def test_remote_scheduling_failure_keeps_teardown_incomplete(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """Round-14 P1-3: an exception from _schedule_remote_drain() itself
+    counts the state as retained, so shutdown raises instead of
+    reporting success over live state."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    remote_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=remote_loop.run_forever, daemon=True)
+    thread.start()
+    try:
+      state = mock.MagicMock()
+      state.write_client = None
+      state.batch_processor = mock.MagicMock(
+          spec=bigquery_agent_analytics_plugin.BatchProcessor
+      )
+      state.batch_processor.get_drop_stats = mock.MagicMock(return_value={})
+      plugin._loop_state_by_loop[remote_loop] = state
+
+      with mock.patch.object(
+          plugin,
+          "_schedule_remote_drain",
+          side_effect=RuntimeError("loop closed during scheduling"),
+      ):
+        with pytest.raises(
+            bigquery_agent_analytics_plugin._ShutdownIncompleteError
+        ):
+          await plugin.shutdown(timeout=2)
+      assert remote_loop in plugin._loop_state_by_loop
+    finally:
+      remote_loop.call_soon_threadsafe(remote_loop.stop)
+      thread.join(timeout=5)
+      remote_loop.close()
+
   def test_prose_inside_encoded_string_fails_closed(self):
     """Round-13 P1-2: a single valid encoded string whose DECODED content
     hides a container after prose fails closed; ordinary quoted prose
