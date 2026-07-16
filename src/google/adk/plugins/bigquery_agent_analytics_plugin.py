@@ -3725,12 +3725,17 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       return
     loop = asyncio.get_running_loop()
 
-    if not self.client:
-      executor = self._executor
-      if executor is None:
-        executor = ThreadPoolExecutor(max_workers=1)
-        self._executor = executor
+    # The executor is needed beyond client construction (schema RPCs, GCS
+    # offloader): creating it only inside the client branch left
+    # _executor as None for the offloader when a client was already set
+    # (post-rebase mypy: GCSOffloader argument 3 expects a non-optional
+    # ThreadPoolExecutor — a latent runtime gap, not just typing).
+    executor = self._executor
+    if executor is None:
+      executor = ThreadPoolExecutor(max_workers=1)
+      self._executor = executor
 
+    if not self.client:
       client_future: "ConcurrentFuture[Any]" = executor.submit(
           lambda: bigquery.Client(
               project=self.project_id,
@@ -3778,7 +3783,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # the table check on retry and mark the plugin started against a
     # missing/unready table (#6360 review P1-1). Once _started is True,
     # _lazy_setup returns early above, so the steady state pays no extra RPC.
-    await loop.run_in_executor(self._executor, self._ensure_schema_exists)
+    await loop.run_in_executor(executor, self._ensure_schema_exists)
 
     if not self.parser:
       self.arrow_schema = to_arrow_schema(self._schema)
@@ -3804,7 +3809,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           self.offloader = GCSOffloader(
               self.project_id,
               self.config.gcs_bucket_name,
-              self._executor,
+              executor,
               storage_client=storage.Client(
                   project=self.project_id, credentials=self._credentials
               ),
