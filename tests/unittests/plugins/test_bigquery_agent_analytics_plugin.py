@@ -10775,6 +10775,98 @@ class TestIssue6356Hardening:
 
     assert plugin.get_drop_stats()["stress"] == increments * n_threads
 
+  def test_unlimited_mode_scans_entire_emitted_value(self):
+    """Round-15 P1-1: in unlimited mode the ENTIRE emitted value is
+    classified — a credential document just past the inspection window
+    fails closed; escape-free giant quoted prose passes whole."""
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+    ceiling = bigquery_agent_analytics_plugin._MAX_JSON_INSPECT_CHARS
+
+    raw = (
+        '"'
+        + "a" * (ceiling + 10)
+        + '\\u007b\\"access\\u005ftoken\\":'
+        + '\\"R15-UNLIMITED-SECRET\\"\\u007d"'
+    )
+    out, truncated = truncate({"blob": raw}, -1)
+    assert "R15-UNLIMITED-SECRET" not in json.dumps(out)
+    assert out["blob"] == "[UNPARSEABLE_JSON_BLOB]"
+    assert truncated is True
+
+    prose = '"' + "hello world " * ((ceiling // 12) + 10) + '"'
+    out, truncated = truncate({"s": prose}, -1)
+    assert out["s"] == prose
+    assert truncated is False
+
+  def test_normalizer_redacts_and_bounds(self):
+    """Round-15 P1-2/P1-3: the JSON-native normalizer applies
+    sensitive-key/temp: redaction and the configured length bound, while
+    preserving sentinels and bracketed prose."""
+    normalize = bigquery_agent_analytics_plugin._normalize_json_native
+
+    out, _ = normalize(
+        {"prompt": [{"role": {"access_token": "R15-NATIVE-SECRET"}}]},
+        10000,
+    )
+    assert "R15-NATIVE-SECRET" not in json.dumps(out)
+    assert out["prompt"][0]["role"]["access_token"] == "[REDACTED]"
+
+    out, replaced = normalize("R15-ROLE-" + "x" * 1_000_000, 10)
+    assert out == "R15-ROLE-x...[TRUNCATED]"
+    assert replaced is True
+
+    for preserved in ("[FORMATTER_FAILED]", "[bracketed] prose"):
+      out, replaced = normalize(preserved, 10000)
+      assert out == preserved
+      assert replaced is False
+
+  @pytest.mark.asyncio
+  async def test_native_secret_mapping_via_model_field_redacted(
+      self,
+      mock_write_client,
+      invocation_context,
+      callback_context,
+      mock_auth_default,
+      mock_bq_client,
+      mock_to_arrow_schema,
+      dummy_arrow_schema,
+      mock_asyncio_to_thread,
+  ):
+    """Round-15 P1-2 at the row boundary: a nested model property handing
+    the parser a raw credential mapping is redacted in the written row."""
+    _ = mock_auth_default, mock_bq_client
+
+    class EvilContent(types.Content):
+
+      def __getattribute__(self, name):
+        if name == "role":
+          return {"access_token": "R15-NATIVE-SECRET"}
+        return super().__getattribute__(name)
+
+    hostile = llm_request_lib.LlmRequest(contents=[EvilContent(parts=[])])
+    assert type(hostile) is llm_request_lib.LlmRequest
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=lambda content, event_type: hostile
+    )
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    ) as plugin:
+      await plugin._ensure_started()
+      mock_write_client.append_rows.reset_mock()
+      bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+      await plugin._log_event(
+          "LLM_REQUEST",
+          callback_context,
+          event_data=bigquery_agent_analytics_plugin.EventData(),
+      )
+      await asyncio.sleep(0.01)
+      log_entry = await _get_captured_event_dict_async(
+          mock_write_client, dummy_arrow_schema
+      )
+      assert "R15-NATIVE-SECRET" not in json.dumps(log_entry, default=str)
+      assert "[REDACTED]" in json.dumps(log_entry, default=str)
+
   def test_overlimit_prose_prefixed_encoded_string_fails_closed(self):
     """Round-14 P1-1: an over-limit quoted value whose EMITTED prefix
     hides an escaped container after prose fails closed; escape-free

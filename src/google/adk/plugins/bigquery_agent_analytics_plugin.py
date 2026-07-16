@@ -467,6 +467,7 @@ def _strip_bom_ws(value: str) -> str:
 
 def _normalize_json_native(
     obj: Any,
+    max_len: int,
     depth: int = 0,
     budget: Optional[list[int]] = None,
 ) -> tuple[Any, bool]:
@@ -476,10 +477,15 @@ def _normalize_json_native(
   e.g. an attribute that returns an object whose __repr__ raises — so the
   payload detonated later during Arrow serialization's json.dumps/str
   fallback (#6360 review round 14 P1-2). Unlike the full sanitizer, this
-  does NOT re-inspect strings: parser output is already truncated and
-  redacted, and re-running blob inspection would corrupt sentinels and
-  bracketed prose. It only guarantees nothing non-native survives
-  downstream. Returns ``(normalized, replaced_anything)``.
+  does NOT re-run JSON-blob inspection on strings (parser output would
+  have its sentinels and bracketed prose corrupted), but it DOES enforce
+  the two policies parser output cannot be assumed to carry (#6360 review
+  round 15 P1-2/P1-3): sensitive-key/``temp:`` value redaction — a nested
+  model property can hand the parser a raw credential mapping — and the
+  configured length bound, because model fields like ``role`` are copied
+  verbatim and an unbounded string reopens the synchronous
+  json.dumps/Arrow work boundary. Returns ``(normalized,
+  replaced_anything)``.
   """
   if budget is None:
     budget = [_MAX_SANITIZE_NODES]
@@ -489,10 +495,13 @@ def _normalize_json_native(
   if depth >= _MAX_SANITIZE_DEPTH:
     return "[MAX_DEPTH_EXCEEDED]", True
   try:
-    if obj is None or type(obj) in (str, int, float, bool):
-      return obj, False
     if isinstance(obj, str):
-      return str.__str__(obj), False
+      text = obj if type(obj) is str else str.__str__(obj)
+      if max_len != -1 and len(text) > max_len:
+        return text[:max_len] + "...[TRUNCATED]", True
+      return text, False
+    if obj is None or type(obj) in (int, float, bool):
+      return obj, False
     if isinstance(obj, bool):
       return bool(obj), False
     if isinstance(obj, int):
@@ -511,11 +520,18 @@ def _normalize_json_native(
         if isinstance(k, str):
           if type(k) is not str:
             k = str.__str__(k)
+          k_lower = k.lower()
+          if k_lower in _SENSITIVE_KEYS or k_lower.startswith("temp:"):
+            budget[0] -= 1
+            out_dict[k] = "[REDACTED]"
+            continue
         else:
           bad_keys += 1
           k = f"[UNSUPPORTED_KEY_{bad_keys}]"
           replaced = True
-        norm_v, v_replaced = _normalize_json_native(v, depth + 1, budget)
+        norm_v, v_replaced = _normalize_json_native(
+            v, max_len, depth + 1, budget
+        )
         replaced = replaced or v_replaced
         out_dict[k] = norm_v
       return out_dict, replaced
@@ -528,7 +544,7 @@ def _normalize_json_native(
           replaced = True
           break
         norm_item, item_replaced = _normalize_json_native(
-            item, depth + 1, budget
+            item, max_len, depth + 1, budget
         )
         replaced = replaced or item_replaced
         out_list.append(norm_item)
@@ -614,15 +630,17 @@ def _sanitize_json_blob(
     if depth >= _MAX_SANITIZE_DEPTH:
       return "[UNPARSEABLE_JSON_BLOB]", True, True
     if len(stripped) > inspect_limit:
-      # Decoding would allocate beyond the limit, so classify the bounded
-      # prefix that will actually be EMITTED after the caller's raw
-      # truncation — a first-character check missed an escaped container
-      # hidden after a stretch of prose inside the emitted window (#6360
-      # review round 14 P1-1, refining rounds 7/8). Any container token
-      # or escape in that window means the truncated output could retain
-      # (escaped) credential material — fail closed. Escape-free,
-      # container-free prose is left to the caller's length truncation.
-      emitted = stripped[: max_len if max_len != -1 else inspect_limit]
+      # Decoding would allocate beyond the limit, so classify what will
+      # actually be EMITTED — the max_len prefix after the caller's raw
+      # truncation, or the ENTIRE value in unlimited mode, where scanning
+      # only the inspection window let a credential document sit just
+      # past it (#6360 review round 15 P1-1, refining rounds 7/8/14). Any
+      # container token or escape in the emitted text means the output
+      # could retain (escaped) credential material — fail closed. The
+      # scan is a bounded linear pass over text already in memory.
+      # Escape-free, container-free prose is left to the caller's length
+      # truncation (or emitted whole in unlimited mode).
+      emitted = stripped if max_len == -1 else stripped[:max_len]
       if "{" in emitted or "[" in emitted or "\\" in emitted:
         return "[UNPARSEABLE_JSON_BLOB]", True, True
       return value, False, False
@@ -5346,9 +5364,15 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         # Arrow serialization's json.dumps/str fallback where
         # _write_rows_with_retry logged the payload with a traceback and
         # dropped the row as arrow_prep_failed.
-        content_json, norm_replaced_json = _normalize_json_native(content_json)
+        content_json, norm_replaced_json = _normalize_json_native(
+            content_json, self.config.max_content_length
+        )
+        # content_parts carry parser-BUILT metadata (GCS URIs,
+        # object_ref.details JSON) whose strings must stay intact; their
+        # payload text was already truncated by the parser itself, so
+        # only shape normalization applies (max_len=-1).
         normalized_parts, norm_replaced_parts = _normalize_json_native(
-            content_parts
+            content_parts, -1
         )
         content_parts = (
             normalized_parts if isinstance(normalized_parts, list) else []
