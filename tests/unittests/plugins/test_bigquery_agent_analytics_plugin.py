@@ -10201,16 +10201,24 @@ class TestIssue6356Hardening:
     assert out["userdict"]["refresh_token"] == "[REDACTED]"
 
   def test_deep_json_blob_fails_closed(self):
-    """A blob too deep to parse becomes a sentinel, not a pass-through.
+    """A blob beyond the fixed nesting limit fails closed on every runtime.
 
-    json.loads raises RecursionError before the bounded traversal ever
-    runs; the row keeps flowing with the blob replaced (#6360 review
-    round 2 P2-5).
+    Older Python runtimes raise RecursionError while Python 3.14's iterative
+    JSON decoder accepts this input. The row must keep flowing with the same
+    whole-blob sentinel regardless (#6360 review round 2 P2-5).
     """
     truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
     deep = "[" * 10000 + "]" * 10000
     out, _ = truncate({"blob": deep}, 500 * 1024)
     assert out["blob"] == "[UNPARSEABLE_JSON_BLOB]"
+
+  def test_json_nesting_limit_ignores_brackets_inside_strings(self):
+    """Payload punctuation does not count as structural JSON nesting."""
+    truncate = bigquery_agent_analytics_plugin._recursive_smart_truncate
+    blob = json.dumps({"note": "prose " + "[" * 1001 + "]" * 1001})
+    out, truncated = truncate({"blob": blob}, 500 * 1024)
+    assert out["blob"] == blob
+    assert truncated is False
 
   @pytest.mark.asyncio
   async def test_shutdown_timeout_counts_lost_rows(self):

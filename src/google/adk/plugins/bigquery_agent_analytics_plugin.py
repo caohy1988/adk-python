@@ -445,6 +445,12 @@ _MAX_SANITIZE_NODES = 100_000
 # values beyond it fail closed.
 _MAX_JSON_INSPECT_CHARS = 4_000_000
 
+# Keep deeply nested JSON behavior deterministic across Python versions.
+# CPython <=3.13 rejects extreme nesting from json.loads with RecursionError,
+# while 3.14's iterative decoder accepts it. A fixed ceiling preserves the
+# fail-closed contract and bounds the materialized object graph everywhere.
+_MAX_JSON_NESTING_DEPTH = 1_000
+
 
 def _strip_bom_ws(value: str) -> str:
   """Strips BOMs and ALL Unicode whitespace from the start of a string.
@@ -463,6 +469,36 @@ def _strip_bom_ws(value: str) -> str:
   while i < n and (value[i].isspace() or value[i] == "\ufeff"):
     i += 1
   return value[i:] if i else value
+
+
+def _json_nesting_exceeds_limit(value: str) -> bool:
+  """Returns whether JSON structural nesting exceeds the fixed ceiling.
+
+  Brackets and braces inside strings are payload, not structure. This linear
+  preflight runs only after the existing character-size bound, before
+  ``json.loads`` can materialize a runtime-dependent deep object graph.
+  """
+  depth = 0
+  in_string = False
+  escaped = False
+  for char in value:
+    if in_string:
+      if escaped:
+        escaped = False
+      elif char == "\\":
+        escaped = True
+      elif char == '"':
+        in_string = False
+      continue
+    if char == '"':
+      in_string = True
+    elif char in "[{":
+      depth += 1
+      if depth > _MAX_JSON_NESTING_DEPTH:
+        return True
+    elif char in "]}":
+      depth -= 1
+  return False
 
 
 def _normalize_json_native(
@@ -717,6 +753,9 @@ def _sanitize_json_blob(
   # Truncating the raw JSON prefix instead could both retain a secret and
   # emit invalid JSON, so over-limit container blobs fail closed.
   if len(stripped) > inspect_limit:
+    return "[UNPARSEABLE_JSON_BLOB]", True, True
+
+  if _json_nesting_exceeds_limit(stripped):
     return "[UNPARSEABLE_JSON_BLOB]", True, True
 
   # json.loads silently keeps only the LAST duplicate member, so a blob like
