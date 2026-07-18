@@ -548,23 +548,45 @@ def _normalize_json_native(
       out_dict: dict[str, Any] = {}
       replaced = False
       bad_keys = 0
+
+      def collision_safe_key(k: str) -> str:
+        """Allocates a unique key while preserving first-writer order."""
+        nonlocal bad_keys, replaced
+        if k not in out_dict:
+          return k
+        bad_keys += 1
+        candidate = f"[KEY_COLLISION_{bad_keys}]{k}"
+        while candidate in out_dict:
+          bad_keys += 1
+          candidate = f"[KEY_COLLISION_{bad_keys}]{k}"
+        replaced = True
+        return candidate
+
       for k, v in obj.items():
         if budget[0] <= 0:
-          out_dict["[SANITIZE_BUDGET_EXCEEDED]"] = "[SANITIZE_BUDGET_EXCEEDED]"
+          budget_key = collision_safe_key("[SANITIZE_BUDGET_EXCEEDED]")
+          out_dict[budget_key] = "[SANITIZE_BUDGET_EXCEEDED]"
           replaced = True
           break
+        redact_value = False
         if isinstance(k, str):
           if type(k) is not str:
             k = str.__str__(k)
           k_lower = k.lower()
           if k_lower in _SENSITIVE_KEYS or k_lower.startswith("temp:"):
-            budget[0] -= 1
-            out_dict[k] = "[REDACTED]"
-            continue
+            redact_value = True
         else:
           bad_keys += 1
           k = f"[UNSUPPORTED_KEY_{bad_keys}]"
           replaced = True
+        # Preserve every value after key normalization. The first writer
+        # keeps the plain key; later colliders receive a marker that is
+        # itself re-allocated around genuine marker-like user keys.
+        k = collision_safe_key(k)
+        if redact_value:
+          budget[0] -= 1
+          out_dict[k] = "[REDACTED]"
+          continue
         norm_v, v_replaced = _normalize_json_native(
             v, max_len, depth + 1, budget
         )
@@ -3627,8 +3649,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     if self._generation != generation:
       raise RuntimeError("BigQuery plugin is shutting down.")
     self._cleanup_stale_loop_states()
-    if loop in self._loop_state_by_loop:
-      return self._loop_state_by_loop[loop]
+    state = self._loop_state_by_loop.get(loop)
+    if state is not None:
+      return state
 
     # grpc.aio clients are loop-bound, so we create one per event loop.
 

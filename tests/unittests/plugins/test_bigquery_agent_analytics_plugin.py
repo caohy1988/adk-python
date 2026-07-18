@@ -10828,6 +10828,63 @@ class TestIssue6356Hardening:
       assert out == preserved
       assert replaced is False
 
+  def test_normalizer_preserves_post_normalization_key_collisions(self):
+    """Normalized keys never silently overwrite an earlier value."""
+    normalize = bigquery_agent_analytics_plugin._normalize_json_native
+
+    unsupported_first, replaced = normalize(
+        {object(): "unsupported", "[UNSUPPORTED_KEY_1]": "genuine"},
+        10000,
+    )
+    assert unsupported_first == {
+        "[UNSUPPORTED_KEY_1]": "unsupported",
+        "[KEY_COLLISION_2][UNSUPPORTED_KEY_1]": "genuine",
+    }
+    assert replaced is True
+
+    genuine_first, replaced = normalize(
+        {"[UNSUPPORTED_KEY_1]": "genuine", object(): "unsupported"},
+        10000,
+    )
+    assert genuine_first == {
+        "[UNSUPPORTED_KEY_1]": "genuine",
+        "[KEY_COLLISION_2][UNSUPPORTED_KEY_1]": "unsupported",
+    }
+    assert replaced is True
+
+    marker_reserved, replaced = normalize(
+        {
+            object(): "unsupported",
+            "[KEY_COLLISION_2][UNSUPPORTED_KEY_1]": "reserved",
+            "[UNSUPPORTED_KEY_1]": "genuine",
+        },
+        10000,
+    )
+    assert marker_reserved == {
+        "[UNSUPPORTED_KEY_1]": "unsupported",
+        "[KEY_COLLISION_2][UNSUPPORTED_KEY_1]": "reserved",
+        "[KEY_COLLISION_3][UNSUPPORTED_KEY_1]": "genuine",
+    }
+    assert replaced is True
+
+    budget_reserved, replaced = normalize(
+        {
+            "[SANITIZE_BUDGET_EXCEEDED]": "reserved",
+            "[KEY_COLLISION_1][SANITIZE_BUDGET_EXCEEDED]": "marker",
+            "omitted": "value",
+        },
+        10000,
+        budget=[3],
+    )
+    assert budget_reserved == {
+        "[SANITIZE_BUDGET_EXCEEDED]": "reserved",
+        "[KEY_COLLISION_1][SANITIZE_BUDGET_EXCEEDED]": "marker",
+        "[KEY_COLLISION_2][SANITIZE_BUDGET_EXCEEDED]": (
+            "[SANITIZE_BUDGET_EXCEEDED]"
+        ),
+    }
+    assert replaced is True
+
   @pytest.mark.asyncio
   async def test_native_secret_mapping_via_model_field_redacted(
       self,
@@ -12821,6 +12878,30 @@ class TestIssue6356Hardening:
     await plugin.close()
     assert plugin._is_shutting_down is False
     assert loop not in plugin._loop_state_by_loop
+
+  @pytest.mark.asyncio
+  async def test_get_loop_state_uses_single_lookup(
+      self, mock_auth_default, mock_bq_client
+  ):
+    """A concurrent removal cannot split an existence check from lookup."""
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    loop = asyncio.get_running_loop()
+    expected_state = mock.MagicMock()
+
+    class DeleteOnContainsDict(dict):
+
+      def __contains__(self, key):
+        present = super().__contains__(key)
+        if present:
+          del self[key]
+        return present
+
+    plugin._loop_state_by_loop = DeleteOnContainsDict({loop: expected_state})
+
+    assert await plugin._get_loop_state() is expected_state
 
   @pytest.mark.asyncio
   async def test_writer_built_during_shutdown_is_not_published(
