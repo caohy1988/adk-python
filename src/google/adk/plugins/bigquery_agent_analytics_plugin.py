@@ -419,6 +419,10 @@ _SENSITIVE_KEYS = frozenset({
     "id_token",
     "api_key",
     "password",
+    "private_key",
+    "token",
+    "secret",
+    "authorization",
 })
 
 # Written in place of event content when a configured content_formatter
@@ -2294,7 +2298,10 @@ class BatchProcessor:
                 if row_errors:
                   for row_error in row_errors:
                     logger.error("Row error details: %s", row_error)
-                logger.error("Row content causing error: %s", rows)
+                logger.error(
+                    "%d row(s) dropped due to a non-retryable BigQuery error.",
+                    len(rows),
+                )
               self._dropped["non_retryable"] += len(rows)
               return
           return
@@ -2401,7 +2408,15 @@ class BatchProcessor:
           # Wait for the task to acknowledge cancellation
           await self._batch_processor_task
         except asyncio.CancelledError:
-          pass
+          # The worker normally re-raises the cancellation requested just
+          # above.  A SECOND cancellation can also arrive here from the host
+          # while shutdown is waiting for that acknowledgement.  Do not
+          # mistake the host's cancellation for the worker's: swallowing it
+          # lets an outer close timeout report success and skip retryable
+          # plugin-level teardown.
+          current_task = asyncio.current_task()
+          if current_task is not None and current_task.cancelling():
+            raise
         # Rows still queued after the timeout are lost: count them so the
         # loss is observable instead of silent (#6360 review round 2 P2-4).
         # The worker counts its own in-flight batch on cancellation.
@@ -2553,6 +2568,28 @@ class HybridContentParser:
       )
     return text, False
 
+  @staticmethod
+  def _sanitize_raw_text(text: str) -> tuple[str, bool]:
+    """Sanitizes caller-provided text exactly once before it is stored.
+
+    Known formatter/redaction sentinels are already safe and must not be
+    reinterpreted as malformed JSON merely because they are bracketed. All
+    other raw text goes through the same fail-closed credential sanitizer used
+    for structured attributes. Length truncation remains a separate pass so
+    the sanitized value is also the value sent to GCS.
+    """
+    if text in (_FORMATTER_FAILED_SENTINEL, "[REDACTED]"):
+      return text, False
+    sanitized, content_lost = _recursive_smart_truncate(text, -1)
+    if not isinstance(sanitized, str):
+      return "[UNSUPPORTED_OBJECT]", True
+    return sanitized, content_lost
+
+  def _sanitize_and_truncate(self, text: str) -> tuple[str, bool]:
+    sanitized, content_lost = self._sanitize_raw_text(text)
+    truncated_text, length_truncated = self._truncate(sanitized)
+    return truncated_text, content_lost or length_truncated
+
   async def _parse_content_object(
       self,
       content: types.Content | types.Part,
@@ -2633,8 +2670,11 @@ class HybridContentParser:
 
       # CASE C: Text
       elif hasattr(part, "text") and part.text:
-        char_len = len(part.text)
-        byte_len = len(part.text.encode("utf-8"))
+        safe_text, sanitized_content_lost = self._sanitize_raw_text(part.text)
+        if sanitized_content_lost:
+          is_truncated = True
+        char_len = len(safe_text)
+        byte_len = len(safe_text.encode("utf-8"))
 
         # Decide whether to offload using each limit in its own
         # unit.  inline_text_limit is a byte-based storage guard;
@@ -2652,7 +2692,7 @@ class HybridContentParser:
           )
           try:
             uri = await self.offloader.upload_content(
-                part.text, "text/plain", path
+                safe_text, "text/plain", path
             )
             part_data["storage_mode"] = "GCS_REFERENCE"
             part_data["uri"] = uri
@@ -2666,17 +2706,17 @@ class HybridContentParser:
             }
             part_data["object_ref"] = object_ref
             part_data["mime_type"] = "text/plain"
-            part_data["text"] = part.text[:200] + "... [OFFLOADED]"
+            part_data["text"] = safe_text[:200] + "... [OFFLOADED]"
           except Exception as e:
             logger.warning("Failed to offload text to GCS: %s", e)
-            clean_text, truncated = self._truncate(part.text)
+            clean_text, truncated = self._truncate(safe_text)
             if truncated:
               is_truncated = True
             part_data["text"] = clean_text
             summary_text.append(clean_text)
         else:
           # Text is small or no offloader, keep inline
-          clean_text, truncated = self._truncate(part.text)
+          clean_text, truncated = self._truncate(safe_text)
           if truncated:
             is_truncated = True
           part_data["text"] = clean_text
@@ -2723,7 +2763,7 @@ class HybridContentParser:
     is_truncated = False
 
     def process_text(t: str) -> tuple[str, bool]:
-      return self._truncate(t)
+      return self._sanitize_and_truncate(t)
 
     if isinstance(content, LlmRequest):
       # Handle Prompt
@@ -2735,6 +2775,10 @@ class HybridContentParser:
       )
       for content_idx, c in enumerate(contents):
         role = getattr(c, "role", "unknown")
+        if isinstance(role, str):
+          role, role_truncated = process_text(role)
+          if role_truncated:
+            is_truncated = True
         summary, parts, trunc = await self._parse_content_object(
             c,
             trace_id=trace_id,
@@ -3614,6 +3658,28 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       logger.warning("Content formatter failed: %s", e)
       return "[FORMATTING FAILED]", False
 
+  async def _close_detached_loop_transport(self, state: _LoopState) -> None:
+    """Best-effort bounded close for a terminal loop state's transport."""
+    transport = getattr(state.write_client, "transport", None)
+    close_fn = getattr(transport, "close", None)
+    if close_fn is None:
+      return
+    try:
+      if asyncio.iscoroutinefunction(close_fn):
+        await asyncio.wait_for(close_fn(), timeout=self.config.shutdown_timeout)
+      else:
+        loop = asyncio.get_running_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, close_fn),
+            timeout=self.config.shutdown_timeout,
+        )
+        if isinstance(result, collections.abc.Awaitable):
+          await asyncio.wait_for(result, timeout=self.config.shutdown_timeout)
+    except asyncio.CancelledError:
+      raise
+    except Exception:
+      logger.warning("Could not close a detached BigQuery write transport.")
+
   async def _get_loop_state(
       self, claimed_generation: Optional[int] = None
   ) -> _LoopState:
@@ -3649,9 +3715,63 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     if self._generation != generation:
       raise RuntimeError("BigQuery plugin is shutting down.")
     self._cleanup_stale_loop_states()
-    state = self._loop_state_by_loop.get(loop)
-    if state is not None:
-      return state
+    detached_state: Optional[_LoopState] = None
+    detached_rows = 0
+    detached_reason = "shutdown_timeout"
+    with self._loop_states_guard:
+      state = self._loop_state_by_loop.get(loop)
+      if state is not None:
+        processor = state.batch_processor
+        # Production entries always contain a real BatchProcessor. Keeping
+        # non-production stand-ins opaque also avoids treating truthy mock
+        # attributes as lifecycle flags in compatibility tests.
+        if not isinstance(processor, BatchProcessor):
+          return state
+        worker = processor._batch_processor_task
+        if worker is not None and not worker.done():
+          if processor._shutdown:
+            # It is terminal for admission but still owns a live worker.
+            # Returning it loses rows; detaching/closing it races its drain.
+            raise RuntimeError("BigQuery writer is still shutting down.")
+          return state
+
+        # A missing/done worker can never consume another appended row.
+        # Claim + fold under the same canonical guard order used by shutdown
+        # so concurrent stats readers see the state either live or folded,
+        # never both/neither. Identity ownership makes this single-winner.
+        detached_state = self._loop_state_by_loop.pop(loop)
+        # Prevent the old atexit registration from trying to run a second,
+        # blocking close over a processor whose rows are accounted below.
+        processor._shutdown = True
+        detached_reason = (
+            "shutdown_cancelled"
+            if worker is not None and worker.cancelled()
+            else "shutdown_timeout"
+        )
+        queue = processor._queue
+        sentinels = processor._sentinel_count
+        detached_rows = max(0, queue.qsize() - sentinels)
+        with self._drop_counts_guard:
+          for reason, count in processor.get_drop_stats().items():
+            self._local_drop_counts[reason] = (
+                self._local_drop_counts.get(reason, 0) + count
+            )
+          if detached_rows:
+            self._local_drop_counts[detached_reason] = (
+                self._local_drop_counts.get(detached_reason, 0) + detached_rows
+            )
+
+    if detached_rows:
+      logger.warning(
+          "%d queued row(s) belonged to a terminal BigQuery writer (%s).",
+          detached_rows,
+          detached_reason,
+      )
+    detached_close_task = (
+        asyncio.create_task(self._close_detached_loop_transport(detached_state))
+        if detached_state is not None
+        else None
+    )
 
     # grpc.aio clients are loop-bound, so we create one per event loop.
 
@@ -3724,6 +3844,11 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
     atexit.register(self._atexit_cleanup, weakref.proxy(batch_processor))
 
+    # Publish the replacement before awaiting old-resource cleanup. A
+    # concurrent callback on this loop therefore sees the fresh live state,
+    # while the detached terminal state remains single-owner here.
+    if detached_close_task is not None:
+      await detached_close_task
     return state
 
   async def flush(self) -> None:
@@ -3983,6 +4108,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
   def _schema_fields_match(
       existing: list[bq_schema.SchemaField],
       desired: list[bq_schema.SchemaField],
+      path: tuple[str, ...] = (),
   ) -> tuple[
       list[bq_schema.SchemaField],
       list[bq_schema.SchemaField],
@@ -4006,16 +4132,27 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       existing_field = existing_by_name.get(desired_field.name)
       if existing_field is None:
         new_fields.append(desired_field)
-      elif (
-          desired_field.field_type == "RECORD"
-          and existing_field.field_type == "RECORD"
-          and desired_field.fields
-      ):
+        continue
+
+      field_path = ".".join((*path, desired_field.name))
+      existing_type = existing_field.field_type.upper()
+      desired_type = desired_field.field_type.upper()
+      existing_mode = existing_field.mode.upper()
+      desired_mode = desired_field.mode.upper()
+      if existing_type != desired_type or existing_mode != desired_mode:
+        raise ValueError(
+            "Incompatible BigQuery schema field "
+            f"{field_path!r}: existing={existing_type}/{existing_mode}, "
+            f"desired={desired_type}/{desired_mode}."
+        )
+
+      if desired_type == "RECORD" and desired_field.fields:
         # Recurse into nested RECORD fields.
         sub_new, sub_updated = (
             BigQueryAgentAnalyticsPlugin._schema_fields_match(
                 list(existing_field.fields),
                 list(desired_field.fields),
+                (*path, desired_field.name),
             )
         )
         if sub_new or sub_updated:
@@ -5650,6 +5787,15 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     """
     callback_ctx = CallbackContext(invocation_context)
 
+    # A later before_model callback may short-circuit the model call. ADK
+    # intentionally skips every after_model callback in that case, so the
+    # llm_request span pushed by this plugin has no matching callback to pop
+    # it. The synthesized response is a non-partial event; close only that
+    # expected top span at this boundary. Streaming chunks stay attached to
+    # their live llm_request span until the final response callback.
+    if getattr(event, "partial", None) is not True:
+      TraceManager.pop_span(expected_kind="llm_request")
+
     # --- State delta logging ---
     if event.actions.state_delta:
       await self._log_event(
@@ -6035,6 +6181,12 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     {system_prompt}'.
     """
 
+    # Defensive cleanup for a short-circuited request whose synthesized
+    # event was not observed (for example, an abnormal generator exit).
+    # expected_kind prevents this from disturbing the parent agent or
+    # invocation span.
+    TraceManager.pop_span(expected_kind="llm_request")
+
     # 5. Attributes (Config & Tools)
     attributes: dict[str, Any] = {}
     tools_truncated = False
@@ -6163,7 +6315,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           tfft = int((first_token - start_time) * 1000)
 
       # ACTUALLY pop the span
-      popped_span_id, duration = TraceManager.pop_span()
+      popped_span_id, duration = TraceManager.pop_span(
+          expected_kind="llm_request"
+      )
       is_popped = True
 
       # If we popped, the span_id from get_current_span_and_parent() above is correct for THIS event
@@ -6204,7 +6358,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         llm_request: The request that was sent to the model.
         error: The exception that occurred.
     """
-    span_id, duration = TraceManager.pop_span()
+    span_id, duration = TraceManager.pop_span(expected_kind="llm_request")
     parent_span_id, _ = TraceManager.get_current_span_and_parent()
 
     await self._log_event(
