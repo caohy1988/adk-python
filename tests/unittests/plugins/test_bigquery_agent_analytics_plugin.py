@@ -13418,7 +13418,7 @@ class TestLatestReviewLifecycleRegressions:
     await processor.shutdown(timeout=1.0)
     assert processor._batch_processor_task.cancelled()
     assert processor._queue.empty()
-    assert processor.get_drop_stats()["shutdown_cancelled"] == 1
+    assert processor.get_drop_stats()["shutdown_timeout"] == 1
 
   @pytest.mark.asyncio
   async def test_dead_loop_state_is_replaced_once_and_rows_are_accounted(
@@ -13501,3 +13501,354 @@ class TestLatestReviewLifecycleRegressions:
       write_rows.assert_awaited_once_with([row])
 
     await plugin.shutdown(timeout=1)
+
+  @pytest.mark.asyncio
+  async def test_normal_timeout_retrieves_worker_cancel_and_drains_queue(self):
+    """The 3.10-compatible acknowledgement path handles worker cancel."""
+    processor = bigquery_agent_analytics_plugin.BatchProcessor(
+        write_client=mock.MagicMock(),
+        arrow_schema=None,
+        write_stream="stream",
+        batch_size=1,
+        flush_interval=1.0,
+        retry_config=bigquery_agent_analytics_plugin.RetryConfig(),
+        queue_max_size=10,
+        shutdown_timeout=1.0,
+    )
+    never = asyncio.Event()
+    processor._batch_processor_task = asyncio.create_task(never.wait())
+    processor._queue.put_nowait({"row": 1})
+
+    await processor.shutdown(timeout=0.001)
+
+    assert processor._batch_processor_task.cancelled()
+    assert processor._queue.empty()
+    assert processor.get_drop_stats()["shutdown_timeout"] == 1
+
+  @pytest.mark.asyncio
+  async def test_error_columns_and_tracebacks_redact_embedded_credentials(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    secrets = (
+        "AUTH-SECRET",
+        "QUERY-SECRET",
+        "JSON-SECRET",
+        "SIGNATURE-SECRET",
+        "ESCAPED-SECRET",
+    )
+    message = (
+        "safe prefix Authorization: Bearer AUTH-SECRET; "
+        "access-token=QUERY-SECRET"
+    )
+    traceback_text = (
+        'Traceback safe prefix {"access_token":"JSON-SECRET"}; '
+        'next {"access\\u005ftoken":"ESCAPED-SECRET"}; '
+        "x-goog-signature=SIGNATURE-SECRET"
+    )
+
+    await bq_plugin_inst._log_event(
+        "AGENT_ERROR",
+        callback_context,
+        raw_content={"error_traceback": traceback_text},
+        event_data=bigquery_agent_analytics_plugin.EventData(
+            status="ERROR", error_message=message
+        ),
+    )
+    await bq_plugin_inst.flush()
+    row = await _get_captured_event_dict_async(
+        mock_write_client, dummy_arrow_schema
+    )
+    stored = json.dumps(row, default=str)
+    assert all(secret not in stored for secret in secrets)
+    assert row["error_message"].startswith("safe prefix Authorization:")
+    assert bigquery_agent_analytics_plugin._sanitize_sensitive_text(
+        "Authorization: Bearer AUTH-SECRET", -1
+    ) == ("Authorization: [REDACTED]", True)
+    for escaped in (
+        r"access\u005ftoken=ESCAPED-SECRET",
+        r'Traceback { "access\u005ftoken":"ESCAPED-SECRET"}',
+    ):
+      assert bigquery_agent_analytics_plugin._sanitize_sensitive_text(
+          escaped, -1
+      ) == ("[REDACTED_SENSITIVE_TEXT]", True)
+    assert bigquery_agent_analytics_plugin._sanitize_sensitive_text(
+        "temp:credential=TEMP-SECRET", -1
+    ) == ("temp:credential=[REDACTED]", True)
+    assert "[REDACTED]" in stored
+    assert row["is_truncated"] is True
+
+  @pytest.mark.asyncio
+  async def test_safe_error_message_is_preserved_exactly(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    message = "[INFO] ordinary failure at worker 7"
+    await bq_plugin_inst._log_event(
+        "LLM_ERROR",
+        callback_context,
+        event_data=bigquery_agent_analytics_plugin.EventData(
+            status="ERROR", error_message=message
+        ),
+    )
+    await bq_plugin_inst.flush()
+    row = await _get_captured_event_dict_async(
+        mock_write_client, dummy_arrow_schema
+    )
+    assert row["error_message"] == message
+    assert row["is_truncated"] is False
+
+  @pytest.mark.asyncio
+  async def test_live_shutting_down_writer_aborts_owner_and_waiter_once(
+      self, mock_auth_default, mock_bq_client, callback_context
+  ):
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    processor = bigquery_agent_analytics_plugin.BatchProcessor(
+        write_client=mock.MagicMock(),
+        arrow_schema=None,
+        write_stream="stream",
+        batch_size=1,
+        flush_interval=1.0,
+        retry_config=bigquery_agent_analytics_plugin.RetryConfig(),
+        queue_max_size=10,
+        shutdown_timeout=1.0,
+    )
+    never = asyncio.Event()
+    processor._batch_processor_task = asyncio.create_task(never.wait())
+    processor._shutdown = True
+    loop = asyncio.get_running_loop()
+    plugin._loop_state_by_loop[loop] = (
+        bigquery_agent_analytics_plugin._LoopState(mock.MagicMock(), processor)
+    )
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def attempt_setup(**kwargs):
+      del kwargs
+      entered.set()
+      await release.wait()
+      await plugin._get_loop_state()
+
+    try:
+      with mock.patch.object(plugin, "_lazy_setup", side_effect=attempt_setup):
+        owner = asyncio.create_task(plugin._ensure_started())
+        await entered.wait()
+        waiter = asyncio.create_task(plugin._ensure_started())
+        await asyncio.sleep(0)
+        release.set()
+        assert await owner == "aborted"
+        assert await waiter == "aborted"
+
+        assert plugin._startup_error is None
+        assert plugin._setup_failures == 0
+        assert plugin._setup_retry_at == 0
+        assert plugin._loop_state_by_loop[loop].batch_processor is processor
+
+        await plugin._log_event(
+            "STATE_DELTA",
+            callback_context,
+            event_data=bigquery_agent_analytics_plugin.EventData(),
+        )
+      assert plugin.get_drop_stats()["shutdown_race"] == 1
+    finally:
+      processor._batch_processor_task.cancel()
+      with contextlib.suppress(asyncio.CancelledError):
+        await processor._batch_processor_task
+
+  @pytest.mark.asyncio
+  async def test_detached_transport_closed_when_replacement_build_fails(
+      self, mock_auth_default, mock_bq_client
+  ):
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    plugin._credentials = mock.MagicMock(quota_project_id=None)
+    loop = asyncio.get_running_loop()
+
+    old_transport = mock.MagicMock(close=mock.AsyncMock())
+    old_processor = bigquery_agent_analytics_plugin.BatchProcessor(
+        write_client=mock.MagicMock(transport=old_transport),
+        arrow_schema=None,
+        write_stream="stream",
+        batch_size=1,
+        flush_interval=1.0,
+        retry_config=bigquery_agent_analytics_plugin.RetryConfig(),
+        queue_max_size=10,
+        shutdown_timeout=1.0,
+    )
+    old_processor._shutdown = True
+    old_processor._batch_processor_task = asyncio.create_task(asyncio.sleep(0))
+    await old_processor._batch_processor_task
+    plugin._loop_state_by_loop[loop] = (
+        bigquery_agent_analytics_plugin._LoopState(
+            mock.MagicMock(transport=old_transport), old_processor
+        )
+    )
+
+    fresh_transport = mock.MagicMock(close=mock.AsyncMock())
+    fresh_client = mock.MagicMock(transport=fresh_transport)
+    with (
+        mock.patch.object(
+            bigquery_agent_analytics_plugin,
+            "BigQueryWriteAsyncClient",
+            return_value=fresh_client,
+        ),
+        mock.patch.object(
+            bigquery_agent_analytics_plugin.BatchProcessor,
+            "__init__",
+            side_effect=RuntimeError("construction failed"),
+        ),
+    ):
+      with pytest.raises(RuntimeError, match="construction failed"):
+        await plugin._get_loop_state()
+
+    old_transport.close.assert_awaited_once()
+    fresh_transport.close.assert_awaited_once()
+    assert loop not in plugin._loop_state_by_loop
+
+  @pytest.mark.asyncio
+  async def test_raw_bracket_prose_preserved_inline_and_gcs(self):
+    inline = bigquery_agent_analytics_plugin.HybridContentParser(
+        offloader=None,
+        trace_id="t",
+        span_id="s",
+        max_length=-1,
+    )
+    prose = ("[INFO] ready", "[link](https://example.test)", "{not json}")
+    for value in prose:
+      payload, parts, truncated = await inline.parse(
+          types.Content(parts=[types.Part(text=value)])
+      )
+      assert payload == {"text_summary": value}
+      assert parts[0]["text"] == value
+      assert truncated is False
+
+    offloader = mock.AsyncMock()
+    offloader.upload_content.return_value = "gs://bucket/safe.txt"
+    offloaded = bigquery_agent_analytics_plugin.HybridContentParser(
+        offloader=offloader,
+        trace_id="t",
+        span_id="s",
+        max_length=-1,
+    )
+    large_prose = "[INFO] " + "safe prose " * 4000
+    await offloaded.parse(types.Content(parts=[types.Part(text=large_prose)]))
+    assert offloader.upload_content.call_args.args[0] == large_prose
+
+  @pytest.mark.asyncio
+  async def test_malformed_bracket_credentials_still_fail_closed(self):
+    parser = bigquery_agent_analytics_plugin.HybridContentParser(
+        offloader=None,
+        trace_id="t",
+        span_id="s",
+        max_length=-1,
+    )
+    for value in (
+        '{"access_token":"MALFORMED-SECRET"',
+        '{"access\\u005ftoken":"ESCAPED-SECRET"',
+    ):
+      payload, parts, truncated = await parser.parse(
+          types.Content(parts=[types.Part(text=value)])
+      )
+      stored = json.dumps({"payload": payload, "parts": parts})
+      assert "MALFORMED-SECRET" not in stored
+      assert "ESCAPED-SECRET" not in stored
+      assert "[UNPARSEABLE_JSON_BLOB]" in stored
+      assert truncated is True
+
+  @pytest.mark.asyncio
+  async def test_external_uri_redacts_query_fragment_and_userinfo(self):
+    parser = bigquery_agent_analytics_plugin.HybridContentParser(
+        offloader=None,
+        trace_id="t",
+        span_id="s",
+        max_length=-1,
+    )
+    signed = (
+        "https://storage.example.test/safe/path?safe=kept"
+        "&X-Goog-Credential=URI-CREDENTIAL"
+        "&X-Goog-Signature=URI-SIGNATURE#access-token=FRAGMENT-SECRET"
+    )
+    _, parts, truncated = await parser.parse(
+        types.Content(
+            parts=[types.Part.from_uri(file_uri=signed, mime_type="text/plain")]
+        )
+    )
+    uri = parts[0]["uri"]
+    assert uri.startswith("https://storage.example.test/safe/path?")
+    assert "safe=kept" in uri
+    assert all(
+        secret not in uri
+        for secret in ("URI-CREDENTIAL", "URI-SIGNATURE", "FRAGMENT-SECRET")
+    )
+    assert truncated is True
+
+    userinfo = types.Part(
+        file_data=types.FileData(
+            file_uri="https://user:password@example.test/safe",
+            mime_type="text/plain",
+        )
+    )
+    _, parts, truncated = await parser.parse(types.Content(parts=[userinfo]))
+    assert parts[0]["uri"] == "[REDACTED_SENSITIVE_URI]"
+    assert truncated is True
+
+    missing = types.Part(
+        file_data=types.FileData(file_uri=None, mime_type="text/plain")
+    )
+    _, parts, truncated = await parser.parse(types.Content(parts=[missing]))
+    assert parts[0]["uri"] == "[REDACTED_SENSITIVE_URI]"
+    assert truncated is True
+
+  @pytest.mark.asyncio
+  async def test_structured_non_text_parts_are_complete_and_private(self):
+    parser = bigquery_agent_analytics_plugin.HybridContentParser(
+        offloader=None,
+        trace_id="t",
+        span_id="s",
+        max_length=1000,
+    )
+    secret = "STRUCTURED-PART-SECRET"
+    content = types.Content(
+        parts=[
+            types.Part(
+                function_response=types.FunctionResponse(
+                    name="lookup", response={"access_token": secret, "ok": True}
+                )
+            ),
+            types.Part(
+                executable_code=types.ExecutableCode(
+                    language=types.Language.PYTHON,
+                    code=json.dumps({"private_key": secret}),
+                )
+            ),
+            types.Part(
+                code_execution_result=types.CodeExecutionResult(
+                    outcome=types.Outcome.OUTCOME_OK,
+                    output=f"Authorization: Bearer {secret}",
+                )
+            ),
+        ]
+    )
+
+    payload, parts, truncated = await parser.parse(content)
+    stored = json.dumps({"payload": payload, "parts": parts})
+    assert secret not in stored
+    assert truncated is True
+    assert "Function response: lookup" in payload["text_summary"]
+    assert "Executable code" in payload["text_summary"]
+    assert "Code execution result" in payload["text_summary"]
+    assert "function_response" in json.loads(parts[0]["part_attributes"])
+    assert "executable_code" in json.loads(parts[1]["part_attributes"])
+    assert "code_execution_result" in json.loads(parts[2]["part_attributes"])

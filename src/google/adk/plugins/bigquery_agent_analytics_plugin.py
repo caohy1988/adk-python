@@ -58,6 +58,10 @@ from typing import Optional
 from typing import ParamSpec
 from typing import TYPE_CHECKING
 from typing import TypeVar
+from urllib.parse import parse_qsl
+from urllib.parse import urlencode
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 import uuid
 import weakref
 
@@ -424,6 +428,147 @@ _SENSITIVE_KEYS = frozenset({
     "secret",
     "authorization",
 })
+
+# Credentials commonly carried in signed URLs and HTTP error text.  These are
+# values rather than structured mapping keys in those two surfaces, so they
+# need an explicit bounded text/URI pass in addition to _SENSITIVE_KEYS.
+_SENSITIVE_TEXT_KEYS = frozenset(
+    set(_SENSITIVE_KEYS)
+    | {
+        "proxy_authorization",
+        "x_api_key",
+        "x_goog_credential",
+        "x_goog_security_token",
+        "x_goog_signature",
+        "signature",
+    }
+)
+_SENSITIVE_TEXT_KEY_RE = re.compile(
+    r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])(?:[\"'])?(?:"
+    r"temp:[A-Za-z0-9_.-]+|"
+    + "|".join(
+        sorted(
+            (
+                re.escape(key).replace("_", "[-_]")
+                for key in _SENSITIVE_TEXT_KEYS
+            ),
+            key=len,
+            reverse=True,
+        )
+    )
+    + r")(?:[\"'])?\s*[:=]\s*)(?P<value>"
+    r"\[REDACTED\]"
+    r'|"(?:\\.|[^"\\])*"'
+    r"|'(?:\\.|[^'\\])*'"
+    r"|[^\s,;&}\]]+)"
+)
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)(?P<prefix>\b(?:authorization|proxy-authorization|x-api-key|api-key)"
+    r"[ \t]*:[ \t]*)(?:bearer[ \t]+|basic[ \t]+)?[^\s,;]+"
+)
+_BEARER_TOKEN_RE = re.compile(r"(?i)(?P<prefix>\bbearer[ \t]+)[^\s,;]+")
+_UNICODE_ESCAPE_RE = re.compile(r"(?i)\\u([0-9a-f]{4})")
+_HEX_ESCAPE_RE = re.compile(r"(?i)\\x([0-9a-f]{2})")
+
+
+def _contains_sensitive_text_marker(text: str) -> bool:
+  """Returns whether text contains a credential/header marker."""
+  lowered = text.lower().replace("-", "_")
+  return (
+      any(key in lowered for key in _SENSITIVE_TEXT_KEYS)
+      or "temp:" in lowered
+      or "bearer " in lowered
+  )
+
+
+def _contains_escaped_sensitive_text_marker(text: str) -> bool:
+  """Detects sensitive markers hidden behind common ASCII escapes."""
+
+  def _decode_escape(match: re.Match[str]) -> str:
+    return chr(int(match.group(1), 16))
+
+  decoded = _UNICODE_ESCAPE_RE.sub(_decode_escape, text)
+  decoded = _HEX_ESCAPE_RE.sub(_decode_escape, decoded)
+  # A decoded backslash can introduce another escape layer. Fail closed
+  # instead of repeatedly scanning a multi-megabyte diagnostic string.
+  introduced_escape = "\\u005c" in text.lower() or "\\x5c" in text.lower()
+  return introduced_escape or _contains_sensitive_text_marker(decoded)
+
+
+def _sanitize_sensitive_text(text: str, max_len: int) -> tuple[str, bool]:
+  """Redacts bounded credential material embedded in diagnostic text.
+
+  Unlike the generic attribute sanitizer, this preserves ordinary prose
+  exactly (including bracket-led log messages). Complete JSON/encoded JSON
+  still uses the existing structural redactor, while HTTP headers, bearer
+  tokens, query parameters, and key/value fragments embedded in prose are
+  replaced in place. Inputs too large to inspect safely fail closed when they
+  would otherwise be emitted without a configured length bound.
+  """
+  if type(text) is not str:
+    text = str.__str__(text)
+  if len(text) > _MAX_JSON_INSPECT_CHARS:
+    if max_len == -1 or max_len > _MAX_JSON_INSPECT_CHARS:
+      return "[REDACTED_SENSITIVE_TEXT]", True
+    # Only this prefix can reach the row. A cut escape could hide a key across
+    # the boundary, so fail closed rather than emit an unverifiable prefix.
+    emitted = text[:max_len]
+    if "\\" in emitted and _contains_sensitive_text_marker(emitted):
+      return "[REDACTED_SENSITIVE_TEXT]", True
+    text = emitted
+    length_truncated = True
+  else:
+    length_truncated = False
+
+  sanitized = text
+  stripped = _strip_bom_ws(text)
+  if stripped.startswith(("{", "[", '"')):
+    try:
+      json.loads(stripped)
+    except (TypeError, ValueError, RecursionError, MemoryError):
+      # Malformed diagnostic prose is handled by the explicit marker pass
+      # below; safe "[INFO] ..." messages must remain byte-identical.
+      pass
+    else:
+      structured, _ = _recursive_smart_truncate(text, -1)
+      if isinstance(structured, str):
+        sanitized = structured
+      else:
+        sanitized = json.dumps(structured)
+
+  changed = sanitized != text
+
+  def _redact_key_value(match: re.Match[str]) -> str:
+    value = match.group("value")
+    if value == "[REDACTED]":
+      return match.group(0)
+    quote = value[:1] if value[:1] in ('"', "'") else ""
+    return f"{match.group('prefix')}{quote}[REDACTED]{quote}"
+
+  sanitized, n_headers = _AUTH_HEADER_RE.subn(
+      lambda match: f"{match.group('prefix')}[REDACTED]", sanitized
+  )
+  sanitized, n_bearer = _BEARER_TOKEN_RE.subn(
+      lambda match: f"{match.group('prefix')}[REDACTED]", sanitized
+  )
+  sanitized, n_values = _SENSITIVE_TEXT_KEY_RE.subn(
+      _redact_key_value, sanitized
+  )
+  changed = changed or bool(n_headers or n_bearer or n_values)
+
+  # An escaped sensitive marker that survived all structural/pattern passes
+  # cannot be verified secret-free (e.g. access\u005ftoken in malformed JSON).
+  if "\\" in sanitized and (
+      _contains_sensitive_text_marker(sanitized)
+      or _contains_escaped_sensitive_text_marker(sanitized)
+  ):
+    return "[REDACTED_SENSITIVE_TEXT]", True
+
+  if max_len != -1 and len(sanitized) > max_len:
+    sanitized = sanitized[:max_len] + "...[TRUNCATED]"
+    length_truncated = True
+  return sanitized, changed or length_truncated
+
 
 # Written in place of event content when a configured content_formatter
 # raises: the formatter is a privacy/redaction boundary, so failure must
@@ -918,6 +1063,15 @@ class _SetupAbortedError(RuntimeError):
 
   Distinct from service failures so waiters and row owners can classify
   the outcome without string matching (#6360 review round 8 P2-9).
+  """
+
+
+class _LoopStateAdmissionAbortedError(_SetupAbortedError):
+  """A retained writer is terminal for admission but still draining.
+
+  This is a lifecycle outcome, not a setup/service failure: setup owners and
+  coalesced waiters must report ``aborted`` without poisoning retry backoff or
+  tearing down shared clients needed by the in-flight drain.
   """
 
 
@@ -2404,19 +2558,18 @@ class BatchProcessor:
       except asyncio.TimeoutError:
         logger.warning("BatchProcessor shutdown timed out, cancelling worker.")
         self._batch_processor_task.cancel()
-        try:
-          # Wait for the task to acknowledge cancellation
-          await self._batch_processor_task
-        except asyncio.CancelledError:
-          # The worker normally re-raises the cancellation requested just
-          # above.  A SECOND cancellation can also arrive here from the host
-          # while shutdown is waiting for that acknowledgement.  Do not
-          # mistake the host's cancellation for the worker's: swallowing it
-          # lets an outer close timeout report success and skip retryable
-          # plugin-level teardown.
-          current_task = asyncio.current_task()
-          if current_task is not None and current_task.cancelling():
-            raise
+        # Convert the WORKER's expected CancelledError into a gather result,
+        # then shield that acknowledgement owner. If the HOST cancels this
+        # shutdown await, shield raises CancelledError unambiguously while the
+        # gather continues to own/retrieve the worker result. This works on
+        # Python 3.10 (where Task.cancelling() does not exist) and preserves
+        # the external-cancellation distinction on newer runtimes.
+        await asyncio.shield(
+            asyncio.gather(
+                self._batch_processor_task,
+                return_exceptions=True,
+            )
+        )
         # Rows still queued after the timeout are lost: count them so the
         # loss is observable instead of silent (#6360 review round 2 P2-4).
         # The worker counts its own in-flight batch on cancellation.
@@ -2581,6 +2734,23 @@ class HybridContentParser:
     if text in (_FORMATTER_FAILED_SENTINEL, "[REDACTED]"):
       return text, False
     sanitized, content_lost = _recursive_smart_truncate(text, -1)
+    if sanitized == "[UNPARSEABLE_JSON_BLOB]":
+      # Raw content is user-facing prose, not an opaque attributes blob.
+      # Reusing the attributes sanitizer made every invalid bracket-led
+      # message ("[INFO]", Markdown links, "{not json}") disappear. Restore
+      # only bounded, plainly non-encoded prose: any escape or credential
+      # marker stays fail-closed, as do valid/malformed credential documents.
+      stripped = _strip_bom_ws(text)
+      if (
+          len(stripped) <= _MAX_JSON_INSPECT_CHARS
+          and stripped.startswith(("[", "{"))
+          and "\\" not in stripped
+          and not _contains_sensitive_text_marker(stripped)
+      ):
+        try:
+          json.loads(stripped)
+        except (ValueError, RecursionError, MemoryError):
+          return text, False
     if not isinstance(sanitized, str):
       return "[UNSUPPORTED_OBJECT]", True
     return sanitized, content_lost
@@ -2589,6 +2759,96 @@ class HybridContentParser:
     sanitized, content_lost = self._sanitize_raw_text(text)
     truncated_text, length_truncated = self._truncate(sanitized)
     return truncated_text, content_lost or length_truncated
+
+  def _sanitize_external_uri(self, uri: str) -> tuple[str, bool]:
+    """Redacts signed/query credentials while preserving a URI's location."""
+    if not isinstance(uri, str):
+      return "[REDACTED_SENSITIVE_URI]", True
+    if type(uri) is not str:
+      uri = str.__str__(uri)
+    if len(uri) > _MAX_JSON_INSPECT_CHARS:
+      return "[REDACTED_SENSITIVE_URI]", True
+    try:
+      parsed = urlsplit(uri)
+      if parsed.username is not None or parsed.password is not None:
+        # Userinfo is a credential-bearing URI surface by definition. Do not
+        # try to retain a username while guessing whether it is sensitive.
+        return "[REDACTED_SENSITIVE_URI]", True
+      query = parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+      return "[REDACTED_SENSITIVE_URI]", True
+
+    changed = False
+    safe_query: list[tuple[str, str]] = []
+    for key, value in query:
+      normalized_key = key.lower().replace("-", "_")
+      if normalized_key in _SENSITIVE_TEXT_KEYS or normalized_key.startswith(
+          "temp:"
+      ):
+        safe_query.append((key, "[REDACTED]"))
+        changed = True
+        continue
+      safe_value, value_changed = _sanitize_sensitive_text(value, -1)
+      safe_query.append((key, safe_value))
+      changed = changed or value_changed
+
+    safe_fragment, fragment_changed = _sanitize_sensitive_text(
+        parsed.fragment, -1
+    )
+    changed = changed or fragment_changed
+    safe_uri = urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        urlencode(safe_query),
+        safe_fragment,
+    ))
+    safe_uri, uri_truncated = self._truncate(safe_uri)
+    return safe_uri, changed or uri_truncated
+
+  def _serialize_part_model(self, value: Any) -> tuple[dict[str, Any], bool]:
+    """Returns bounded JSON-native fields for a supported structured part."""
+    dumped = value.model_dump(exclude_none=True, mode="json")
+    sanitized, content_lost = _recursive_smart_truncate(dumped, self.max_length)
+    if not isinstance(sanitized, dict):
+      return {"value": "[UNSUPPORTED_OBJECT]"}, True
+
+    budget = [_MAX_SANITIZE_NODES]
+
+    def _sanitize_strings(obj: Any, depth: int = 0) -> tuple[Any, bool]:
+      budget[0] -= 1
+      if budget[0] < 0 or depth >= _MAX_SANITIZE_DEPTH:
+        return "[SANITIZE_BUDGET_EXCEEDED]", True
+      if isinstance(obj, str):
+        return _sanitize_sensitive_text(obj, self.max_length)
+      if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        replaced = False
+        for key, item in obj.items():
+          if budget[0] <= 0:
+            out["[SANITIZE_BUDGET_EXCEEDED]"] = "[SANITIZE_BUDGET_EXCEEDED]"
+            return out, True
+          safe_item, item_replaced = _sanitize_strings(item, depth + 1)
+          out[key] = safe_item
+          replaced = replaced or item_replaced
+        return out, replaced
+      if isinstance(obj, list):
+        out_list = []
+        replaced = False
+        for item in obj:
+          if budget[0] <= 0:
+            out_list.append("[SANITIZE_BUDGET_EXCEEDED]")
+            return out_list, True
+          safe_item, item_replaced = _sanitize_strings(item, depth + 1)
+          out_list.append(safe_item)
+          replaced = replaced or item_replaced
+        return out_list, replaced
+      return obj, False
+
+    sanitized, text_content_lost = _sanitize_strings(sanitized)
+    if not isinstance(sanitized, dict):
+      return {"value": "[UNSUPPORTED_OBJECT]"}, True
+    return sanitized, content_lost or text_content_lost
 
   async def _parse_content_object(
       self,
@@ -2634,7 +2894,12 @@ class HybridContentParser:
       # CASE A: It is already a URI (e.g. from user input)
       if hasattr(part, "file_data") and part.file_data:
         part_data["storage_mode"] = "EXTERNAL_URI"
-        part_data["uri"] = part.file_data.file_uri
+        safe_uri, uri_content_lost = self._sanitize_external_uri(
+            part.file_data.file_uri
+        )
+        part_data["uri"] = safe_uri
+        if uri_content_lost:
+          is_truncated = True
         part_data["mime_type"] = part.file_data.mime_type
 
       # CASE B: It is Binary/Inline Data (Image/Blob)
@@ -2728,6 +2993,66 @@ class HybridContentParser:
         part_data["part_attributes"] = json.dumps(
             {"function_name": part.function_call.name}
         )
+
+      elif hasattr(part, "function_response") and part.function_response:
+        response, response_lost = self._serialize_part_model(
+            part.function_response
+        )
+        if response_lost:
+          is_truncated = True
+        name = response.get("name") or "unknown"
+        if not isinstance(name, str):
+          name = "[UNSUPPORTED_OBJECT]"
+          is_truncated = True
+        response_summary = f"Function response: {name}"
+        part_data["mime_type"] = "application/json"
+        part_data["text"] = response_summary
+        part_data["part_attributes"] = json.dumps(
+            {"function_response": response}
+        )
+        summary_text.append(response_summary)
+
+      elif hasattr(part, "executable_code") and part.executable_code:
+        executable, code_lost = self._serialize_part_model(part.executable_code)
+        if code_lost:
+          is_truncated = True
+        language = executable.get("language") or "unknown"
+        if not isinstance(language, str):
+          language = "[UNSUPPORTED_OBJECT]"
+          is_truncated = True
+        code = executable.get("code") or ""
+        if not isinstance(code, str):
+          code = "[UNSUPPORTED_OBJECT]"
+          is_truncated = True
+        part_data["mime_type"] = "text/plain"
+        part_data["text"] = code
+        part_data["part_attributes"] = json.dumps({
+            "executable_code": executable,
+        })
+        summary_text.append(f"Executable code ({language}): {code}")
+
+      elif (
+          hasattr(part, "code_execution_result") and part.code_execution_result
+      ):
+        result, result_lost = self._serialize_part_model(
+            part.code_execution_result
+        )
+        if result_lost:
+          is_truncated = True
+        outcome = result.get("outcome") or "unknown"
+        if not isinstance(outcome, str):
+          outcome = "[UNSUPPORTED_OBJECT]"
+          is_truncated = True
+        output = result.get("output") or ""
+        if not isinstance(output, str):
+          output = "[UNSUPPORTED_OBJECT]"
+          is_truncated = True
+        part_data["mime_type"] = "text/plain"
+        part_data["text"] = output
+        part_data["part_attributes"] = json.dumps({
+            "code_execution_result": result,
+        })
+        summary_text.append(f"Code execution result ({outcome}): {output}")
 
       content_parts.append(part_data)
 
@@ -3658,9 +3983,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       logger.warning("Content formatter failed: %s", e)
       return "[FORMATTING FAILED]", False
 
-  async def _close_detached_loop_transport(self, state: _LoopState) -> None:
-    """Best-effort bounded close for a terminal loop state's transport."""
-    transport = getattr(state.write_client, "transport", None)
+  async def _close_write_transport(self, write_client: Any) -> None:
+    """Best-effort bounded close for a BigQuery write-client transport."""
+    transport = getattr(write_client, "transport", None)
     close_fn = getattr(transport, "close", None)
     if close_fn is None:
       return
@@ -3679,6 +4004,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       raise
     except Exception:
       logger.warning("Could not close a detached BigQuery write transport.")
+
+  async def _close_detached_loop_transport(self, state: _LoopState) -> None:
+    """Best-effort bounded close for a terminal loop state's transport."""
+    await self._close_write_transport(state.write_client)
 
   async def _get_loop_state(
       self, claimed_generation: Optional[int] = None
@@ -3732,7 +4061,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           if processor._shutdown:
             # It is terminal for admission but still owns a live worker.
             # Returning it loses rows; detaching/closing it races its drain.
-            raise RuntimeError("BigQuery writer is still shutting down.")
+            raise _LoopStateAdmissionAbortedError(
+                "BigQuery writer is still shutting down."
+            )
           return state
 
         # A missing/done worker can never consume another appended row.
@@ -3767,89 +4098,95 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           detached_rows,
           detached_reason,
       )
-    detached_close_task = (
-        asyncio.create_task(self._close_detached_loop_transport(detached_state))
-        if detached_state is not None
-        else None
-    )
+    # Structured ownership: the claimant that removed a terminal state also
+    # owns its bounded transport close. A detached fire-and-forget task left a
+    # warning/leak window whenever fresh construction raised before the task
+    # was retrieved. The finally runs on success, failure, and cancellation;
+    # on success the replacement is published before this await so concurrent
+    # callers share it instead of building another writer.
+    try:
+      # grpc.aio clients are loop-bound, so we create one per event loop.
+      def get_credentials() -> google.auth.credentials.Credentials:
+        creds, _ = google.auth.default(scopes=[_CLOUD_PLATFORM_SCOPE])
+        return creds
 
-    # grpc.aio clients are loop-bound, so we create one per event loop.
-
-    def get_credentials() -> google.auth.credentials.Credentials:
-      creds, _ = google.auth.default(scopes=[_CLOUD_PLATFORM_SCOPE])
-      return creds
-
-    if self._credentials is None:
-      self._credentials = await loop.run_in_executor(
-          self._executor, get_credentials
-      )
-    quota_project_id = getattr(self._credentials, "quota_project_id", None)
-    options = (
-        client_options.ClientOptions(quota_project_id=quota_project_id)
-        if quota_project_id
-        else None
-    )
-
-    user_agents = [f"google-adk-bq-logger/{__version__}"]
-    if self._visual_builder:
-      user_agents.append(f"google-adk-visual-builder/{__version__}")
-
-    client_info = gapic_client_info.ClientInfo(user_agent=" ".join(user_agents))
-
-    write_client = BigQueryWriteAsyncClient(
-        credentials=self._credentials,
-        client_info=client_info,
-        client_options=options,
-    )
-
-    if not self._write_stream_name:
-      self._write_stream_name = f"projects/{self.project_id}/datasets/{self.dataset_id}/tables/{self.table_id}/_default"
-
-    batch_processor = BatchProcessor(
-        write_client=write_client,
-        arrow_schema=self.arrow_schema,
-        write_stream=self._write_stream_name,
-        batch_size=self.config.batch_size,
-        flush_interval=self.config.batch_flush_interval,
-        retry_config=self.config.retry_config,
-        queue_max_size=self.config.queue_max_size,
-        shutdown_timeout=self.config.shutdown_timeout,
-    )
-    await batch_processor.start()
-
-    state = _LoopState(write_client, batch_processor)
-    with self._loop_states_guard:
-      invalidated = self._is_shutting_down or self._generation != generation
-      if not invalidated:
-        self._loop_state_by_loop[loop] = state
-    if invalidated:
-      # shutdown() ran during construction; its snapshot cannot include
-      # this writer, so publishing it would leave a live processor and
-      # open transport behind after close() returns (#6360 review round 6
-      # P1-2). Tear the fresh instances down instead of publishing.
-      try:
-        await batch_processor.shutdown(timeout=self.config.shutdown_timeout)
-      except Exception:
-        logger.warning(
-            "Could not shut down writer created during shutdown.",
-            exc_info=True,
+      if self._credentials is None:
+        self._credentials = await loop.run_in_executor(
+            self._executor, get_credentials
         )
-      transport = getattr(write_client, "transport", None)
-      if transport:
+      quota_project_id = getattr(self._credentials, "quota_project_id", None)
+      options = (
+          client_options.ClientOptions(quota_project_id=quota_project_id)
+          if quota_project_id
+          else None
+      )
+
+      user_agents = [f"google-adk-bq-logger/{__version__}"]
+      if self._visual_builder:
+        user_agents.append(f"google-adk-visual-builder/{__version__}")
+
+      client_info = gapic_client_info.ClientInfo(
+          user_agent=" ".join(user_agents)
+      )
+
+      write_client = BigQueryWriteAsyncClient(
+          credentials=self._credentials,
+          client_info=client_info,
+          client_options=options,
+      )
+
+      if not self._write_stream_name:
+        self._write_stream_name = f"projects/{self.project_id}/datasets/{self.dataset_id}/tables/{self.table_id}/_default"
+
+      try:
+        batch_processor = BatchProcessor(
+            write_client=write_client,
+            arrow_schema=self.arrow_schema,
+            write_stream=self._write_stream_name,
+            batch_size=self.config.batch_size,
+            flush_interval=self.config.batch_flush_interval,
+            retry_config=self.config.retry_config,
+            queue_max_size=self.config.queue_max_size,
+            shutdown_timeout=self.config.shutdown_timeout,
+        )
+      except BaseException:
+        # The write client already exists but no _LoopState can own it yet.
+        await self._close_write_transport(write_client)
+        raise
+      state = _LoopState(write_client, batch_processor)
+      try:
+        await batch_processor.start()
+      except BaseException:
+        # start() may create then fail/cancel a worker. Keep the fresh client
+        # under structured ownership as well; the bounded helper retrieves
+        # either sync or async transport-close outcomes.
+        await self._close_detached_loop_transport(state)
+        raise
+
+      with self._loop_states_guard:
+        invalidated = self._is_shutting_down or self._generation != generation
+        if not invalidated:
+          self._loop_state_by_loop[loop] = state
+      if invalidated:
+        # shutdown() ran during construction; its snapshot cannot include
+        # this writer, so publishing it would leave a live processor and
+        # open transport behind after close() returns (#6360 review round 6
+        # P1-2). Tear the fresh instances down instead of publishing.
         try:
-          await transport.close()
+          await batch_processor.shutdown(timeout=self.config.shutdown_timeout)
         except Exception:
-          pass
-      raise RuntimeError("BigQuery plugin is shutting down.")
+          logger.warning(
+              "Could not shut down writer created during shutdown.",
+              exc_info=True,
+          )
+        await self._close_detached_loop_transport(state)
+        raise RuntimeError("BigQuery plugin is shutting down.")
 
-    atexit.register(self._atexit_cleanup, weakref.proxy(batch_processor))
-
-    # Publish the replacement before awaiting old-resource cleanup. A
-    # concurrent callback on this loop therefore sees the fresh live state,
-    # while the detached terminal state remains single-owner here.
-    if detached_close_task is not None:
-      await detached_close_task
-    return state
+      atexit.register(self._atexit_cleanup, weakref.proxy(batch_processor))
+      return state
+    finally:
+      if detached_state is not None:
+        await self._close_detached_loop_transport(detached_state)
 
   async def flush(self) -> None:
     """Flushes any pending events to BigQuery.
@@ -4938,6 +5275,17 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             )
         )
       raise
+    except _LoopStateAdmissionAbortedError as e:
+      # A retained processor with _shutdown=True and a live worker is a
+      # lifecycle admission race, not a service/setup failure. Keep shared
+      # clients intact, avoid poisoning exponential backoff, and wake every
+      # coalesced caller with the same structured aborted outcome. The row
+      # owner (and only the row owner) converts that outcome to shutdown_race.
+      with self._setup_guard:
+        self._setup_future = None
+      if not setup_future.done():
+        setup_future.set_exception(e)
+      return "aborted"
     except Exception as e:
       aborted = False
       with self._setup_guard:
@@ -5481,6 +5829,39 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
     if event_data is None:
       event_data = EventData()
+
+    # Error diagnostics bypass the ordinary attributes tree: error_message is
+    # a dedicated column and agent/run tracebacks live in raw content. Apply
+    # one bounded, fail-closed boundary here so every current and future error
+    # producer receives the same privacy contract before formatter/parser row
+    # assembly. Ordinary safe messages remain byte-for-byte unchanged.
+    if event_data.error_message is not None:
+      try:
+        safe_error, error_content_lost = _sanitize_sensitive_text(
+            event_data.error_message, self.config.max_content_length
+        )
+      except Exception:
+        safe_error, error_content_lost = (
+            "[REDACTED_SENSITIVE_TEXT]",
+            True,
+        )
+      event_data.error_message = safe_error
+      is_truncated = is_truncated or error_content_lost
+    if event_type in ("AGENT_ERROR", "INVOCATION_ERROR") and isinstance(
+        raw_content, collections.abc.Mapping
+    ):
+      try:
+        error_traceback = raw_content.get("error_traceback")
+        if isinstance(error_traceback, str):
+          safe_traceback, traceback_content_lost = _sanitize_sensitive_text(
+              error_traceback, self.config.max_content_length
+          )
+          raw_content = dict(raw_content)
+          raw_content["error_traceback"] = safe_traceback
+          is_truncated = is_truncated or traceback_content_lost
+      except Exception:
+        raw_content = {"error_traceback": "[REDACTED_SENSITIVE_TEXT]"}
+        is_truncated = True
 
     timestamp = datetime.now(timezone.utc)
     if self.config.content_formatter:
@@ -6522,10 +6903,6 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             type(error), error, error.__traceback__
         )
     )
-    max_len = self.config.max_content_length
-    if max_len > 0 and len(error_tb) > max_len:
-      error_tb = error_tb[:max_len] + "... [truncated]"
-
     await self._log_event(
         "AGENT_ERROR",
         callback_context,
@@ -6571,10 +6948,6 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
               type(error), error, error.__traceback__
           )
       )
-      max_len = self.config.max_content_length
-      if max_len > 0 and len(error_tb) > max_len:
-        error_tb = error_tb[:max_len] + "... [truncated]"
-
       await self._log_event(
           "INVOCATION_ERROR",
           callback_ctx,
