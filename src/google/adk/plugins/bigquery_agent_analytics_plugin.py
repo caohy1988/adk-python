@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
 import collections.abc
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
@@ -59,6 +60,7 @@ from typing import ParamSpec
 from typing import TYPE_CHECKING
 from typing import TypeVar
 from urllib.parse import parse_qsl
+from urllib.parse import quote
 from urllib.parse import urlencode
 from urllib.parse import urlsplit
 from urllib.parse import urlunsplit
@@ -424,25 +426,25 @@ _SENSITIVE_KEYS = frozenset({
     "api_key",
     "password",
     "private_key",
+    "proxy_authorization",
+    "google_access_id",
+    "sig",
+    "signature",
     "token",
     "secret",
     "authorization",
+    "x_api_key",
+    "x_amz_credential",
+    "x_amz_signature",
+    "x_goog_credential",
+    "x_goog_security_token",
+    "x_goog_signature",
 })
 
 # Credentials commonly carried in signed URLs and HTTP error text.  These are
 # values rather than structured mapping keys in those two surfaces, so they
 # need an explicit bounded text/URI pass in addition to _SENSITIVE_KEYS.
-_SENSITIVE_TEXT_KEYS = frozenset(
-    set(_SENSITIVE_KEYS)
-    | {
-        "proxy_authorization",
-        "x_api_key",
-        "x_goog_credential",
-        "x_goog_security_token",
-        "x_goog_signature",
-        "signature",
-    }
-)
+_SENSITIVE_TEXT_KEYS = _SENSITIVE_KEYS
 _SENSITIVE_TEXT_KEY_RE = re.compile(
     r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])(?:[\"'])?(?:"
     r"temp:[A-Za-z0-9_.-]+|"
@@ -457,42 +459,121 @@ _SENSITIVE_TEXT_KEY_RE = re.compile(
         )
     )
     + r")(?:[\"'])?\s*[:=]\s*)(?P<value>"
-    r"\[REDACTED\]"
-    r'|"(?:\\.|[^"\\])*"'
+    r'"(?:\\.|[^"\\])*"'
     r"|'(?:\\.|[^'\\])*'"
-    r"|[^\s,;&}\]]+)"
+    r"|[^\s,;&}]+)"
 )
 _AUTH_HEADER_RE = re.compile(
-    r"(?i)(?P<prefix>\b(?:authorization|proxy-authorization|x-api-key|api-key)"
-    r"[ \t]*:[ \t]*)(?:bearer[ \t]+|basic[ \t]+)?[^\s,;]+"
+    r"(?im)(?P<prefix>\b(?:authorization|proxy-authorization|x-api-key|api-key)"
+    r"[ \t]*:[ \t]*)[^\r\n]*"
 )
-_BEARER_TOKEN_RE = re.compile(r"(?i)(?P<prefix>\bbearer[ \t]+)[^\s,;]+")
-_UNICODE_ESCAPE_RE = re.compile(r"(?i)\\u([0-9a-f]{4})")
-_HEX_ESCAPE_RE = re.compile(r"(?i)\\x([0-9a-f]{2})")
+_BEARER_TOKEN_RE = re.compile(
+    r"(?i)(?P<prefix>\bbearer\s+)(?!of(?:\s|$))[^\s,;]+"
+)
+_BASIC_TOKEN_RE = re.compile(
+    r"(?i)(?P<prefix>\bbasic\s+)(?P<value>[A-Za-z0-9+/]+={0,2})"
+    r"(?![A-Za-z0-9+/=])"
+)
+_MAX_BASIC_AUTH_TOKEN_CHARS = 16 * 1024
+_ASCII_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_sensitive_text_key(text: str) -> bool:
+  """Returns whether ``text`` is exactly a credential-bearing key."""
+  normalized = text.lower().replace("-", "_")
+  return normalized in _SENSITIVE_TEXT_KEYS or normalized.startswith("temp:")
+
+
+def _canonicalize_common_ascii_escapes(text: str) -> str:
+  """Decodes nested ASCII ``\\u``, ``\\x``, and percent escapes in O(n).
+
+  This is a detection-only representation: callers retain the original text
+  unless the canonical form exposes a credential construct. The output stack
+  also handles encodings that reveal another escape introducer, such as
+  ``%255F`` and ``\\u005cu005f``, without rescanning the whole input.
+  """
+  output: list[str] = []
+  for char in text:
+    output.append(char)
+    while True:
+      escape_start = -1
+      digits = ""
+      if (
+          len(output) >= 6
+          and output[-6] == "\\"
+          and output[-5] in ("u", "U")
+          and all(char in _ASCII_HEX_DIGITS for char in output[-4:])
+      ):
+        escape_start = len(output) - 6
+        digits = "".join(output[-4:])
+      elif (
+          len(output) >= 4
+          and output[-4] == "\\"
+          and output[-3] in ("x", "X")
+          and all(char in _ASCII_HEX_DIGITS for char in output[-2:])
+      ):
+        escape_start = len(output) - 4
+        digits = "".join(output[-2:])
+      elif (
+          len(output) >= 3
+          and output[-3] == "%"
+          and all(char in _ASCII_HEX_DIGITS for char in output[-2:])
+      ):
+        escape_start = len(output) - 3
+        digits = "".join(output[-2:])
+      if escape_start < 0:
+        break
+      decoded = int(digits, 16)
+      if decoded > 0x7F:
+        break
+      del output[escape_start:]
+      output.append(chr(decoded))
+  return "".join(output)
+
+
+def _redact_sensitive_patterns(text: str) -> tuple[str, bool]:
+  """Redacts plain-text credential constructs without decoding the input."""
+
+  def _redact_key_value(match: re.Match[str]) -> str:
+    value = match.group("value")
+    if value == "[REDACTED]":
+      return match.group(0)
+    quote_char = value[:1] if value[:1] in ('"', "'") else ""
+    return f"{match.group('prefix')}{quote_char}[REDACTED]{quote_char}"
+
+  def _redact_basic_credential(match: re.Match[str]) -> str:
+    encoded = match.group("value")
+    if len(encoded) > _MAX_BASIC_AUTH_TOKEN_CHARS:
+      return f"{match.group('prefix')}[REDACTED]"
+    try:
+      decoded = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+      return match.group(0)
+    if "=" not in encoded and b":" not in decoded:
+      return match.group(0)
+    return f"{match.group('prefix')}[REDACTED]"
+
+  sanitized = _AUTH_HEADER_RE.sub(
+      lambda match: f"{match.group('prefix')}[REDACTED]", text
+  )
+  sanitized = _BEARER_TOKEN_RE.sub(
+      lambda match: f"{match.group('prefix')}[REDACTED]", sanitized
+  )
+  sanitized = _BASIC_TOKEN_RE.sub(_redact_basic_credential, sanitized)
+  sanitized = _SENSITIVE_TEXT_KEY_RE.sub(_redact_key_value, sanitized)
+  return sanitized, sanitized != text
 
 
 def _contains_sensitive_text_marker(text: str) -> bool:
-  """Returns whether text contains a credential/header marker."""
-  lowered = text.lower().replace("-", "_")
-  return (
-      any(key in lowered for key in _SENSITIVE_TEXT_KEYS)
-      or "temp:" in lowered
-      or "bearer " in lowered
-  )
-
-
-def _contains_escaped_sensitive_text_marker(text: str) -> bool:
-  """Detects sensitive markers hidden behind common ASCII escapes."""
-
-  def _decode_escape(match: re.Match[str]) -> str:
-    return chr(int(match.group(1), 16))
-
-  decoded = _UNICODE_ESCAPE_RE.sub(_decode_escape, text)
-  decoded = _HEX_ESCAPE_RE.sub(_decode_escape, decoded)
-  # A decoded backslash can introduce another escape layer. Fail closed
-  # instead of repeatedly scanning a multi-megabyte diagnostic string.
-  introduced_escape = "\\u005c" in text.lower() or "\\x5c" in text.lower()
-  return introduced_escape or _contains_sensitive_text_marker(decoded)
+  """Returns whether raw or encoded text contains a credential construct."""
+  _, changed = _redact_sensitive_patterns(text)
+  if changed:
+    return True
+  canonical = _canonicalize_common_ascii_escapes(text)
+  if canonical == text:
+    return False
+  _, changed = _redact_sensitive_patterns(canonical)
+  return changed
 
 
 def _sanitize_sensitive_text(text: str, max_len: int) -> tuple[str, bool]:
@@ -510,11 +591,9 @@ def _sanitize_sensitive_text(text: str, max_len: int) -> tuple[str, bool]:
   if len(text) > _MAX_JSON_INSPECT_CHARS:
     if max_len == -1 or max_len > _MAX_JSON_INSPECT_CHARS:
       return "[REDACTED_SENSITIVE_TEXT]", True
-    # Only this prefix can reach the row. A cut escape could hide a key across
-    # the boundary, so fail closed rather than emit an unverifiable prefix.
+    # Only this prefix can reach the row, so inspect exactly that bounded
+    # value below. Incomplete trailing escapes cannot reveal omitted bytes.
     emitted = text[:max_len]
-    if "\\" in emitted and _contains_sensitive_text_marker(emitted):
-      return "[REDACTED_SENSITIVE_TEXT]", True
     text = emitted
     length_truncated = True
   else:
@@ -538,30 +617,15 @@ def _sanitize_sensitive_text(text: str, max_len: int) -> tuple[str, bool]:
 
   changed = sanitized != text
 
-  def _redact_key_value(match: re.Match[str]) -> str:
-    value = match.group("value")
-    if value == "[REDACTED]":
-      return match.group(0)
-    quote = value[:1] if value[:1] in ('"', "'") else ""
-    return f"{match.group('prefix')}{quote}[REDACTED]{quote}"
+  sanitized, patterns_changed = _redact_sensitive_patterns(sanitized)
+  changed = changed or patterns_changed
 
-  sanitized, n_headers = _AUTH_HEADER_RE.subn(
-      lambda match: f"{match.group('prefix')}[REDACTED]", sanitized
-  )
-  sanitized, n_bearer = _BEARER_TOKEN_RE.subn(
-      lambda match: f"{match.group('prefix')}[REDACTED]", sanitized
-  )
-  sanitized, n_values = _SENSITIVE_TEXT_KEY_RE.subn(
-      _redact_key_value, sanitized
-  )
-  changed = changed or bool(n_headers or n_bearer or n_values)
-
-  # An escaped sensitive marker that survived all structural/pattern passes
-  # cannot be verified secret-free (e.g. access\u005ftoken in malformed JSON).
-  if "\\" in sanitized and (
-      _contains_sensitive_text_marker(sanitized)
-      or _contains_escaped_sensitive_text_marker(sanitized)
-  ):
+  # Escaped/percent-encoded credential constructs cannot be safely rewritten
+  # in place without risking a partial source-to-canonical mapping. Fail the
+  # bounded diagnostic closed only when decoding actually exposes one; safe
+  # Windows paths and decoder errors remain byte-identical.
+  canonical = _canonicalize_common_ascii_escapes(sanitized)
+  if canonical != sanitized and _contains_sensitive_text_marker(canonical):
     return "[REDACTED_SENSITIVE_TEXT]", True
 
   if max_len != -1 and len(sanitized) > max_len:
@@ -721,7 +785,7 @@ def _normalize_json_native(
         if isinstance(k, str):
           if type(k) is not str:
             k = str.__str__(k)
-          k_lower = k.lower()
+          k_lower = k.lower().replace("-", "_")
           if k_lower in _SENSITIVE_KEYS or k_lower.startswith("temp:"):
             redact_value = True
         else:
@@ -1265,7 +1329,7 @@ def _recursive_smart_truncate(
             # misreport itself to the redaction check below (#6360 review
             # round 7 P1-3).
             k = str.__str__(k)
-          k_lower = k.lower()
+          k_lower = k.lower().replace("-", "_")
           if k_lower in _SENSITIVE_KEYS or k_lower.startswith("temp:"):
             redact_value = True
         elif k is None or isinstance(k, (int, float, bool)):
@@ -2738,13 +2802,13 @@ class HybridContentParser:
       # Raw content is user-facing prose, not an opaque attributes blob.
       # Reusing the attributes sanitizer made every invalid bracket-led
       # message ("[INFO]", Markdown links, "{not json}") disappear. Restore
-      # only bounded, plainly non-encoded prose: any escape or credential
-      # marker stays fail-closed, as do valid/malformed credential documents.
+      # only bounded prose with no raw or encoded credential construct;
+      # malformed credential documents remain fail-closed while ordinary
+      # Windows paths and decoder diagnostics stay byte-identical.
       stripped = _strip_bom_ws(text)
       if (
           len(stripped) <= _MAX_JSON_INSPECT_CHARS
           and stripped.startswith(("[", "{"))
-          and "\\" not in stripped
           and not _contains_sensitive_text_marker(stripped)
       ):
         try:
@@ -2779,18 +2843,37 @@ class HybridContentParser:
       return "[REDACTED_SENSITIVE_URI]", True
 
     changed = False
+    path_segments = parsed.path.split("/")
+    redact_next_path_segment = False
+    for index, segment in enumerate(path_segments):
+      if not segment:
+        continue
+      canonical_segment = _canonicalize_common_ascii_escapes(segment)
+      if redact_next_path_segment:
+        path_segments[index] = quote("[REDACTED]", safe="")
+        changed = True
+        redact_next_path_segment = False
+        continue
+      if _is_sensitive_text_key(canonical_segment):
+        path_segments[index] = quote("[REDACTED]", safe="")
+        changed = True
+        redact_next_path_segment = True
+        continue
+      safe_segment, segment_changed = _sanitize_sensitive_text(segment, -1)
+      if segment_changed:
+        path_segments[index] = quote(safe_segment, safe="")
+        changed = True
+
     safe_query: list[tuple[str, str]] = []
     for key, value in query:
-      normalized_key = key.lower().replace("-", "_")
-      if normalized_key in _SENSITIVE_TEXT_KEYS or normalized_key.startswith(
-          "temp:"
-      ):
+      if _is_sensitive_text_key(key):
         safe_query.append((key, "[REDACTED]"))
         changed = True
         continue
+      safe_key, key_changed = _sanitize_sensitive_text(key, -1)
       safe_value, value_changed = _sanitize_sensitive_text(value, -1)
-      safe_query.append((key, safe_value))
-      changed = changed or value_changed
+      safe_query.append((safe_key, safe_value))
+      changed = changed or key_changed or value_changed
 
     safe_fragment, fragment_changed = _sanitize_sensitive_text(
         parsed.fragment, -1
@@ -2799,7 +2882,7 @@ class HybridContentParser:
     safe_uri = urlunsplit((
         parsed.scheme,
         parsed.netloc,
-        parsed.path,
+        "/".join(path_segments),
         urlencode(safe_query),
         safe_fragment,
     ))
@@ -2824,13 +2907,45 @@ class HybridContentParser:
       if isinstance(obj, dict):
         out: dict[str, Any] = {}
         replaced = False
+        collision_count = 0
+
+        def _collision_safe_key(key: str) -> str:
+          nonlocal collision_count, replaced
+          if key not in out:
+            return key
+          collision_count += 1
+          candidate = f"[KEY_COLLISION_{collision_count}]{key}"
+          while candidate in out:
+            collision_count += 1
+            candidate = f"[KEY_COLLISION_{collision_count}]{key}"
+          replaced = True
+          return candidate
+
         for key, item in obj.items():
           if budget[0] <= 0:
-            out["[SANITIZE_BUDGET_EXCEEDED]"] = "[SANITIZE_BUDGET_EXCEEDED]"
+            budget_key = _collision_safe_key("[SANITIZE_BUDGET_EXCEEDED]")
+            out[budget_key] = "[SANITIZE_BUDGET_EXCEEDED]"
             return out, True
-          safe_item, item_replaced = _sanitize_strings(item, depth + 1)
-          out[key] = safe_item
-          replaced = replaced or item_replaced
+          redact_item = False
+          if not isinstance(key, str):
+            safe_key = "[UNSUPPORTED_KEY]"
+            key_replaced = True
+          else:
+            if type(key) is not str:
+              key = str.__str__(key)
+            canonical_key = _canonicalize_common_ascii_escapes(key)
+            redact_item = _is_sensitive_text_key(canonical_key)
+            safe_key, key_replaced = _sanitize_sensitive_text(
+                key, self.max_length
+            )
+          safe_key = _collision_safe_key(safe_key)
+          if redact_item:
+            safe_item = "[REDACTED]"
+            item_replaced = item != "[REDACTED]"
+          else:
+            safe_item, item_replaced = _sanitize_strings(item, depth + 1)
+          out[safe_key] = safe_item
+          replaced = replaced or key_replaced or item_replaced
         return out, replaced
       if isinstance(obj, list):
         out_list = []
@@ -4173,13 +4288,15 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         # open transport behind after close() returns (#6360 review round 6
         # P1-2). Tear the fresh instances down instead of publishing.
         try:
-          await batch_processor.shutdown(timeout=self.config.shutdown_timeout)
-        except Exception:
-          logger.warning(
-              "Could not shut down writer created during shutdown.",
-              exc_info=True,
-          )
-        await self._close_detached_loop_transport(state)
+          try:
+            await batch_processor.shutdown(timeout=self.config.shutdown_timeout)
+          except Exception:
+            logger.warning(
+                "Could not shut down writer created during shutdown.",
+                exc_info=True,
+            )
+        finally:
+          await self._close_detached_loop_transport(state)
         raise RuntimeError("BigQuery plugin is shutting down.")
 
       atexit.register(self._atexit_cleanup, weakref.proxy(batch_processor))

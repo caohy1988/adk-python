@@ -13604,6 +13604,81 @@ class TestLatestReviewLifecycleRegressions:
     assert row["error_message"] == message
     assert row["is_truncated"] is False
 
+  def test_sensitive_text_redacts_complete_values_and_encoded_constructs(self):
+    sanitize = bigquery_agent_analytics_plugin._sanitize_sensitive_text
+    redacted_cases = {
+        "access_token=[REDACTED]SECRET": "SECRET",
+        "access_token=[REDACTED]]SECRET": "SECRET",
+        "access_token=[REDACTED]/SECRET": "SECRET",
+        'Authorization: Digest username="u", response="DIGEST-SECRET"': (
+            "DIGEST-SECRET"
+        ),
+        (
+            "Authorization: AWS4-HMAC-SHA256 "
+            "Credential=AWS-SECRET, SignedHeaders=host"
+        ): "AWS-SECRET",
+        "Proxy-Authorization: Negotiate NEGOTIATE-SECRET": "NEGOTIATE-SECRET",
+        "Bearer\nBEARER-SECRET": "BEARER-SECRET",
+        "Basic\tdXNlcjpwYXNz": "dXNlcjpwYXNz",
+        "Basic dXNlcg==": "dXNlcg==",
+        "sig=SIG-SECRET": "SIG-SECRET",
+        "x-amz-signature=AMZ-SIGNATURE-SECRET": "AMZ-SIGNATURE-SECRET",
+        "x_amz_credential=AMZ-CREDENTIAL-SECRET": "AMZ-CREDENTIAL-SECRET",
+        "google-access-id=GOOGLE-ID-SECRET": "GOOGLE-ID-SECRET",
+        r"access\u005ftoken=UNICODE-SECRET": "UNICODE-SECRET",
+        r"access\x5ftoken=HEX-SECRET": "HEX-SECRET",
+        "access_token%3DPERCENT-SECRET": "PERCENT-SECRET",
+        "access%255Ftoken%253DDOUBLE-SECRET": "DOUBLE-SECRET",
+    }
+    for value, secret in redacted_cases.items():
+      sanitized, changed = sanitize(value, -1)
+      assert changed is True, value
+      assert secret not in sanitized, value
+
+    # A sentinel is idempotent only when it is the complete value.
+    assert sanitize("access_token=[REDACTED]", -1) == (
+        "access_token=[REDACTED]",
+        False,
+    )
+
+    structured, _ = bigquery_agent_analytics_plugin._recursive_smart_truncate(
+        {
+            "x-amz-signature": "STRUCTURED-AMZ-SECRET",
+            "google_access_id": "STRUCTURED-GOOGLE-SECRET",
+            "safe": True,
+        },
+        -1,
+    )
+    assert structured == {
+        "x-amz-signature": "[REDACTED]",
+        "google_access_id": "[REDACTED]",
+        "safe": True,
+    }
+
+  def test_sensitive_text_preserves_safe_slashes_and_encoded_prose_exactly(
+      self,
+  ):
+    sanitize = bigquery_agent_analytics_plugin._sanitize_sensitive_text
+    safe = (
+        r"C:\Users\secret\project\file.json",
+        r"Invalid \escape at position 4",
+        r"can't decode \x5c in position 2",
+        "the bearer of bad news",
+        "a basic principle",
+        "a basic test",
+        "design=balanced",
+        "signal=strong",
+        "progress%3D100%25 complete",
+        "literal%2525value",
+    )
+    for value in safe:
+      assert sanitize(value, -1) == (value, False)
+
+    # A moderately wide safe input exercises the bounded stack scanner while
+    # pinning the useful property instead of a timing threshold.
+    wide = (r"C:\safe\secret\file%25.txt; " * 20_000).rstrip()
+    assert sanitize(wide, len(wide)) == (wide, False)
+
   @pytest.mark.asyncio
   async def test_live_shutting_down_writer_aborts_owner_and_waiter_once(
       self, mock_auth_default, mock_bq_client, callback_context
@@ -13718,6 +13793,62 @@ class TestLatestReviewLifecycleRegressions:
     assert loop not in plugin._loop_state_by_loop
 
   @pytest.mark.asyncio
+  async def test_invalidated_writer_transport_closes_when_shutdown_is_cancelled(
+      self, mock_auth_default, mock_bq_client
+  ):
+    _ = mock_auth_default, mock_bq_client
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    )
+    plugin._credentials = mock.MagicMock(quota_project_id=None)
+
+    start_entered = asyncio.Event()
+    start_release = asyncio.Event()
+    shutdown_entered = asyncio.Event()
+    shutdown_never = asyncio.Event()
+
+    async def gated_start(self):
+      del self
+      start_entered.set()
+      await start_release.wait()
+
+    async def blocked_shutdown(self, timeout=None):
+      del self, timeout
+      shutdown_entered.set()
+      await shutdown_never.wait()
+
+    transport = mock.MagicMock(close=mock.AsyncMock())
+    write_client = mock.MagicMock(transport=transport)
+    with (
+        mock.patch.object(
+            bigquery_agent_analytics_plugin.BatchProcessor,
+            "start",
+            gated_start,
+        ),
+        mock.patch.object(
+            bigquery_agent_analytics_plugin.BatchProcessor,
+            "shutdown",
+            blocked_shutdown,
+        ),
+        mock.patch.object(
+            bigquery_agent_analytics_plugin,
+            "BigQueryWriteAsyncClient",
+            return_value=write_client,
+        ),
+    ):
+      builder = asyncio.create_task(plugin._get_loop_state())
+      await start_entered.wait()
+      await plugin.shutdown()
+      start_release.set()
+      await shutdown_entered.wait()
+      builder.cancel()
+      with pytest.raises(asyncio.CancelledError):
+        await builder
+
+    transport.close.assert_awaited_once()
+    assert plugin._loop_state_by_loop == {}
+
+  @pytest.mark.asyncio
   async def test_raw_bracket_prose_preserved_inline_and_gcs(self):
     inline = bigquery_agent_analytics_plugin.HybridContentParser(
         offloader=None,
@@ -13745,6 +13876,51 @@ class TestLatestReviewLifecycleRegressions:
     large_prose = "[INFO] " + "safe prose " * 4000
     await offloaded.parse(types.Content(parts=[types.Part(text=large_prose)]))
     assert offloader.upload_content.call_args.args[0] == large_prose
+
+  @pytest.mark.asyncio
+  async def test_bracket_prose_auth_and_signature_classification(self):
+    parser = bigquery_agent_analytics_plugin.HybridContentParser(
+        offloader=None,
+        trace_id="t",
+        span_id="s",
+        max_length=-1,
+    )
+    safe = (
+        r"[INFO] C:\Users\secret\project",
+        "[INFO] the bearer of bad news",
+        "[INFO] a basic principle",
+        "[INFO] a basic test",
+        "[INFO] design=balanced and progress%3D100%25",
+    )
+    for value in safe:
+      payload, parts, truncated = await parser.parse(
+          types.Content(parts=[types.Part(text=value)])
+      )
+      assert payload == {"text_summary": value}
+      assert parts[0]["text"] == value
+      assert truncated is False
+
+    unsafe = (
+        ("[WARN] Bearer\tBRACKET-BEARER-SECRET", "BRACKET-BEARER-SECRET"),
+        ("[WARN] Basic\ndXNlcjpwYXNz", "dXNlcjpwYXNz"),
+        ("[WARN] sig=BRACKET-SIG-SECRET", "BRACKET-SIG-SECRET"),
+        (
+            "[WARN] x-amz-signature=BRACKET-AMZ-SECRET",
+            "BRACKET-AMZ-SECRET",
+        ),
+        (
+            "[WARN] access%255Ftoken%253DBRACKET-ENCODED-SECRET",
+            "BRACKET-ENCODED-SECRET",
+        ),
+    )
+    for value, secret in unsafe:
+      payload, parts, truncated = await parser.parse(
+          types.Content(parts=[types.Part(text=value)])
+      )
+      stored = json.dumps({"payload": payload, "parts": parts})
+      assert secret not in stored
+      assert "[UNPARSEABLE_JSON_BLOB]" in stored
+      assert truncated is True
 
   @pytest.mark.asyncio
   async def test_malformed_bracket_credentials_still_fail_closed(self):
@@ -13804,6 +13980,47 @@ class TestLatestReviewLifecycleRegressions:
     assert parts[0]["uri"] == "[REDACTED_SENSITIVE_URI]"
     assert truncated is True
 
+  @pytest.mark.asyncio
+  async def test_external_uri_redacts_sensitive_path_segments_and_variants(
+      self,
+  ):
+    parser = bigquery_agent_analytics_plugin.HybridContentParser(
+        offloader=None,
+        trace_id="t",
+        span_id="s",
+        max_length=-1,
+    )
+    uri = (
+        "https://example.test/public/access-token/PATH-SECRET/report"
+        "?x-amz-signature=QUERY-SIGNATURE-SECRET"
+        "&access%255Ftoken%253DDOUBLE-QUERY-SECRET"
+    )
+    _, parts, truncated = await parser.parse(
+        types.Content(
+            parts=[types.Part.from_uri(file_uri=uri, mime_type="text/plain")]
+        )
+    )
+    stored_uri = parts[0]["uri"]
+    for secret in (
+        "PATH-SECRET",
+        "QUERY-SIGNATURE-SECRET",
+        "DOUBLE-QUERY-SECRET",
+    ):
+      assert secret not in stored_uri
+    assert "/public/%5BREDACTED%5D/%5BREDACTED%5D/report" in stored_uri
+    assert truncated is True
+
+    safe_uri = "https://example.test/design/signal/public/progress%25/report"
+    _, parts, truncated = await parser.parse(
+        types.Content(
+            parts=[
+                types.Part.from_uri(file_uri=safe_uri, mime_type="text/plain")
+            ]
+        )
+    )
+    assert parts[0]["uri"] == safe_uri
+    assert truncated is False
+
     missing = types.Part(
         file_data=types.FileData(file_uri=None, mime_type="text/plain")
     )
@@ -13852,3 +14069,40 @@ class TestLatestReviewLifecycleRegressions:
     assert "function_response" in json.loads(parts[0]["part_attributes"])
     assert "executable_code" in json.loads(parts[1]["part_attributes"])
     assert "code_execution_result" in json.loads(parts[2]["part_attributes"])
+
+  def test_structured_part_dictionary_keys_are_sanitized_without_collisions(
+      self,
+  ):
+    parser = bigquery_agent_analytics_plugin.HybridContentParser(
+        offloader=None,
+        trace_id="t",
+        span_id="s",
+        max_length=1000,
+    )
+    value = mock.MagicMock()
+    value.model_dump.return_value = {
+        "access_token=[REDACTED]": "genuine-marker",
+        "access_token=KEY-ONE-SECRET": "first",
+        "access-token=KEY-TWO-SECRET": "second",
+        "[KEY_COLLISION_1]access_token=[REDACTED]": "genuine-collision",
+        "sig": "STRUCTURED-SIG-SECRET",
+        "x-amz-credential": "STRUCTURED-AMZ-SECRET",
+    }
+
+    serialized, content_lost = parser._serialize_part_model(value)
+    dumped = json.dumps(serialized)
+    assert "KEY-ONE-SECRET" not in dumped
+    assert "KEY-TWO-SECRET" not in dumped
+    assert "STRUCTURED-SIG-SECRET" not in dumped
+    assert "STRUCTURED-AMZ-SECRET" not in dumped
+    assert sorted(serialized.values()) == [
+        "[REDACTED]",
+        "[REDACTED]",
+        "first",
+        "genuine-collision",
+        "genuine-marker",
+        "second",
+    ]
+    assert len(serialized) == 6
+    assert any(key.startswith("[KEY_COLLISION_") for key in serialized)
+    assert content_lost is True
