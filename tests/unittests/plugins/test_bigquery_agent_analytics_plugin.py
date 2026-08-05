@@ -161,6 +161,7 @@ def mock_write_client():
 def dummy_arrow_schema():
   return pa.schema([
       pa.field("timestamp", pa.timestamp("us", tz="UTC"), nullable=False),
+      pa.field("event_id", pa.string(), nullable=True),
       pa.field("root_agent_name", pa.string(), nullable=True),
       pa.field("event_type", pa.string(), nullable=True),
       pa.field("agent", pa.string(), nullable=True),
@@ -5155,6 +5156,98 @@ class TestMultiSubagentToolLogging:
       assert row["session_id"] == "session-multi"
 
 
+class TestEventId:
+  """Rows carry a stable identifier for query-time retry deduplication."""
+
+  def test_schema_and_views_expose_event_id(self):
+    """The physical schema and every typed view expose the row identifier."""
+    schema_fields = {
+        field.name: field
+        for field in bigquery_agent_analytics_plugin._get_events_schema()
+    }
+
+    assert schema_fields["event_id"].field_type == "STRING"
+    assert schema_fields["event_id"].mode == "NULLABLE"
+    assert "event_id" in bigquery_agent_analytics_plugin._VIEW_COMMON_COLUMNS
+
+  @pytest.mark.asyncio
+  async def test_each_emitted_row_has_a_distinct_hex_event_id(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """Separate plugin rows receive distinct UUID-derived identifiers."""
+    user_message = types.Content(parts=[types.Part(text="hello")])
+
+    await bq_plugin_inst.on_user_message_callback(
+        invocation_context=invocation_context,
+        user_message=user_message,
+    )
+    await bq_plugin_inst.on_user_message_callback(
+        invocation_context=invocation_context,
+        user_message=user_message,
+    )
+    await bq_plugin_inst.flush()
+
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    event_ids = [row["event_id"] for row in rows]
+    assert len(event_ids) == 2
+    assert len(set(event_ids)) == 2
+    for event_id in event_ids:
+      assert len(event_id) == 32
+      assert event_id == event_id.lower()
+      assert int(event_id, 16) >= 0
+
+  @pytest.mark.asyncio
+  async def test_bigquery_retry_reuses_the_same_event_id(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """A transport retry resends the original row identifier unchanged."""
+    state = next(iter(bq_plugin_inst._loop_state_by_loop.values()))
+    state.batch_processor.retry_config = (
+        bigquery_agent_analytics_plugin.RetryConfig(
+            max_retries=1,
+            initial_delay=0,
+            multiplier=1,
+            max_delay=0,
+        )
+    )
+    event_ids = []
+
+    async def append_then_lose_ack(requests, **kwargs):
+      del kwargs
+      request = [request async for request in requests][0]
+      batch = pa.ipc.read_record_batch(
+          pa.py_buffer(request.arrow_rows.rows.serialized_record_batch),
+          dummy_arrow_schema,
+      )
+      event_ids.append(batch.to_pylist()[0]["event_id"])
+      if len(event_ids) == 1:
+        raise bigquery_agent_analytics_plugin.ServiceUnavailable("ack lost")
+      response = mock.MagicMock()
+      response.error.code = 0
+      response.row_errors = []
+      return _async_gen(response)
+
+    mock_write_client.append_rows.side_effect = append_then_lose_ack
+
+    await bq_plugin_inst.on_user_message_callback(
+        invocation_context=invocation_context,
+        user_message=types.Content(parts=[types.Part(text="hello")]),
+    )
+    await bq_plugin_inst.flush()
+
+    assert len(event_ids) == 2
+    assert event_ids[0] is not None
+    assert event_ids[0] == event_ids[1]
+
+
 class TestSchemaAutoUpgrade:
   """Tests for _ensure_schema_exists with auto_schema_upgrade."""
 
@@ -5212,6 +5305,7 @@ class TestSchemaAutoUpgrade:
     updated_table = plugin.client.update_table.call_args[0][0]
     updated_names = {f.name for f in updated_table.schema}
     assert "event_type" in updated_names
+    assert "event_id" in updated_names
     assert "agent" in updated_names
     assert "content" in updated_names
     assert (

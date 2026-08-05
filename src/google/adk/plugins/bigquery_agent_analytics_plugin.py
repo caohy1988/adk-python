@@ -104,7 +104,7 @@ tracer = trace.get_tracer(
 
 # Bumped when the schema changes (1 → 2 → 3 …). Used as a table
 # label for governance and to decide whether auto-upgrade should run.
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
 _SCHEMA_VERSION_LABEL_KEY = "adk_schema_version"
 
 # ADK 2.0 envelope version. Stamped onto every ADK-enriched row as
@@ -3285,6 +3285,16 @@ def _get_events_schema() -> list[bigquery.SchemaField]:
           ),
       ),
       bigquery.SchemaField(
+          "event_id",
+          "STRING",
+          mode="NULLABLE",
+          description=(
+              "A unique identifier assigned before enqueue. Storage Write API"
+              " retries preserve this value so duplicate rows can be"
+              " identified reliably."
+          ),
+      ),
+      bigquery.SchemaField(
           "event_type",
           "STRING",
           mode="NULLABLE",
@@ -3583,6 +3593,7 @@ def _parse_custom_metadata_allowlist(
 # Columns included in every per-event-type view.
 _VIEW_COMMON_COLUMNS = (
     "timestamp",
+    "event_id",
     "event_type",
     "agent",
     "session_id",
@@ -6096,6 +6107,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
     row = {
         "timestamp": timestamp,
+        "event_id": uuid.uuid4().hex,
         "event_type": event_type,
         "agent": self._resolve_agent_label(
             callback_context, event_data.source_event
