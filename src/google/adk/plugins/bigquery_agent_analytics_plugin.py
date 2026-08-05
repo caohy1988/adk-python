@@ -3661,6 +3661,7 @@ _EVENT_VIEW_DEFS: dict[str, list[str]] = {
         "JSON_VALUE(attributes, '$.model_version') AS model_version",
         "JSON_QUERY(attributes, '$.usage_metadata') AS usage_metadata",
         "JSON_QUERY(attributes, '$.cache_metadata') AS cache_metadata",
+        "JSON_VALUE(attributes, '$.finish_reason') AS finish_reason",
     ],
     "LLM_ERROR": [
         "CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64) AS total_ms",
@@ -3830,6 +3831,7 @@ class EventData:
   model_version: Optional[str] = None
   usage_metadata: Any = None
   cache_metadata: Any = None
+  finish_reason: Optional[str] = None
   status: str = "OK"
   error_message: Optional[str] = None
   extra_attributes: dict[str, Any] = field(default_factory=dict)
@@ -5794,6 +5796,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       else:
         attrs["cache_metadata"] = event_data.cache_metadata
 
+    if event_data.finish_reason is not None:
+      attrs["finish_reason"] = event_data.finish_reason
+
     if self.config.log_session_metadata:
       try:
         session = callback_context._invocation_context.session
@@ -6812,6 +6817,12 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             model_version=llm_response.model_version,
             usage_metadata=llm_response.usage_metadata,
             cache_metadata=getattr(llm_response, "cache_metadata", None),
+            finish_reason=(
+                llm_response.finish_reason.name
+                if llm_response.finish_reason is not None
+                else None
+            ),
+            error_message=llm_response.error_message,
             span_id_override=span_id if is_popped else None,
             parent_span_id_override=(parent_span_id if is_popped else None),
         ),

@@ -1853,6 +1853,99 @@ class TestBigQueryAgentAnalyticsPlugin:
     # The original test passed it as kwarg.
 
   @pytest.mark.asyncio
+  @pytest.mark.parametrize(
+      "finish_reason",
+      [
+          types.FinishReason.STOP,
+          types.FinishReason.MAX_TOKENS,
+          types.FinishReason.SAFETY,
+          types.FinishReason.MALFORMED_FUNCTION_CALL,
+      ],
+  )
+  async def test_after_model_callback_projects_finish_reason(
+      self,
+      finish_reason,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """LLM termination reasons are queryable in response attributes."""
+    response = llm_response_lib.LlmResponse(
+        content=types.Content(parts=[types.Part(text="response")]),
+        finish_reason=finish_reason,
+    )
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        callback_context, "llm_request"
+    )
+
+    await bq_plugin_inst.after_model_callback(
+        callback_context=callback_context, llm_response=response
+    )
+    await bq_plugin_inst.flush()
+
+    row = await _get_captured_event_dict_async(
+        mock_write_client, dummy_arrow_schema
+    )
+    assert json.loads(row["attributes"])["finish_reason"] == finish_reason.name
+
+  @pytest.mark.asyncio
+  async def test_streaming_partial_omits_missing_finish_reason(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """Streaming chunks without a termination reason omit the JSON key."""
+    response = llm_response_lib.LlmResponse(
+        content=types.Content(parts=[types.Part(text="chunk")]), partial=True
+    )
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        callback_context, "llm_request"
+    )
+
+    await bq_plugin_inst.after_model_callback(
+        callback_context=callback_context, llm_response=response
+    )
+    await bq_plugin_inst.flush()
+
+    row = await _get_captured_event_dict_async(
+        mock_write_client, dummy_arrow_schema
+    )
+    assert "finish_reason" not in json.loads(row["attributes"])
+
+  @pytest.mark.asyncio
+  async def test_after_model_callback_sanitizes_error_message_without_error_status(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """Response diagnostics use the safe error column without changing status."""
+    response = llm_response_lib.LlmResponse(
+        error_message="Authorization: Bearer MODEL-SECRET",
+        finish_reason=types.FinishReason.SAFETY,
+    )
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        callback_context, "llm_request"
+    )
+
+    await bq_plugin_inst.after_model_callback(
+        callback_context=callback_context, llm_response=response
+    )
+    await bq_plugin_inst.flush()
+
+    row = await _get_captured_event_dict_async(
+        mock_write_client, dummy_arrow_schema
+    )
+    assert row["error_message"] == "Authorization: [REDACTED]"
+    assert row["status"] == "OK"
+    assert row["is_truncated"] is True
+    assert "MODEL-SECRET" not in json.dumps(row, default=str)
+
+  @pytest.mark.asyncio
   async def test_after_model_callback_tool_call(
       self,
       bq_plugin_inst,
@@ -6677,6 +6770,14 @@ class TestAnalyticsViews:
     assert "usage_tool_use_tokens" in all_sql
     assert "$.usage_metadata.thoughts_token_count" in all_sql
     assert "$.usage_metadata.tool_use_prompt_token_count" in all_sql
+
+  def test_llm_response_view_exposes_finish_reason(self):
+    """LLM_RESPONSE views expose the termination reason as a typed column."""
+    columns = bigquery_agent_analytics_plugin._EVENT_VIEW_DEFS["LLM_RESPONSE"]
+
+    assert (
+        "JSON_VALUE(attributes, '$.finish_reason') AS finish_reason" in columns
+    )
 
   def test_config_create_views_default_true(self):
     """Config create_views defaults to True."""
