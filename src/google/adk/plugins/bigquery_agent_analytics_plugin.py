@@ -3795,6 +3795,24 @@ _EVENT_VIEW_DEFS: dict[str, list[str]] = {
         "JSON_VALUE(attributes, '$.adk.pause_kind') AS pause_kind",
         "JSON_VALUE(attributes, '$.adk.function_call_id') AS function_call_id",
     ],
+    "NODE_OUTPUT": [
+        "JSON_VALUE(attributes, '$.adk.node.path') AS node_path",
+        "JSON_VALUE(attributes, '$.adk.node.run_id') AS node_run_id",
+        (
+            "JSON_VALUE(attributes, '$.adk.node.parent_run_id')"
+            " AS node_parent_run_id"
+        ),
+        "content AS output",
+    ],
+    "NODE_ERROR": [
+        "JSON_VALUE(attributes, '$.adk.node.path') AS node_path",
+        "JSON_VALUE(attributes, '$.adk.node.run_id') AS node_run_id",
+        (
+            "JSON_VALUE(attributes, '$.adk.node.parent_run_id')"
+            " AS node_parent_run_id"
+        ),
+        "JSON_VALUE(content, '$.error_code') AS error_code",
+    ],
 }
 
 _VIEW_SQL_TEMPLATE = """\
@@ -6284,6 +6302,31 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
               source_event=event,
               extra_attributes={"state_delta": dict(event.actions.state_delta)},
           ),
+      )
+
+    node_path = getattr(getattr(event, "node_info", None), "path", "")
+    if node_path and event.error_code:
+      await self._log_event(
+          "NODE_ERROR",
+          callback_ctx,
+          raw_content={"error_code": event.error_code},
+          event_data=EventData(
+              source_event=event,
+              status="ERROR",
+              error_message=event.error_message,
+          ),
+      )
+    elif (
+        node_path
+        and event.partial is not True
+        and event.content is None
+        and event.output is not None
+    ):
+      await self._log_event(
+          "NODE_OUTPUT",
+          callback_ctx,
+          raw_content=event.output,
+          event_data=EventData(source_event=event),
       )
 
     # --- AGENT_TRANSFER ---

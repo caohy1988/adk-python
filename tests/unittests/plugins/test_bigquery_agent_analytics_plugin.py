@@ -2090,6 +2090,7 @@ class TestBigQueryAgentAnalyticsPlugin:
       bq_plugin_inst,
       mock_write_client,
       invocation_context,
+      dummy_arrow_schema,
   ):
     """on_event_callback should not log when state_delta is empty."""
     event = event_lib.Event(
@@ -6779,6 +6780,16 @@ class TestAnalyticsViews:
         "JSON_VALUE(attributes, '$.finish_reason') AS finish_reason" in columns
     )
 
+  @pytest.mark.parametrize("event_type", ["NODE_OUTPUT", "NODE_ERROR"])
+  def test_node_views_expose_workflow_identity(self, event_type):
+    """Workflow-node views expose stable node identity columns."""
+    columns = bigquery_agent_analytics_plugin._EVENT_VIEW_DEFS[event_type]
+
+    assert "JSON_VALUE(attributes, '$.adk.node.path') AS node_path" in columns
+    assert (
+        "JSON_VALUE(attributes, '$.adk.node.run_id') AS node_run_id" in columns
+    )
+
   def test_config_create_views_default_true(self):
     """Config create_views defaults to True."""
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig()
@@ -9663,6 +9674,139 @@ class TestC8ActionAttributes:
     assert adk["rewind_before_invocation_id"] == "inv-earlier"
     # Not nested under .actions.
     assert "actions" not in adk
+
+
+class TestWorkflowNodeEvents:
+  """Workflow node outputs and failures are observable through the plugin."""
+
+  @pytest.mark.asyncio
+  @pytest.mark.parametrize("output", [{"id": 7}, ["a", "b"], "done"])
+  async def test_node_output_preserves_payload_and_identity(
+      self,
+      output,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """Function-node payloads produce one identity-bearing NODE_OUTPUT row."""
+    event = event_lib.Event(
+        author="step",
+        output=output,
+        node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+    )
+
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=invocation_context, event=event
+    )
+    await bq_plugin_inst.flush()
+
+    row = await _get_captured_event_dict_async(
+        mock_write_client, dummy_arrow_schema
+    )
+    assert row["event_type"] == "NODE_OUTPUT"
+    stored_output = (
+        json.loads(row["content"])
+        if isinstance(output, (dict, list))
+        else row["content"]
+    )
+    assert stored_output == output
+    node = json.loads(row["attributes"])["adk"]["node"]
+    assert node["path"] == "wf@1/step@2"
+    assert node["run_id"] == "2"
+
+  @pytest.mark.asyncio
+  async def test_output_and_state_delta_emit_separate_rows(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """A node event preserves both its state change and returned output."""
+    event = event_lib.Event(
+        author="step",
+        output={"result": 1},
+        actions=event_actions_lib.EventActions(state_delta={"count": 1}),
+        node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+    )
+
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=invocation_context, event=event
+    )
+    await bq_plugin_inst.flush()
+
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert [row["event_type"] for row in rows] == [
+        "STATE_DELTA",
+        "NODE_OUTPUT",
+    ]
+
+  @pytest.mark.asyncio
+  async def test_node_error_uses_sanitized_error_column(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """Workflow failures produce an error row with their node identity."""
+    event = event_lib.Event(
+        author="step",
+        error_code="ValueError",
+        error_message="invalid input",
+        node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+    )
+
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=invocation_context, event=event
+    )
+    await bq_plugin_inst.flush()
+
+    row = await _get_captured_event_dict_async(
+        mock_write_client, dummy_arrow_schema
+    )
+    assert row["event_type"] == "NODE_ERROR"
+    assert row["status"] == "ERROR"
+    assert row["error_message"] == "invalid input"
+    assert json.loads(row["content"])["error_code"] == "ValueError"
+
+  @pytest.mark.asyncio
+  @pytest.mark.parametrize(
+      "event",
+      [
+          event_lib.Event(
+              author="step",
+              output=None,
+              node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+          ),
+          event_lib.Event(
+              author="agent",
+              content=types.Content(parts=[types.Part(text="answer")]),
+              output="answer",
+              node_info=event_lib.NodeInfo(
+                  path="wf@1/agent@2", message_as_output=True
+              ),
+          ),
+      ],
+      ids=("none", "message-as-output"),
+  )
+  async def test_non_output_events_do_not_duplicate_node_rows(
+      self,
+      event,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """Empty and message-delegated events do not add NODE_OUTPUT rows."""
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=invocation_context, event=event
+    )
+    await bq_plugin_inst.flush()
+
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert all(row["event_type"] != "NODE_OUTPUT" for row in rows)
 
 
 class TestViewDefsRegistration:
