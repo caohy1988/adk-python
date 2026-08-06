@@ -217,6 +217,12 @@ _GRPC_OUT_OF_RANGE = 11
 _GRPC_INTERNAL = 13
 _GRPC_UNAVAILABLE = 14
 
+_LLM_RESPONSE_ERROR_CODES = frozenset(
+    reason.value
+    for reason_type in (types.FinishReason, types.BlockedReason)
+    for reason in reason_type
+)
+
 
 # --- Helper Formatters ---
 def _format_content(
@@ -1711,7 +1717,14 @@ class BigQueryLoggerConfig:
       batch_flush_interval: Max time to wait before flushing a batch.
       shutdown_timeout: Max time to wait for shutdown.
       queue_max_size: Max size of the in-memory queue.
-      exactly_once_delivery: Opt into committed streams with explicit offsets.
+      exactly_once_delivery: Use one committed stream per event loop and
+        explicit offsets to prevent ambiguous retries from producing duplicate
+        rows. Stream rotation can consume additional ``CreateWriteStream``
+        quota. This mode is not lossless: batches are dropped after retry
+        exhaustion, offset conflicts, or replacement-stream failures, and
+        events arriving during the 30-second rotation backoff are also dropped.
+        The unconditional ``event_id`` column remains the deduplication key for
+        default-mode writes.
       content_formatter: Optional custom formatter for content.
       gcs_bucket_name: GCS bucket for offloading large content.
       connection_id: BigQuery connection ID for ObjectRef columns.
@@ -1771,6 +1784,8 @@ class BigQueryLoggerConfig:
   batch_flush_interval: float = 1.0
   shutdown_timeout: float = 10.0
   queue_max_size: int = 10000
+  # Opt-in duplicate prevention for retries within a live processor. See the
+  # class docstring for stream-quota and data-loss boundaries.
   exactly_once_delivery: bool = False
   content_formatter: Optional[Callable[[Any, str], Any]] = None
   # If provided, large content (images, audio, video, large text) will be offloaded to this GCS bucket.
@@ -2200,7 +2215,9 @@ class BatchProcessor:
         retry_config: Retry configuration.
         queue_max_size: Max size of the in-memory queue.
         shutdown_timeout: Max time to wait for shutdown.
-        exactly_once_delivery: Whether to use committed-stream offsets.
+        exactly_once_delivery: Whether to use committed-stream offsets to
+          prevent retry duplicates. Replacement streams consume stream-creation
+          quota, and unrecoverable/ambiguous batches may still be dropped.
         create_stream: Async factory for replacement committed streams.
     """
     self.write_client = write_client
@@ -2490,6 +2507,25 @@ class BatchProcessor:
       return
     self._next_offset = offset + row_count
 
+  def _handle_already_exists(
+      self,
+      offset: Optional[int],
+      row_count: int,
+      *,
+      had_ambiguous_send: bool,
+  ) -> None:
+    """Confirms this batch's retry or rejects an occupied foreign offset."""
+    if had_ambiguous_send:
+      self._confirm_committed_delivery(offset, row_count)
+      return
+    logger.warning(
+        "BigQuery committed stream reported an occupied offset %s before"
+        " this batch had an ambiguous append; rotating the stream.",
+        offset,
+    )
+    self._desync_stream()
+    self._dropped["offset_conflict"] += row_count
+
   async def _ensure_writable_stream(self, row_count: int) -> bool:
     """Rotates a desynchronized committed stream before another append."""
     if not self.exactly_once_delivery or not self._offset_desynced:
@@ -2500,9 +2536,10 @@ class BatchProcessor:
       return False
 
     old_stream = self.write_stream
-    await self._finalize_stream()
-    if not self._stream_finalized:
-      self._pending_finalize_streams.add(old_stream)
+    # Finalization is optional for committed streams and may block on the
+    # network. Preserve the old name for bounded shutdown cleanup, but do not
+    # stall the single batch writer before creating its replacement.
+    self._pending_finalize_streams.add(old_stream)
     try:
       new_stream = await self._create_stream()
     except asyncio.CancelledError:
@@ -2538,6 +2575,7 @@ class BatchProcessor:
     attempt = 0
     delay = self.retry_config.initial_delay
     offset_for_batch = self._next_offset if self.exactly_once_delivery else None
+    had_ambiguous_send = False
 
     try:
       arrow_batch = self._prepare_arrow_batch(rows)
@@ -2609,7 +2647,11 @@ class BatchProcessor:
               definitive_rejection = True
               if self.exactly_once_delivery:
                 if error_code == _GRPC_ALREADY_EXISTS:
-                  self._confirm_committed_delivery(offset_for_batch, len(rows))
+                  self._handle_already_exists(
+                      offset_for_batch,
+                      len(rows),
+                      had_ambiguous_send=had_ambiguous_send,
+                  )
                   return
                 if error_code in (_GRPC_NOT_FOUND, _GRPC_OUT_OF_RANGE):
                   self._desync_stream()
@@ -2653,7 +2695,11 @@ class BatchProcessor:
 
       except api_exceptions.AlreadyExists as e:
         if self.exactly_once_delivery:
-          self._confirm_committed_delivery(offset_for_batch, len(rows))
+          self._handle_already_exists(
+              offset_for_batch,
+              len(rows),
+              had_ambiguous_send=had_ambiguous_send,
+          )
           return
         self._dropped["unexpected_error"] += len(rows)
         logger.error("Unexpected BigQuery Write API error: %s", e)
@@ -2677,14 +2723,12 @@ class BatchProcessor:
           InternalServerError,
           asyncio.TimeoutError,
       ) as e:
+        if request_sent and not definitive_rejection:
+          had_ambiguous_send = True
         attempt += 1
         if attempt > self.retry_config.max_retries:
           self._dropped["retry_exhausted"] += len(rows)
-          if (
-              self.exactly_once_delivery
-              and request_sent
-              and not definitive_rejection
-          ):
+          if self.exactly_once_delivery and had_ambiguous_send:
             self._desync_stream()
           logger.error(
               "BigQuery Batch Dropped after %s attempts. Last error: %s."
@@ -2709,11 +2753,9 @@ class BatchProcessor:
         delay *= self.retry_config.multiplier
       except Exception as e:
         self._dropped["unexpected_error"] += len(rows)
-        if (
-            self.exactly_once_delivery
-            and request_sent
-            and not definitive_rejection
-        ):
+        if request_sent and not definitive_rejection:
+          had_ambiguous_send = True
+        if self.exactly_once_delivery and had_ambiguous_send:
           self._desync_stream()
         logger.error(
             "Unexpected BigQuery Write API error (Dropping batch): %s."
@@ -3712,7 +3754,10 @@ def _get_events_schema() -> list[bigquery.SchemaField]:
           "error_message",
           "STRING",
           mode="NULLABLE",
-          description="Detailed error message if the status is 'ERROR'.",
+          description=(
+              "Diagnostic message for errors and model termination details;"
+              " may be populated on LLM_RESPONSE rows whose status is 'OK'."
+          ),
       ),
       bigquery.SchemaField(
           "is_truncated",
@@ -6537,30 +6582,34 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           ),
       )
 
-    node_path = getattr(getattr(event, "node_info", None), "path", "")
-    if node_path and event.error_code:
-      await self._log_event(
-          "NODE_ERROR",
-          callback_ctx,
-          raw_content={"error_code": event.error_code},
-          event_data=EventData(
-              source_event=event,
-              status="ERROR",
-              error_message=event.error_message,
-          ),
-      )
-    elif (
-        node_path
-        and event.partial is not True
-        and event.content is None
-        and event.output is not None
-    ):
-      await self._log_event(
-          "NODE_OUTPUT",
-          callback_ctx,
-          raw_content=event.output,
-          event_data=EventData(source_event=event),
-      )
+    node_info = getattr(event, "node_info", None)
+    node_path = getattr(node_info, "path", "")
+    if node_path and event.partial is not True:
+      if event.error_code and event.error_code not in _LLM_RESPONSE_ERROR_CODES:
+        await self._log_event(
+            "NODE_ERROR",
+            callback_ctx,
+            raw_content={"error_code": event.error_code},
+            event_data=EventData(
+                source_event=event,
+                status="ERROR",
+                error_message=event.error_message,
+            ),
+        )
+      if (
+          event.output is not None
+          and getattr(node_info, "message_as_output", None) is not True
+      ):
+        node_output, output_truncated = _recursive_smart_truncate(
+            event.output, self.config.max_content_length
+        )
+        await self._log_event(
+            "NODE_OUTPUT",
+            callback_ctx,
+            raw_content=node_output,
+            is_truncated=output_truncated,
+            event_data=EventData(source_event=event),
+        )
 
     # --- AGENT_TRANSFER ---
     # actions.transfer_to_agent stores the *target* agent only
@@ -7013,6 +7062,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         callback_context: The callback context.
         llm_response: The LLM response object.
     """
+    is_partial = getattr(llm_response, "partial", None) is True
     content_dict = {}
     is_truncated = False
     if llm_response.content:
@@ -7048,7 +7098,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     duration = 0
     tfft = None
 
-    if hasattr(llm_response, "partial") and llm_response.partial:
+    if is_partial:
       # Streaming chunk - do NOT pop span yet
       if span_id:
         TraceManager.record_first_token(span_id)
@@ -7094,8 +7144,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             usage_metadata=llm_response.usage_metadata,
             cache_metadata=getattr(llm_response, "cache_metadata", None),
             finish_reason=(
-                finish_reason.name
-                if (
+                getattr(finish_reason, "name", str(finish_reason))
+                if not is_partial
+                and (
                     finish_reason := getattr(
                         llm_response, "finish_reason", None
                     )
@@ -7103,7 +7154,11 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
                 is not None
                 else None
             ),
-            error_message=getattr(llm_response, "error_message", None),
+            error_message=(
+                None
+                if is_partial
+                else getattr(llm_response, "error_message", None)
+            ),
             span_id_override=span_id if is_popped else None,
             parent_span_id_override=(parent_span_id if is_popped else None),
         ),

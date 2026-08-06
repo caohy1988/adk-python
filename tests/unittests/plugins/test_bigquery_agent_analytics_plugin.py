@@ -38,6 +38,7 @@ from google.adk.sessions import base_session_service as base_session_service_lib
 from google.adk.sessions import session as session_lib
 from google.adk.tools import base_tool as base_tool_lib
 from google.adk.tools import tool_context as tool_context_lib
+from google.adk.utils import streaming_utils
 from google.adk.utils._telemetry_context import _is_visual_builder
 from google.adk.version import __version__
 from google.api_core import exceptions as api_exceptions
@@ -49,6 +50,7 @@ from google.cloud import exceptions as cloud_exceptions
 from google.genai import types
 from opentelemetry import trace
 import pyarrow as pa
+from pydantic import BaseModel
 import pytest
 
 PROJECT_ID = "test-gcp-project"
@@ -1917,6 +1919,72 @@ class TestBigQueryAgentAnalyticsPlugin:
     assert "finish_reason" not in json.loads(row["attributes"])
 
   @pytest.mark.asyncio
+  async def test_streaming_terminal_metadata_is_logged_only_on_final_response(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """A streamed turn contributes one finish reason and diagnostic row."""
+    aggregator = streaming_utils.StreamingResponseAggregator()
+    terminal_chunk = types.GenerateContentResponse(
+        candidates=[
+            types.Candidate(
+                finish_reason=types.FinishReason.MAX_TOKENS,
+                finish_message="token limit reached",
+            )
+        ]
+    )
+    responses = [
+        response
+        async for response in aggregator.process_response(terminal_chunk)
+    ]
+    responses.append(aggregator.close())
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        callback_context, "llm_request"
+    )
+
+    for response in responses:
+      await bq_plugin_inst.after_model_callback(
+          callback_context=callback_context, llm_response=response
+      )
+    await bq_plugin_inst.flush()
+
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert len(rows) == 2
+    assert "finish_reason" not in json.loads(rows[0]["attributes"])
+    assert rows[0]["error_message"] is None
+    assert json.loads(rows[1]["attributes"])["finish_reason"] == "MAX_TOKENS"
+    assert rows[1]["error_message"] == "token limit reached"
+
+  @pytest.mark.asyncio
+  async def test_after_model_callback_accepts_string_finish_reason(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """Response-like objects with string finish reasons still produce a row."""
+    response = llm_response_lib.LlmResponse.model_construct(
+        finish_reason="CUSTOM_REASON"
+    )
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        callback_context, "llm_request"
+    )
+
+    await bq_plugin_inst.after_model_callback(
+        callback_context=callback_context, llm_response=response
+    )
+    await bq_plugin_inst.flush()
+
+    row = await _get_captured_event_dict_async(
+        mock_write_client, dummy_arrow_schema
+    )
+    assert json.loads(row["attributes"])["finish_reason"] == "CUSTOM_REASON"
+
+  @pytest.mark.asyncio
   async def test_after_model_callback_sanitizes_error_message_without_error_status(
       self,
       bq_plugin_inst,
@@ -2912,44 +2980,6 @@ class TestBigQueryAgentAnalyticsPlugin:
       content_json = json.loads(log_entry["content"])
       assert content_json["result"]["id"] == "inc-123"
       assert content_json["result"]["kpi_missed"][0]["kpi"] == "latency"
-
-  @pytest.mark.asyncio
-  async def test_push_pop_does_not_call_tracer_start_span(
-      self,
-      callback_context,
-  ):
-    """Regression guard for the duplicate-Cloud-Trace bug.
-
-    The plugin must NOT call ``tracer.start_span(...)`` from
-    ``push_span`` / ``pop_span``.  Any owned OTel span goes through
-    the globally configured exporter (e.g. Cloud Trace via Agent
-    Engine telemetry) and surfaces as a duplicate span next to the
-    framework's real one.  The plugin's internal stack is sufficient
-    for ``span_id`` / ``parent_span_id`` / ``trace_id`` resolution
-    without creating an exportable span.
-    """
-    mock_tracer = mock.Mock()
-    with mock.patch(
-        "google.adk.plugins.bigquery_agent_analytics_plugin.tracer",
-        mock_tracer,
-        create=True,
-    ):
-      span_id = bigquery_agent_analytics_plugin.TraceManager.push_span(
-          callback_context, "test_span"
-      )
-      assert isinstance(span_id, str) and len(span_id) == 16
-
-      trace_id = bigquery_agent_analytics_plugin.TraceManager.get_trace_id(
-          callback_context
-      )
-      assert isinstance(trace_id, str) and len(trace_id) == 32
-
-      popped_span_id, _duration_ms = (
-          bigquery_agent_analytics_plugin.TraceManager.pop_span()
-      )
-      assert popped_span_id == span_id
-
-    mock_tracer.start_span.assert_not_called()
 
   @pytest.mark.asyncio
   async def test_push_pop_does_not_export_spans_through_real_provider(
@@ -9305,6 +9335,20 @@ class TestExactlyOnceDelivery:
     assert processor.dropped_event_count == 0
 
   @pytest.mark.asyncio
+  async def test_default_mode_never_finalizes_default_stream(
+      self, dummy_arrow_schema
+  ):
+    """Closing the default-stream writer never invokes stream finalization."""
+    client = mock.MagicMock()
+    client.finalize_write_stream = mock.AsyncMock()
+    processor = TestDropStats()._make_processor(dummy_arrow_schema)
+    processor.write_client = client
+
+    await processor.close()
+
+    client.finalize_write_stream.assert_not_awaited()
+
+  @pytest.mark.asyncio
   async def test_exactly_once_empty_response_poison_stream(
       self, dummy_arrow_schema
   ):
@@ -9383,6 +9427,73 @@ class TestExactlyOnceDelivery:
     assert processor.dropped_event_count == 0
 
   @pytest.mark.asyncio
+  async def test_ambiguous_attempt_stays_desynchronized_after_later_rejection(
+      self, dummy_arrow_schema
+  ):
+    """A later rejected retry cannot make an earlier sent attempt safe."""
+    client = mock.MagicMock()
+    streams = []
+    calls = 0
+    replacement = self._STREAM.replace("committed-1", "committed-2")
+    create_stream = mock.AsyncMock(return_value=replacement)
+
+    async def append_rows(requests, **kwargs):
+      nonlocal calls
+      del kwargs
+      request = await anext(requests)
+      streams.append(request.write_stream)
+      calls += 1
+      if calls == 1:
+        raise asyncio.TimeoutError()
+      if calls == 2:
+        return _async_gen(self._response(14, "unavailable"))
+      if request.write_stream == self._STREAM:
+        return _async_gen(self._response(6, "offset already exists"))
+      return _async_gen(self._response())
+
+    client.append_rows.side_effect = append_rows
+    client.finalize_write_stream = mock.AsyncMock()
+    processor = self._make_processor(
+        dummy_arrow_schema,
+        write_client=client,
+        create_stream=create_stream,
+        max_retries=1,
+    )
+
+    await processor._write_rows_with_retry([{"batch": "a"}, {"batch": "a"}])
+    await processor._write_rows_with_retry([{"batch": "b"}])
+
+    assert streams == [self._STREAM, self._STREAM, replacement]
+    assert processor._next_offset == 1
+    assert processor.get_drop_stats()["retry_exhausted"] == 2
+
+  @pytest.mark.asyncio
+  @pytest.mark.parametrize("already_exists_in_band", [False, True])
+  async def test_first_attempt_already_exists_desynchronizes_stream(
+      self, dummy_arrow_schema, already_exists_in_band
+  ):
+    """An occupied offset cannot confirm a batch with no ambiguous attempt."""
+    client = mock.MagicMock()
+
+    async def append_rows(requests, **kwargs):
+      del kwargs
+      await anext(requests)
+      if already_exists_in_band:
+        return _async_gen(self._response(6, "offset already exists"))
+      raise api_exceptions.AlreadyExists("offset already exists")
+
+    client.append_rows.side_effect = append_rows
+    processor = self._make_processor(
+        dummy_arrow_schema, write_client=client, max_retries=1
+    )
+
+    await processor._write_rows_with_retry([{"a": 1}])
+
+    assert processor._next_offset == 0
+    assert processor._offset_desynced
+    assert processor.get_drop_stats()["offset_conflict"] == 1
+
+  @pytest.mark.asyncio
   @pytest.mark.parametrize(
       ("error", "code"),
       [
@@ -9430,7 +9541,68 @@ class TestExactlyOnceDelivery:
     assert offsets == [0, 0]
     assert streams == [self._STREAM, replacement]
     create_stream.assert_awaited_once_with()
-    client.finalize_write_stream.assert_awaited_once_with(name=self._STREAM)
+    client.finalize_write_stream.assert_not_awaited()
+    assert self._STREAM in processor._pending_finalize_streams
+
+  @pytest.mark.asyncio
+  async def test_rotation_does_not_wait_for_old_stream_finalization(
+      self, dummy_arrow_schema
+  ):
+    """A stuck finalizer cannot block writes on a replacement stream."""
+    client = mock.MagicMock()
+    replacement = self._STREAM.replace("committed-1", "committed-2")
+    create_stream = mock.AsyncMock(return_value=replacement)
+
+    async def append_rows(requests, **kwargs):
+      del kwargs
+      request = await anext(requests)
+      assert request.write_stream == replacement
+      return _async_gen(self._response())
+
+    async def never_finalize(**kwargs):
+      del kwargs
+      await asyncio.Event().wait()
+
+    client.append_rows.side_effect = append_rows
+    client.finalize_write_stream = mock.AsyncMock(side_effect=never_finalize)
+    processor = self._make_processor(
+        dummy_arrow_schema,
+        write_client=client,
+        create_stream=create_stream,
+    )
+    processor._offset_desynced = True
+
+    await asyncio.wait_for(
+        processor._write_rows_with_retry([{"a": 1}]), timeout=0.1
+    )
+
+    assert processor.write_stream == replacement
+    assert processor._next_offset == 1
+    assert self._STREAM in processor._pending_finalize_streams
+
+  @pytest.mark.asyncio
+  async def test_rotation_creation_failure_drops_during_backoff(
+      self, dummy_arrow_schema
+  ):
+    """A failed replacement counts later backoff-window batches as dropped."""
+    client = mock.MagicMock()
+    client.append_rows = mock.AsyncMock()
+    create_stream = mock.AsyncMock(
+        side_effect=api_exceptions.ServiceUnavailable("quota unavailable")
+    )
+    processor = self._make_processor(
+        dummy_arrow_schema,
+        write_client=client,
+        create_stream=create_stream,
+    )
+    processor._offset_desynced = True
+
+    await processor._write_rows_with_retry([{"a": 1}])
+    await processor._write_rows_with_retry([{"a": 2}, {"a": 3}])
+
+    create_stream.assert_awaited_once_with()
+    client.append_rows.assert_not_awaited()
+    assert processor.get_drop_stats()["offset_conflict"] == 3
 
   @pytest.mark.asyncio
   async def test_ambiguous_exhaustion_poison_stream_and_rotates(
@@ -9551,6 +9723,47 @@ class TestExactlyOnceDelivery:
         f"projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}"
     )
     assert kwargs["write_stream"].type_.name == "COMMITTED"
+
+  @pytest.mark.asyncio
+  async def test_config_wires_committed_stream_into_batch_processor(
+      self, dummy_arrow_schema
+  ):
+    """The public opt-in config constructs an offset-aware processor."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        exactly_once_delivery=True
+    )
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        project_id=PROJECT_ID,
+        dataset_id=DATASET_ID,
+        table_id=TABLE_ID,
+        config=config,
+    )
+    plugin.arrow_schema = dummy_arrow_schema
+    plugin._credentials = mock.MagicMock(quota_project_id=None)
+    client = mock.MagicMock()
+    client.finalize_write_stream = mock.AsyncMock()
+    client.close = mock.AsyncMock()
+    create_stream = mock.AsyncMock(return_value=self._STREAM)
+
+    with (
+        mock.patch.object(
+            bigquery_agent_analytics_plugin,
+            "BigQueryWriteAsyncClient",
+            return_value=client,
+        ),
+        mock.patch.object(
+            plugin, "_create_committed_write_stream", create_stream
+        ),
+    ):
+      state = await plugin._get_loop_state()
+
+      assert state.batch_processor.exactly_once_delivery
+      assert state.batch_processor.write_stream == self._STREAM
+      assert state.batch_processor._create_stream is not None
+
+      await plugin.shutdown()
+
+    create_stream.assert_awaited_once_with(client)
 
 
 # -----------------------------------------------------------------------------
@@ -10071,6 +10284,35 @@ class TestWorkflowNodeEvents:
     assert node["run_id"] == "2"
 
   @pytest.mark.asyncio
+  async def test_node_output_preserves_pydantic_payload(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """Pydantic node results remain queryable as structured JSON."""
+
+    class Result(BaseModel):
+      answer: int
+
+    event = event_lib.Event(
+        author="step",
+        output=Result(answer=42),
+        node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+    )
+
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=invocation_context, event=event
+    )
+    await bq_plugin_inst.flush()
+
+    row = await _get_captured_event_dict_async(
+        mock_write_client, dummy_arrow_schema
+    )
+    assert json.loads(row["content"]) == {"answer": 42}
+
+  @pytest.mark.asyncio
   async def test_output_and_state_delta_emit_separate_rows(
       self,
       bq_plugin_inst,
@@ -10125,6 +10367,115 @@ class TestWorkflowNodeEvents:
     assert row["status"] == "ERROR"
     assert row["error_message"] == "invalid input"
     assert json.loads(row["content"])["error_code"] == "ValueError"
+
+  @pytest.mark.asyncio
+  async def test_partial_node_error_does_not_duplicate_failure_row(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+  ):
+    """Partial events cannot produce durable NODE_ERROR rows."""
+    event = event_lib.Event(
+        author="step",
+        error_code="ValueError",
+        error_message="invalid input",
+        partial=True,
+        node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+    )
+
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=invocation_context, event=event
+    )
+    await bq_plugin_inst.flush()
+
+    mock_write_client.append_rows.assert_not_called()
+
+  @pytest.mark.asyncio
+  @pytest.mark.parametrize(
+      ("error_code", "finish_reason"),
+      [
+          ("MAX_TOKENS", types.FinishReason.MAX_TOKENS),
+          ("MODEL_ARMOR", None),
+      ],
+  )
+  async def test_model_termination_does_not_produce_node_error(
+      self,
+      error_code,
+      finish_reason,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+  ):
+    """Model termination diagnostics remain LLM_RESPONSE-only telemetry."""
+    event = event_lib.Event(
+        author="agent",
+        error_code=error_code,
+        error_message="model stopped",
+        finish_reason=finish_reason,
+        node_info=event_lib.NodeInfo(path="wf@1/agent@2"),
+    )
+
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=invocation_context, event=event
+    )
+    await bq_plugin_inst.flush()
+
+    mock_write_client.append_rows.assert_not_called()
+
+  @pytest.mark.asyncio
+  async def test_content_and_output_event_preserves_node_output(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """A node's distinct message and output both remain observable."""
+    event = event_lib.Event(
+        author="step",
+        content=types.Content(parts=[types.Part(text="progress")]),
+        output={"result": 1},
+        node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+    )
+
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=invocation_context, event=event
+    )
+    await bq_plugin_inst.flush()
+
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    node_outputs = [row for row in rows if row["event_type"] == "NODE_OUTPUT"]
+    assert len(node_outputs) == 1
+    assert json.loads(node_outputs[0]["content"]) == {"result": 1}
+
+  @pytest.mark.asyncio
+  async def test_error_and_output_event_preserves_both_node_rows(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """A failing node can retain a diagnostic output beside its error."""
+    event = event_lib.Event(
+        author="step",
+        error_code="ValueError",
+        error_message="partial result",
+        output={"processed": 3},
+        node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+    )
+
+    await bq_plugin_inst.on_event_callback(
+        invocation_context=invocation_context, event=event
+    )
+    await bq_plugin_inst.flush()
+
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert [row["event_type"] for row in rows] == [
+        "NODE_ERROR",
+        "NODE_OUTPUT",
+    ]
 
   @pytest.mark.asyncio
   @pytest.mark.parametrize(
