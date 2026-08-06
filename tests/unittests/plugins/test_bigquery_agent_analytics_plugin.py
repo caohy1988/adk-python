@@ -2932,6 +2932,7 @@ class TestBigQueryAgentAnalyticsPlugin:
     with mock.patch(
         "google.adk.plugins.bigquery_agent_analytics_plugin.tracer",
         mock_tracer,
+        create=True,
     ):
       span_id = bigquery_agent_analytics_plugin.TraceManager.push_span(
           callback_context, "test_span"
@@ -2978,6 +2979,7 @@ class TestBigQueryAgentAnalyticsPlugin:
     with mock.patch(
         "google.adk.plugins.bigquery_agent_analytics_plugin.tracer",
         real_tracer,
+        create=True,
     ):
       span_id = bigquery_agent_analytics_plugin.TraceManager.push_span(
           callback_context, "test_span"
@@ -4293,7 +4295,7 @@ class TestResolveIds:
     # Seed the plugin stack with a span.
     bigquery_agent_analytics_plugin._span_records_ctx.set(None)
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       bigquery_agent_analytics_plugin.TraceManager.push_span(
           callback_context, "plugin-child"
@@ -6967,7 +6969,7 @@ class TestTraceIdContinuity:
     real_tracer = provider.get_tracer("test-plugin")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       # Reset the span records contextvar for a clean invocation.
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
@@ -7021,7 +7023,7 @@ class TestTraceIdContinuity:
     real_tracer = provider.get_tracer("test-plugin")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       # Reset for a clean invocation; no ambient span.
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
@@ -7081,7 +7083,7 @@ class TestTraceIdContinuity:
     real_tracer = provider.get_tracer("test-plugin")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       # Reset span records for a clean invocation.
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
@@ -7141,7 +7143,7 @@ class TestTraceIdContinuity:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       # Reset the span records contextvar.
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
@@ -7184,7 +7186,7 @@ class TestTraceIdContinuity:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       # --- Turn 1 ---
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
@@ -7249,7 +7251,7 @@ class TestSpanIdConsistency:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
@@ -7315,7 +7317,7 @@ class TestSpanIdConsistency:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
@@ -7379,7 +7381,7 @@ class TestSpanIdConsistency:
     )
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
@@ -7444,7 +7446,7 @@ class TestStackLeakSafety:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       # Simulate stale records from incomplete previous invocation.
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
@@ -7494,7 +7496,7 @@ class TestStackLeakSafety:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
       TM.push_span(callback_context, "span-a")
@@ -7542,7 +7544,7 @@ class TestStackLeakSafety:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
@@ -7593,7 +7595,7 @@ class TestStackLeakSafety:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
       bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
@@ -7645,7 +7647,7 @@ class TestStackLeakSafety:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
       bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
@@ -7697,7 +7699,7 @@ class TestStackLeakSafety:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
       bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
@@ -7793,7 +7795,7 @@ class TestRootAgentNameAcrossInvocations:
       )
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       # --- Invocation 1: root agent = "RootA" ---
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
@@ -7879,7 +7881,7 @@ class TestAfterRunCleanupExceptionSafety:
     real_tracer = provider.get_tracer("test")
 
     with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer
+        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
     ):
       bigquery_agent_analytics_plugin._span_records_ctx.set(None)
       bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)

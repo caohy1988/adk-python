@@ -99,9 +99,6 @@ if TYPE_CHECKING:
   from ..events.event import Event
 
 logger: logging.Logger = logging.getLogger("google_adk." + __name__)
-tracer = trace.get_tracer(
-    "google.adk.plugins.bigquery_agent_analytics", __version__
-)
 
 # Bumped when the schema changes (1 → 2 → 3 …). Used as a table
 # label for governance and to decide whether auto-upgrade should run.
