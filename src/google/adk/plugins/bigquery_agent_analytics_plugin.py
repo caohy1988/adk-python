@@ -7094,11 +7094,16 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             usage_metadata=llm_response.usage_metadata,
             cache_metadata=getattr(llm_response, "cache_metadata", None),
             finish_reason=(
-                llm_response.finish_reason.name
-                if llm_response.finish_reason is not None
+                finish_reason.name
+                if (
+                    finish_reason := getattr(
+                        llm_response, "finish_reason", None
+                    )
+                )
+                is not None
                 else None
             ),
-            error_message=llm_response.error_message,
+            error_message=getattr(llm_response, "error_message", None),
             span_id_override=span_id if is_popped else None,
             parent_span_id_override=(parent_span_id if is_popped else None),
         ),
