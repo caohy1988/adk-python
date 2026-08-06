@@ -2680,6 +2680,8 @@ class BatchProcessor:
                     "%d row(s) dropped due to a non-retryable BigQuery error.",
                     len(rows),
                 )
+              if self.exactly_once_delivery and had_ambiguous_send:
+                self._desync_stream()
               self._dropped["non_retryable"] += len(rows)
               return
             if self.exactly_once_delivery:
@@ -7057,6 +7059,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     2. Token usage (if available)
 
     The content is formatted as 'Response: {content} | Usage: {usage}'.
+    Termination metadata is recorded once per non-partial response. Progressive
+    SSE produces one terminal response per model call, while legacy aggregators
+    and mixed LiteLLM streams can emit multiple terminal responses.
 
     Args:
         callback_context: The callback context.

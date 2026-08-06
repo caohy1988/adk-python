@@ -3006,31 +3006,24 @@ class TestBigQueryAgentAnalyticsPlugin:
     provider.add_span_processor(trace_export.SimpleSpanProcessor(exporter))
     real_tracer = provider.get_tracer("test_tracer")
 
-    with mock.patch(
-        "google.adk.plugins.bigquery_agent_analytics_plugin.tracer",
-        real_tracer,
-        create=True,
-    ):
-      span_id = bigquery_agent_analytics_plugin.TraceManager.push_span(
-          callback_context, "test_span"
-      )
-      assert exporter.get_finished_spans() == ()
+    span_id = bigquery_agent_analytics_plugin.TraceManager.push_span(
+        callback_context, "test_span"
+    )
+    assert exporter.get_finished_spans() == ()
 
-      trace_id = bigquery_agent_analytics_plugin.TraceManager.get_trace_id(
-          callback_context
-      )
-      assert trace_id is not None and len(trace_id) == 32
+    trace_id = bigquery_agent_analytics_plugin.TraceManager.get_trace_id(
+        callback_context
+    )
+    assert trace_id is not None and len(trace_id) == 32
 
-      popped_span_id, _ = (
-          bigquery_agent_analytics_plugin.TraceManager.pop_span()
-      )
-      assert popped_span_id == span_id
+    popped_span_id, _ = bigquery_agent_analytics_plugin.TraceManager.pop_span()
+    assert popped_span_id == span_id
 
-      assert exporter.get_finished_spans() == (), (
-          "Plugin must not export OTel spans; any owned span would"
-          " surface as a duplicate in Cloud Trace alongside the"
-          " framework's real spans."
-      )
+    assert exporter.get_finished_spans() == (), (
+        "Plugin must not export OTel spans; any owned span would"
+        " surface as a duplicate in Cloud Trace alongside the"
+        " framework's real spans."
+    )
 
     provider.shutdown()
 
@@ -4324,12 +4317,9 @@ class TestResolveIds:
 
     # Seed the plugin stack with a span.
     bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      bigquery_agent_analytics_plugin.TraceManager.push_span(
-          callback_context, "plugin-child"
-      )
+    bigquery_agent_analytics_plugin.TraceManager.push_span(
+        callback_context, "plugin-child"
+    )
 
     # Capture the plugin span_id that was pushed.
     plugin_span_id, _ = (
@@ -6998,35 +6988,32 @@ class TestTraceIdContinuity:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     real_tracer = provider.get_tracer("test-plugin")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      # Reset the span records contextvar for a clean invocation.
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    # Reset the span records contextvar for a clean invocation.
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
-      # No ambient OTel span — we do NOT start_as_current_span.
-      ambient = trace.get_current_span()
-      assert not ambient.get_span_context().is_valid
+    # No ambient OTel span — we do NOT start_as_current_span.
+    ambient = trace.get_current_span()
+    assert not ambient.get_span_context().is_valid
 
-      # ensure_invocation_span should push a new span.
-      TM.ensure_invocation_span(callback_context)
-      trace_id_early = TM.get_trace_id(callback_context)
-      assert trace_id_early is not None
-      # Should NOT fall back to invocation_id — it should be
-      # a 32-char hex OTel trace_id.
-      assert trace_id_early != callback_context.invocation_id
-      assert len(trace_id_early) == 32
+    # ensure_invocation_span should push a new span.
+    TM.ensure_invocation_span(callback_context)
+    trace_id_early = TM.get_trace_id(callback_context)
+    assert trace_id_early is not None
+    # Should NOT fall back to invocation_id — it should be
+    # a 32-char hex OTel trace_id.
+    assert trace_id_early != callback_context.invocation_id
+    assert len(trace_id_early) == 32
 
-      # Simulate agent callback: push_span("agent")
-      TM.push_span(callback_context, "agent")
-      trace_id_agent = TM.get_trace_id(callback_context)
+    # Simulate agent callback: push_span("agent")
+    TM.push_span(callback_context, "agent")
+    trace_id_agent = TM.get_trace_id(callback_context)
 
-      # Both trace_ids must be identical.
-      assert trace_id_early == trace_id_agent
+    # Both trace_ids must be identical.
+    assert trace_id_early == trace_id_agent
 
-      # Cleanup
-      TM.pop_span()  # agent
-      TM.pop_span()  # invocation
+    # Cleanup
+    TM.pop_span()  # agent
+    TM.pop_span()  # invocation
 
     provider.shutdown()
 
@@ -7052,38 +7039,35 @@ class TestTraceIdContinuity:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     real_tracer = provider.get_tracer("test-plugin")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      # Reset for a clean invocation; no ambient span.
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-      assert not trace.get_current_span().get_span_context().is_valid
+    # Reset for a clean invocation; no ambient span.
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    assert not trace.get_current_span().get_span_context().is_valid
 
-      # --- Simulate the full callback lifecycle ---
-      # 1. before_run / on_user_message: ensure invocation span
-      TM.ensure_invocation_span(callback_context)
-      trace_id_start = TM.get_trace_id(callback_context)
+    # --- Simulate the full callback lifecycle ---
+    # 1. before_run / on_user_message: ensure invocation span
+    TM.ensure_invocation_span(callback_context)
+    trace_id_start = TM.get_trace_id(callback_context)
 
-      # 2. before_agent: push agent span
-      TM.push_span(callback_context, "agent")
-      assert TM.get_trace_id(callback_context) == trace_id_start
+    # 2. before_agent: push agent span
+    TM.push_span(callback_context, "agent")
+    assert TM.get_trace_id(callback_context) == trace_id_start
 
-      # 3. after_agent: pop agent span
-      TM.pop_span()
+    # 3. after_agent: pop agent span
+    TM.pop_span()
 
-      # 4. after_run: capture trace_id THEN pop invocation span
-      trace_id_before_pop = TM.get_trace_id(callback_context)
-      assert trace_id_before_pop == trace_id_start
+    # 4. after_run: capture trace_id THEN pop invocation span
+    trace_id_before_pop = TM.get_trace_id(callback_context)
+    assert trace_id_before_pop == trace_id_start
 
-      TM.pop_span()
+    TM.pop_span()
 
-      # After popping, get_trace_id falls back to invocation_id
-      trace_id_after_pop = TM.get_trace_id(callback_context)
-      assert trace_id_after_pop == callback_context.invocation_id
+    # After popping, get_trace_id falls back to invocation_id
+    trace_id_after_pop = TM.get_trace_id(callback_context)
+    assert trace_id_after_pop == callback_context.invocation_id
 
-      # The trace_id_override preserves continuity
-      assert trace_id_before_pop == trace_id_start
-      assert trace_id_before_pop != trace_id_after_pop
+    # The trace_id_override preserves continuity
+    assert trace_id_before_pop == trace_id_start
+    assert trace_id_before_pop != trace_id_after_pop
 
     provider.shutdown()
 
@@ -7112,48 +7096,43 @@ class TestTraceIdContinuity:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     real_tracer = provider.get_tracer("test-plugin")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      # Reset span records for a clean invocation.
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    # Reset span records for a clean invocation.
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
-      # No ambient span — simulates Agent Engine / custom runner.
-      assert not trace.get_current_span().get_span_context().is_valid
+    # No ambient span — simulates Agent Engine / custom runner.
+    assert not trace.get_current_span().get_span_context().is_valid
 
-      # Run the full callback lifecycle.
-      await bq_plugin_inst.before_run_callback(
-          invocation_context=invocation_context
-      )
-      await bq_plugin_inst.before_agent_callback(
-          agent=mock_agent, callback_context=callback_context
-      )
-      await bq_plugin_inst.after_agent_callback(
-          agent=mock_agent, callback_context=callback_context
-      )
-      await bq_plugin_inst.after_run_callback(
-          invocation_context=invocation_context
-      )
-      await bq_plugin_inst.flush()
+    # Run the full callback lifecycle.
+    await bq_plugin_inst.before_run_callback(
+        invocation_context=invocation_context
+    )
+    await bq_plugin_inst.before_agent_callback(
+        agent=mock_agent, callback_context=callback_context
+    )
+    await bq_plugin_inst.after_agent_callback(
+        agent=mock_agent, callback_context=callback_context
+    )
+    await bq_plugin_inst.after_run_callback(
+        invocation_context=invocation_context
+    )
+    await bq_plugin_inst.flush()
 
-      # Collect all emitted rows.
-      rows = await _get_captured_rows_async(
-          mock_write_client, dummy_arrow_schema
-      )
-      event_types = [r["event_type"] for r in rows]
-      assert "INVOCATION_STARTING" in event_types
-      assert "INVOCATION_COMPLETED" in event_types
+    # Collect all emitted rows.
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    event_types = [r["event_type"] for r in rows]
+    assert "INVOCATION_STARTING" in event_types
+    assert "INVOCATION_COMPLETED" in event_types
 
-      # Every row must share the same trace_id.
-      trace_ids = {r["trace_id"] for r in rows}
-      assert len(trace_ids) == 1, (
-          "Expected 1 unique trace_id across all events, got"
-          f" {len(trace_ids)}: {trace_ids}"
-      )
-      # Should be a 32-char hex OTel trace, not the invocation_id.
-      sole_trace_id = trace_ids.pop()
-      assert sole_trace_id != invocation_context.invocation_id
-      assert len(sole_trace_id) == 32
+    # Every row must share the same trace_id.
+    trace_ids = {r["trace_id"] for r in rows}
+    assert len(trace_ids) == 1, (
+        "Expected 1 unique trace_id across all events, got"
+        f" {len(trace_ids)}: {trace_ids}"
+    )
+    # Should be a 32-char hex OTel trace, not the invocation_id.
+    sole_trace_id = trace_ids.pop()
+    assert sole_trace_id != invocation_context.invocation_id
+    assert len(sole_trace_id) == 32
 
     provider.shutdown()
 
@@ -7172,30 +7151,27 @@ class TestTraceIdContinuity:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      # Reset the span records contextvar.
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    # Reset the span records contextvar.
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
-      with real_tracer.start_as_current_span("runner_invocation"):
-        ambient = trace.get_current_span()
-        assert ambient.get_span_context().is_valid
-        ambient_trace_id = format(ambient.get_span_context().trace_id, "032x")
+    with real_tracer.start_as_current_span("runner_invocation"):
+      ambient = trace.get_current_span()
+      assert ambient.get_span_context().is_valid
+      ambient_trace_id = format(ambient.get_span_context().trace_id, "032x")
 
-        # ensure_invocation_span should attach the ambient span.
-        TM.ensure_invocation_span(callback_context)
-        trace_id_early = TM.get_trace_id(callback_context)
-        assert trace_id_early == ambient_trace_id
+      # ensure_invocation_span should attach the ambient span.
+      TM.ensure_invocation_span(callback_context)
+      trace_id_early = TM.get_trace_id(callback_context)
+      assert trace_id_early == ambient_trace_id
 
-        # Simulate agent callback: push_span("agent")
-        TM.push_span(callback_context, "agent")
-        trace_id_agent = TM.get_trace_id(callback_context)
-        assert trace_id_agent == ambient_trace_id
+      # Simulate agent callback: push_span("agent")
+      TM.push_span(callback_context, "agent")
+      trace_id_agent = TM.get_trace_id(callback_context)
+      assert trace_id_agent == ambient_trace_id
 
-        # Cleanup
-        TM.pop_span()  # agent
-        TM.pop_span()  # invocation (attached, not owned)
+      # Cleanup
+      TM.pop_span()  # agent
+      TM.pop_span()  # invocation (attached, not owned)
 
     provider.shutdown()
 
@@ -7215,36 +7191,33 @@ class TestTraceIdContinuity:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      # --- Turn 1 ---
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-      TM.ensure_invocation_span(callback_context)
-      trace_id_turn1 = TM.get_trace_id(callback_context)
+    # --- Turn 1 ---
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    TM.ensure_invocation_span(callback_context)
+    trace_id_turn1 = TM.get_trace_id(callback_context)
 
-      TM.push_span(callback_context, "agent")
-      assert TM.get_trace_id(callback_context) == trace_id_turn1
-      TM.pop_span()  # agent
-      TM.pop_span()  # invocation
+    TM.push_span(callback_context, "agent")
+    assert TM.get_trace_id(callback_context) == trace_id_turn1
+    TM.pop_span()  # agent
+    TM.pop_span()  # invocation
 
-      # After popping, the stack should be empty.
-      records = bigquery_agent_analytics_plugin._span_records_ctx.get()
-      assert not records
+    # After popping, the stack should be empty.
+    records = bigquery_agent_analytics_plugin._span_records_ctx.get()
+    assert not records
 
-      # --- Turn 2 ---
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-      TM.ensure_invocation_span(callback_context)
-      trace_id_turn2 = TM.get_trace_id(callback_context)
+    # --- Turn 2 ---
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    TM.ensure_invocation_span(callback_context)
+    trace_id_turn2 = TM.get_trace_id(callback_context)
 
-      TM.push_span(callback_context, "agent")
-      assert TM.get_trace_id(callback_context) == trace_id_turn2
-      TM.pop_span()  # agent
-      TM.pop_span()  # invocation
+    TM.push_span(callback_context, "agent")
+    assert TM.get_trace_id(callback_context) == trace_id_turn2
+    TM.pop_span()  # agent
+    TM.pop_span()  # invocation
 
-      # The two turns must have DIFFERENT trace_ids (different
-      # root spans).
-      assert trace_id_turn1 != trace_id_turn2
+    # The two turns must have DIFFERENT trace_ids (different
+    # root spans).
+    assert trace_id_turn1 != trace_id_turn2
 
     provider.shutdown()
 
@@ -7280,50 +7253,43 @@ class TestSpanIdConsistency:
     provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
-      # Simulate the framework's ambient spans.
-      with real_tracer.start_as_current_span("invocation"):
-        await bq_plugin_inst.before_run_callback(
-            invocation_context=invocation_context
-        )
-        with real_tracer.start_as_current_span("invoke_agent"):
-          await bq_plugin_inst.before_agent_callback(
-              agent=mock_agent, callback_context=callback_context
-          )
-          await bq_plugin_inst.after_agent_callback(
-              agent=mock_agent, callback_context=callback_context
-          )
-        await bq_plugin_inst.after_run_callback(
-            invocation_context=invocation_context
-        )
-
-      await bq_plugin_inst.flush()
-
-      rows = await _get_captured_rows_async(
-          mock_write_client, dummy_arrow_schema
+    # Simulate the framework's ambient spans.
+    with real_tracer.start_as_current_span("invocation"):
+      await bq_plugin_inst.before_run_callback(
+          invocation_context=invocation_context
       )
-      agent_starting = [r for r in rows if r["event_type"] == "AGENT_STARTING"]
-      agent_completed = [
-          r for r in rows if r["event_type"] == "AGENT_COMPLETED"
-      ]
-
-      assert len(agent_starting) == 1
-      assert len(agent_completed) == 1
-
-      # Both events must share the same span_id (the plugin-internal
-      # agent span pushed by before_agent_callback and popped by
-      # after_agent_callback). The lifecycle-pair invariant holds
-      # regardless of whether the id comes from a plugin-minted hex
-      # string or an ambient OTel span.
-      assert agent_starting[0]["span_id"] == agent_completed[0]["span_id"]
-      assert (
-          agent_starting[0]["parent_span_id"]
-          == agent_completed[0]["parent_span_id"]
+      with real_tracer.start_as_current_span("invoke_agent"):
+        await bq_plugin_inst.before_agent_callback(
+            agent=mock_agent, callback_context=callback_context
+        )
+        await bq_plugin_inst.after_agent_callback(
+            agent=mock_agent, callback_context=callback_context
+        )
+      await bq_plugin_inst.after_run_callback(
+          invocation_context=invocation_context
       )
+
+    await bq_plugin_inst.flush()
+
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    agent_starting = [r for r in rows if r["event_type"] == "AGENT_STARTING"]
+    agent_completed = [r for r in rows if r["event_type"] == "AGENT_COMPLETED"]
+
+    assert len(agent_starting) == 1
+    assert len(agent_completed) == 1
+
+    # Both events must share the same span_id (the plugin-internal
+    # agent span pushed by before_agent_callback and popped by
+    # after_agent_callback). The lifecycle-pair invariant holds
+    # regardless of whether the id comes from a plugin-minted hex
+    # string or an ambient OTel span.
+    assert agent_starting[0]["span_id"] == agent_completed[0]["span_id"]
+    assert (
+        agent_starting[0]["parent_span_id"]
+        == agent_completed[0]["parent_span_id"]
+    )
 
     provider.shutdown()
 
@@ -7346,43 +7312,36 @@ class TestSpanIdConsistency:
     provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
-      # No ambient OTel span.
-      assert not trace.get_current_span().get_span_context().is_valid
+    # No ambient OTel span.
+    assert not trace.get_current_span().get_span_context().is_valid
 
-      await bq_plugin_inst.before_run_callback(
-          invocation_context=invocation_context
-      )
-      await bq_plugin_inst.before_agent_callback(
-          agent=mock_agent, callback_context=callback_context
-      )
-      await bq_plugin_inst.after_agent_callback(
-          agent=mock_agent, callback_context=callback_context
-      )
-      await bq_plugin_inst.after_run_callback(
-          invocation_context=invocation_context
-      )
+    await bq_plugin_inst.before_run_callback(
+        invocation_context=invocation_context
+    )
+    await bq_plugin_inst.before_agent_callback(
+        agent=mock_agent, callback_context=callback_context
+    )
+    await bq_plugin_inst.after_agent_callback(
+        agent=mock_agent, callback_context=callback_context
+    )
+    await bq_plugin_inst.after_run_callback(
+        invocation_context=invocation_context
+    )
 
-      await bq_plugin_inst.flush()
+    await bq_plugin_inst.flush()
 
-      rows = await _get_captured_rows_async(
-          mock_write_client, dummy_arrow_schema
-      )
-      agent_starting = [r for r in rows if r["event_type"] == "AGENT_STARTING"]
-      agent_completed = [
-          r for r in rows if r["event_type"] == "AGENT_COMPLETED"
-      ]
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    agent_starting = [r for r in rows if r["event_type"] == "AGENT_STARTING"]
+    agent_completed = [r for r in rows if r["event_type"] == "AGENT_COMPLETED"]
 
-      assert len(agent_starting) == 1
-      assert len(agent_completed) == 1
+    assert len(agent_starting) == 1
+    assert len(agent_completed) == 1
 
-      # AGENT_STARTING gets the top-of-stack span; AGENT_COMPLETED
-      # gets the popped span via override — they should match.
-      assert agent_starting[0]["span_id"] == agent_completed[0]["span_id"]
+    # AGENT_STARTING gets the top-of-stack span; AGENT_COMPLETED
+    # gets the popped span via override — they should match.
+    assert agent_starting[0]["span_id"] == agent_completed[0]["span_id"]
 
     provider.shutdown()
 
@@ -7410,48 +7369,43 @@ class TestSpanIdConsistency:
         invocation_context=invocation_context
     )
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
-      # No ambient OTel — plugin span stack provides IDs.
-      assert not trace.get_current_span().get_span_context().is_valid
+    # No ambient OTel — plugin span stack provides IDs.
+    assert not trace.get_current_span().get_span_context().is_valid
 
-      await bq_plugin_inst.before_run_callback(
-          invocation_context=invocation_context
-      )
-      # Push tool span via before_tool_callback
-      await bq_plugin_inst.before_tool_callback(
-          tool=mock_tool,
-          tool_args={"a": 1},
-          tool_context=tool_ctx,
-      )
-      # Error callback should pop the tool span and use its ID
-      await bq_plugin_inst.on_tool_error_callback(
-          tool=mock_tool,
-          tool_args={"a": 1},
-          tool_context=tool_ctx,
-          error=RuntimeError("boom"),
-      )
-      await bq_plugin_inst.after_run_callback(
-          invocation_context=invocation_context
-      )
-      await bq_plugin_inst.flush()
+    await bq_plugin_inst.before_run_callback(
+        invocation_context=invocation_context
+    )
+    # Push tool span via before_tool_callback
+    await bq_plugin_inst.before_tool_callback(
+        tool=mock_tool,
+        tool_args={"a": 1},
+        tool_context=tool_ctx,
+    )
+    # Error callback should pop the tool span and use its ID
+    await bq_plugin_inst.on_tool_error_callback(
+        tool=mock_tool,
+        tool_args={"a": 1},
+        tool_context=tool_ctx,
+        error=RuntimeError("boom"),
+    )
+    await bq_plugin_inst.after_run_callback(
+        invocation_context=invocation_context
+    )
+    await bq_plugin_inst.flush()
 
-      rows = await _get_captured_rows_async(
-          mock_write_client, dummy_arrow_schema
-      )
-      tool_starting = [r for r in rows if r["event_type"] == "TOOL_STARTING"]
-      tool_error = [r for r in rows if r["event_type"] == "TOOL_ERROR"]
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    tool_starting = [r for r in rows if r["event_type"] == "TOOL_STARTING"]
+    tool_error = [r for r in rows if r["event_type"] == "TOOL_ERROR"]
 
-      assert len(tool_starting) == 1
-      assert len(tool_error) == 1
+    assert len(tool_starting) == 1
+    assert len(tool_error) == 1
 
-      # The TOOL_ERROR event must have the same span_id as
-      # TOOL_STARTING (both correspond to the same tool span).
-      assert tool_starting[0]["span_id"] == tool_error[0]["span_id"]
-      assert tool_error[0]["span_id"] is not None
+    # The TOOL_ERROR event must have the same span_id as
+    # TOOL_STARTING (both correspond to the same tool span).
+    assert tool_starting[0]["span_id"] == tool_error[0]["span_id"]
+    assert tool_error[0]["span_id"] is not None
 
     provider.shutdown()
 
@@ -7475,31 +7429,28 @@ class TestStackLeakSafety:
     provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      # Simulate stale records from incomplete previous invocation.
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-      # Mark the stale records as belonging to a different invocation.
-      bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(
-          "old-inv-stale"
-      )
-      TM.push_span(callback_context, "stale-invocation")
-      TM.push_span(callback_context, "stale-agent")
+    # Simulate stale records from incomplete previous invocation.
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    # Mark the stale records as belonging to a different invocation.
+    bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(
+        "old-inv-stale"
+    )
+    TM.push_span(callback_context, "stale-invocation")
+    TM.push_span(callback_context, "stale-agent")
 
-      stale_records = bigquery_agent_analytics_plugin._span_records_ctx.get()
-      assert len(stale_records) == 2
+    stale_records = bigquery_agent_analytics_plugin._span_records_ctx.get()
+    assert len(stale_records) == 2
 
-      # ensure_invocation_span with the *current* invocation_id should
-      # detect the mismatch, clear stale records, and re-init.
-      TM.ensure_invocation_span(callback_context)
+    # ensure_invocation_span with the *current* invocation_id should
+    # detect the mismatch, clear stale records, and re-init.
+    TM.ensure_invocation_span(callback_context)
 
-      records = bigquery_agent_analytics_plugin._span_records_ctx.get()
-      # Should have exactly 1 fresh entry (the new invocation span).
-      assert len(records) == 1
-      # The fresh span should NOT be one of the stale ones.
-      assert records[0].span_id != stale_records[0].span_id
-      assert records[0].span_id != stale_records[1].span_id
+    records = bigquery_agent_analytics_plugin._span_records_ctx.get()
+    # Should have exactly 1 fresh entry (the new invocation span).
+    assert len(records) == 1
+    # The fresh span should NOT be one of the stale ones.
+    assert records[0].span_id != stale_records[0].span_id
+    assert records[0].span_id != stale_records[1].span_id
 
     provider.shutdown()
 
@@ -7525,30 +7476,27 @@ class TestStackLeakSafety:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-      TM.push_span(callback_context, "span-a")
-      TM.push_span(callback_context, "span-b")
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    TM.push_span(callback_context, "span-a")
+    TM.push_span(callback_context, "span-b")
 
-      records = list(bigquery_agent_analytics_plugin._span_records_ctx.get())
-      assert all(r.owns_span for r in records)
-      # No exported spans yet (the plugin never creates any).
-      assert exporter.get_finished_spans() == ()
+    records = list(bigquery_agent_analytics_plugin._span_records_ctx.get())
+    assert all(r.owns_span for r in records)
+    # No exported spans yet (the plugin never creates any).
+    assert exporter.get_finished_spans() == ()
 
-      TM.clear_stack()
+    TM.clear_stack()
 
-      # Stack must be empty after clear.
-      result = bigquery_agent_analytics_plugin._span_records_ctx.get()
-      assert result == []
+    # Stack must be empty after clear.
+    result = bigquery_agent_analytics_plugin._span_records_ctx.get()
+    assert result == []
 
-      # Still no exported spans — the duplicate-Cloud-Trace guard.
-      assert exporter.get_finished_spans() == (), (
-          "clear_stack() must not export OTel spans; any owned span"
-          " would surface as a duplicate in Cloud Trace alongside the"
-          " framework's real spans."
-      )
+    # Still no exported spans — the duplicate-Cloud-Trace guard.
+    assert exporter.get_finished_spans() == (), (
+        "clear_stack() must not export OTel spans; any owned span"
+        " would surface as a duplicate in Cloud Trace alongside the"
+        " framework's real spans."
+    )
 
     provider.shutdown()
 
@@ -7573,32 +7521,29 @@ class TestStackLeakSafety:
     provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
 
-      # No ambient span.
-      assert not trace.get_current_span().get_span_context().is_valid
+    # No ambient span.
+    assert not trace.get_current_span().get_span_context().is_valid
 
-      await bq_plugin_inst.before_run_callback(
-          invocation_context=invocation_context
-      )
-      # Push an agent span but DON'T pop it (simulate missing
-      # after_agent_callback due to exception).
-      await bq_plugin_inst.before_agent_callback(
-          agent=mock_agent, callback_context=callback_context
-      )
-      # Stack now has [invocation, agent].
+    await bq_plugin_inst.before_run_callback(
+        invocation_context=invocation_context
+    )
+    # Push an agent span but DON'T pop it (simulate missing
+    # after_agent_callback due to exception).
+    await bq_plugin_inst.before_agent_callback(
+        agent=mock_agent, callback_context=callback_context
+    )
+    # Stack now has [invocation, agent].
 
-      # after_run_callback should pop invocation + clear remaining.
-      await bq_plugin_inst.after_run_callback(
-          invocation_context=invocation_context
-      )
+    # after_run_callback should pop invocation + clear remaining.
+    await bq_plugin_inst.after_run_callback(
+        invocation_context=invocation_context
+    )
 
-      # Stack must be empty.
-      records = bigquery_agent_analytics_plugin._span_records_ctx.get()
-      assert records == []
+    # Stack must be empty.
+    records = bigquery_agent_analytics_plugin._span_records_ctx.get()
+    assert records == []
 
     provider.shutdown()
 
@@ -7624,41 +7569,38 @@ class TestStackLeakSafety:
     provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-      bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
 
-      # --- Incomplete invocation 1: no after_run_callback ---
-      await bq_plugin_inst.before_run_callback(
-          invocation_context=invocation_context
-      )
-      await bq_plugin_inst.before_agent_callback(
-          agent=mock_agent, callback_context=callback_context
-      )
-      # Skip after_agent and after_run — simulates exception.
+    # --- Incomplete invocation 1: no after_run_callback ---
+    await bq_plugin_inst.before_run_callback(
+        invocation_context=invocation_context
+    )
+    await bq_plugin_inst.before_agent_callback(
+        agent=mock_agent, callback_context=callback_context
+    )
+    # Skip after_agent and after_run — simulates exception.
 
-      stale = bigquery_agent_analytics_plugin._span_records_ctx.get()
-      assert len(stale) >= 2  # invocation + agent
+    stale = bigquery_agent_analytics_plugin._span_records_ctx.get()
+    assert len(stale) >= 2  # invocation + agent
 
-      # --- Invocation 2 with a different invocation_id ---
-      mock_write_client.append_rows.reset_mock()
-      inv_ctx_2 = InvocationContext(
-          agent=mock_agent,
-          session=mock_session,
-          invocation_id="inv-NEW-002",
-          session_service=invocation_context.session_service,
-          plugin_manager=invocation_context.plugin_manager,
-      )
-      await bq_plugin_inst.before_run_callback(invocation_context=inv_ctx_2)
+    # --- Invocation 2 with a different invocation_id ---
+    mock_write_client.append_rows.reset_mock()
+    inv_ctx_2 = InvocationContext(
+        agent=mock_agent,
+        session=mock_session,
+        invocation_id="inv-NEW-002",
+        session_service=invocation_context.session_service,
+        plugin_manager=invocation_context.plugin_manager,
+    )
+    await bq_plugin_inst.before_run_callback(invocation_context=inv_ctx_2)
 
-      records = bigquery_agent_analytics_plugin._span_records_ctx.get()
-      # Should have exactly 1 fresh invocation span.
-      assert len(records) == 1
+    records = bigquery_agent_analytics_plugin._span_records_ctx.get()
+    # Should have exactly 1 fresh invocation span.
+    assert len(records) == 1
 
-      # Cleanup
-      await bq_plugin_inst.after_run_callback(invocation_context=inv_ctx_2)
+    # Cleanup
+    await bq_plugin_inst.after_run_callback(invocation_context=inv_ctx_2)
 
     provider.shutdown()
 
@@ -7676,30 +7618,27 @@ class TestStackLeakSafety:
     provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-      bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
 
-      # First call: creates invocation span.
-      TM.ensure_invocation_span(callback_context)
-      records_after_first = list(
-          bigquery_agent_analytics_plugin._span_records_ctx.get()
-      )
-      assert len(records_after_first) == 1
-      first_span_id = records_after_first[0].span_id
+    # First call: creates invocation span.
+    TM.ensure_invocation_span(callback_context)
+    records_after_first = list(
+        bigquery_agent_analytics_plugin._span_records_ctx.get()
+    )
+    assert len(records_after_first) == 1
+    first_span_id = records_after_first[0].span_id
 
-      # Second call (same invocation): must be a no-op.
-      TM.ensure_invocation_span(callback_context)
-      records_after_second = (
-          bigquery_agent_analytics_plugin._span_records_ctx.get()
-      )
-      assert len(records_after_second) == 1
-      assert records_after_second[0].span_id == first_span_id
+    # Second call (same invocation): must be a no-op.
+    TM.ensure_invocation_span(callback_context)
+    records_after_second = (
+        bigquery_agent_analytics_plugin._span_records_ctx.get()
+    )
+    assert len(records_after_second) == 1
+    assert records_after_second[0].span_id == first_span_id
 
-      # Cleanup
-      TM.pop_span()
+    # Cleanup
+    TM.pop_span()
 
     provider.shutdown()
 
@@ -7728,47 +7667,42 @@ class TestStackLeakSafety:
     provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-      bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
 
-      # No ambient span.
-      assert not trace.get_current_span().get_span_context().is_valid
+    # No ambient span.
+    assert not trace.get_current_span().get_span_context().is_valid
 
-      user_msg = types.Content(parts=[types.Part(text="hello")], role="user")
-      await bq_plugin_inst.on_user_message_callback(
-          invocation_context=invocation_context,
-          user_message=user_msg,
-      )
-      await bq_plugin_inst.before_run_callback(
-          invocation_context=invocation_context
-      )
-      await bq_plugin_inst.before_agent_callback(
-          agent=mock_agent, callback_context=callback_context
-      )
-      await bq_plugin_inst.after_agent_callback(
-          agent=mock_agent, callback_context=callback_context
-      )
-      await bq_plugin_inst.after_run_callback(
-          invocation_context=invocation_context
-      )
-      await bq_plugin_inst.flush()
+    user_msg = types.Content(parts=[types.Part(text="hello")], role="user")
+    await bq_plugin_inst.on_user_message_callback(
+        invocation_context=invocation_context,
+        user_message=user_msg,
+    )
+    await bq_plugin_inst.before_run_callback(
+        invocation_context=invocation_context
+    )
+    await bq_plugin_inst.before_agent_callback(
+        agent=mock_agent, callback_context=callback_context
+    )
+    await bq_plugin_inst.after_agent_callback(
+        agent=mock_agent, callback_context=callback_context
+    )
+    await bq_plugin_inst.after_run_callback(
+        invocation_context=invocation_context
+    )
+    await bq_plugin_inst.flush()
 
-      rows = await _get_captured_rows_async(
-          mock_write_client, dummy_arrow_schema
-      )
-      event_types = [r["event_type"] for r in rows]
-      assert "USER_MESSAGE_RECEIVED" in event_types
-      assert "INVOCATION_STARTING" in event_types
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    event_types = [r["event_type"] for r in rows]
+    assert "USER_MESSAGE_RECEIVED" in event_types
+    assert "INVOCATION_STARTING" in event_types
 
-      # Every row must share the same trace_id.
-      trace_ids = {r["trace_id"] for r in rows}
-      assert len(trace_ids) == 1, (
-          "Expected 1 unique trace_id across all events, got"
-          f" {len(trace_ids)}: {trace_ids}"
-      )
+    # Every row must share the same trace_id.
+    trace_ids = {r["trace_id"] for r in rows}
+    assert len(trace_ids) == 1, (
+        "Expected 1 unique trace_id across all events, got"
+        f" {len(trace_ids)}: {trace_ids}"
+    )
 
     provider.shutdown()
 
@@ -7824,48 +7758,45 @@ class TestRootAgentNameAcrossInvocations:
           plugin_manager=mock_plugin_manager,
       )
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      # --- Invocation 1: root agent = "RootA" ---
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-      bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
-      bigquery_agent_analytics_plugin._root_agent_name_ctx.set(None)
+    # --- Invocation 1: root agent = "RootA" ---
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
+    bigquery_agent_analytics_plugin._root_agent_name_ctx.set(None)
 
-      inv1 = _make_inv_ctx("RootA", "inv-001")
-      cb1 = CallbackContext(inv1)
-      await bq_plugin_inst.before_run_callback(invocation_context=inv1)
-      await bq_plugin_inst.before_agent_callback(
-          agent=inv1.agent, callback_context=cb1
-      )
-      await bq_plugin_inst.after_agent_callback(
-          agent=inv1.agent, callback_context=cb1
-      )
-      await bq_plugin_inst.after_run_callback(invocation_context=inv1)
-      await bq_plugin_inst.flush()
+    inv1 = _make_inv_ctx("RootA", "inv-001")
+    cb1 = CallbackContext(inv1)
+    await bq_plugin_inst.before_run_callback(invocation_context=inv1)
+    await bq_plugin_inst.before_agent_callback(
+        agent=inv1.agent, callback_context=cb1
+    )
+    await bq_plugin_inst.after_agent_callback(
+        agent=inv1.agent, callback_context=cb1
+    )
+    await bq_plugin_inst.after_run_callback(invocation_context=inv1)
+    await bq_plugin_inst.flush()
 
-      rows_inv1 = await _get_captured_rows_async(
-          mock_write_client, dummy_arrow_schema
-      )
+    rows_inv1 = await _get_captured_rows_async(
+        mock_write_client, dummy_arrow_schema
+    )
 
-      # --- Invocation 2: root agent = "RootB" ---
-      mock_write_client.append_rows.reset_mock()
+    # --- Invocation 2: root agent = "RootB" ---
+    mock_write_client.append_rows.reset_mock()
 
-      inv2 = _make_inv_ctx("RootB", "inv-002")
-      cb2 = CallbackContext(inv2)
-      await bq_plugin_inst.before_run_callback(invocation_context=inv2)
-      await bq_plugin_inst.before_agent_callback(
-          agent=inv2.agent, callback_context=cb2
-      )
-      await bq_plugin_inst.after_agent_callback(
-          agent=inv2.agent, callback_context=cb2
-      )
-      await bq_plugin_inst.after_run_callback(invocation_context=inv2)
-      await bq_plugin_inst.flush()
+    inv2 = _make_inv_ctx("RootB", "inv-002")
+    cb2 = CallbackContext(inv2)
+    await bq_plugin_inst.before_run_callback(invocation_context=inv2)
+    await bq_plugin_inst.before_agent_callback(
+        agent=inv2.agent, callback_context=cb2
+    )
+    await bq_plugin_inst.after_agent_callback(
+        agent=inv2.agent, callback_context=cb2
+    )
+    await bq_plugin_inst.after_run_callback(invocation_context=inv2)
+    await bq_plugin_inst.flush()
 
-      rows_inv2 = await _get_captured_rows_async(
-          mock_write_client, dummy_arrow_schema
-      )
+    rows_inv2 = await _get_captured_rows_async(
+        mock_write_client, dummy_arrow_schema
+    )
 
     # Parse root_agent_name from the attributes JSON column.
     def _get_root_names(rows):
@@ -7910,48 +7841,44 @@ class TestAfterRunCleanupExceptionSafety:
     provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
     real_tracer = provider.get_tracer("test")
 
-    with mock.patch.object(
-        bigquery_agent_analytics_plugin, "tracer", real_tracer, create=True
-    ):
-      bigquery_agent_analytics_plugin._span_records_ctx.set(None)
-      bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
-      bigquery_agent_analytics_plugin._root_agent_name_ctx.set(None)
+    bigquery_agent_analytics_plugin._span_records_ctx.set(None)
+    bigquery_agent_analytics_plugin._active_invocation_id_ctx.set(None)
+    bigquery_agent_analytics_plugin._root_agent_name_ctx.set(None)
 
-      # Run a normal before_run to initialise state.
-      await bq_plugin_inst.before_run_callback(
+    # Run a normal before_run to initialise state.
+    await bq_plugin_inst.before_run_callback(
+        invocation_context=invocation_context
+    )
+    await bq_plugin_inst.before_agent_callback(
+        agent=mock_agent, callback_context=callback_context
+    )
+
+    # Verify state is populated.
+    assert bigquery_agent_analytics_plugin._span_records_ctx.get()
+    assert (
+        bigquery_agent_analytics_plugin._active_invocation_id_ctx.get()
+        is not None
+    )
+
+    # Make _log_event raise inside after_run_callback.
+    with mock.patch.object(
+        bq_plugin_inst,
+        "_log_event",
+        side_effect=RuntimeError("boom"),
+    ):
+      # _safe_callback swallows the exception, but cleanup in
+      # the finally block must still execute.
+      await bq_plugin_inst.after_run_callback(
           invocation_context=invocation_context
       )
-      await bq_plugin_inst.before_agent_callback(
-          agent=mock_agent, callback_context=callback_context
-      )
 
-      # Verify state is populated.
-      assert bigquery_agent_analytics_plugin._span_records_ctx.get()
-      assert (
-          bigquery_agent_analytics_plugin._active_invocation_id_ctx.get()
-          is not None
-      )
-
-      # Make _log_event raise inside after_run_callback.
-      with mock.patch.object(
-          bq_plugin_inst,
-          "_log_event",
-          side_effect=RuntimeError("boom"),
-      ):
-        # _safe_callback swallows the exception, but cleanup in
-        # the finally block must still execute.
-        await bq_plugin_inst.after_run_callback(
-            invocation_context=invocation_context
-        )
-
-      # All invocation state must be cleaned up despite the error.
-      records = bigquery_agent_analytics_plugin._span_records_ctx.get()
-      assert records == [] or records is None
-      assert (
-          bigquery_agent_analytics_plugin._active_invocation_id_ctx.get()
-          is None
-      )
-      assert bigquery_agent_analytics_plugin._root_agent_name_ctx.get() is None
+    # All invocation state must be cleaned up despite the error.
+    records = bigquery_agent_analytics_plugin._span_records_ctx.get()
+    assert records == [] or records is None
+    assert (
+        bigquery_agent_analytics_plugin._active_invocation_id_ctx.get() is None
+    )
+    assert bigquery_agent_analytics_plugin._root_agent_name_ctx.get() is None
 
     provider.shutdown()
 
@@ -9466,6 +9393,50 @@ class TestExactlyOnceDelivery:
     assert streams == [self._STREAM, self._STREAM, replacement]
     assert processor._next_offset == 1
     assert processor.get_drop_stats()["retry_exhausted"] == 2
+
+  @pytest.mark.asyncio
+  async def test_non_retryable_rejection_after_ambiguity_rotates_stream(
+      self, dummy_arrow_schema
+  ):
+    """A terminal rejection cannot make an earlier sent attempt safe."""
+    client = mock.MagicMock()
+    streams = []
+    calls = 0
+    replacement = self._STREAM.replace("committed-1", "committed-2")
+    create_stream = mock.AsyncMock(return_value=replacement)
+
+    async def append_rows(requests, **kwargs):
+      nonlocal calls
+      del kwargs
+      request = await anext(requests)
+      streams.append(request.write_stream)
+      calls += 1
+      if calls == 1:
+        raise asyncio.TimeoutError()
+      if calls == 2:
+        return _async_gen(self._response(7, "permission denied"))
+      if request.write_stream == self._STREAM:
+        if calls == 3:
+          raise asyncio.TimeoutError()
+        return _async_gen(self._response(6, "offset already exists"))
+      return _async_gen(self._response())
+
+    client.append_rows.side_effect = append_rows
+    client.finalize_write_stream = mock.AsyncMock()
+    processor = self._make_processor(
+        dummy_arrow_schema,
+        write_client=client,
+        create_stream=create_stream,
+        max_retries=1,
+    )
+
+    await processor._write_rows_with_retry([{"batch": "a"}])
+    await processor._write_rows_with_retry([{"batch": "b"}])
+
+    assert streams == [self._STREAM, self._STREAM, replacement]
+    assert processor._next_offset == 1
+    assert processor.get_drop_stats()["non_retryable"] == 1
+    create_stream.assert_awaited_once_with()
 
   @pytest.mark.asyncio
   @pytest.mark.parametrize("already_exists_in_band", [False, True])
