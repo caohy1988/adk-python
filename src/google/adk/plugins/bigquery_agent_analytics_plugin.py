@@ -68,6 +68,7 @@ import uuid
 import weakref
 
 from google.api_core import client_options
+from google.api_core import exceptions as api_exceptions
 from google.api_core.exceptions import InternalServerError
 from google.api_core.exceptions import ServiceUnavailable
 from google.api_core.exceptions import TooManyRequests
@@ -213,6 +214,9 @@ def _safe_callback(
 
 # gRPC Error Codes
 _GRPC_DEADLINE_EXCEEDED = 4
+_GRPC_NOT_FOUND = 5
+_GRPC_ALREADY_EXISTS = 6
+_GRPC_OUT_OF_RANGE = 11
 _GRPC_INTERNAL = 13
 _GRPC_UNAVAILABLE = 14
 
@@ -1710,6 +1714,7 @@ class BigQueryLoggerConfig:
       batch_flush_interval: Max time to wait before flushing a batch.
       shutdown_timeout: Max time to wait for shutdown.
       queue_max_size: Max size of the in-memory queue.
+      exactly_once_delivery: Opt into committed streams with explicit offsets.
       content_formatter: Optional custom formatter for content.
       gcs_bucket_name: GCS bucket for offloading large content.
       connection_id: BigQuery connection ID for ObjectRef columns.
@@ -1769,6 +1774,7 @@ class BigQueryLoggerConfig:
   batch_flush_interval: float = 1.0
   shutdown_timeout: float = 10.0
   queue_max_size: int = 10000
+  exactly_once_delivery: bool = False
   content_formatter: Optional[Callable[[Any, str], Any]] = None
   # If provided, large content (images, audio, video, large text) will be offloaded to this GCS bucket.
   gcs_bucket_name: Optional[str] = None
@@ -2183,6 +2189,8 @@ class BatchProcessor:
       retry_config: RetryConfig,
       queue_max_size: int,
       shutdown_timeout: float,
+      exactly_once_delivery: bool = False,
+      create_stream: Optional[Callable[[], Coroutine[Any, Any, str]]] = None,
   ):
     """Initializes the instance.
 
@@ -2195,6 +2203,8 @@ class BatchProcessor:
         retry_config: Retry configuration.
         queue_max_size: Max size of the in-memory queue.
         shutdown_timeout: Max time to wait for shutdown.
+        exactly_once_delivery: Whether to use committed-stream offsets.
+        create_stream: Async factory for replacement committed streams.
     """
     self.write_client = write_client
     self.arrow_schema = arrow_schema
@@ -2203,6 +2213,14 @@ class BatchProcessor:
     self.flush_interval = flush_interval
     self.retry_config = retry_config
     self.shutdown_timeout = shutdown_timeout
+    self.exactly_once_delivery = exactly_once_delivery
+    self._create_stream = create_stream
+    self._next_offset = 0
+    self._offset_desynced = False
+    self._rotation_retry_at = 0.0
+    self._stream_finalized = False
+    self._pending_finalize_streams: set[str] = set()
+    self._finalize_lock = asyncio.Lock()
 
     self._visual_builder = _is_visual_builder.get()
 
@@ -2230,6 +2248,7 @@ class BatchProcessor:
         "unexpected_error": 0,
         "shutdown_timeout": 0,
         "shutdown_cancelled": 0,
+        "offset_conflict": 0,
     }
 
   async def flush(self) -> None:
@@ -2274,6 +2293,8 @@ class BatchProcessor:
       ``shutdown_timeout``: rows still queued when shutdown timed out.
       ``shutdown_cancelled``: rows still queued when shutdown was
         cancelled from outside (e.g. a host close timeout).
+      ``offset_conflict``: a committed stream rejected its offset, or a
+        replacement stream could not be created before the next batch.
 
     Returns:
         A copy of the per-reason drop counters.
@@ -2427,14 +2448,99 @@ class BatchProcessor:
         else:
           break
 
+  async def _finalize_stream(self) -> None:
+    """Best-effort, idempotent finalization for the active committed stream."""
+    if not self.exactly_once_delivery:
+      return
+    async with self._finalize_lock:
+      streams = set(self._pending_finalize_streams)
+      if not self._stream_finalized:
+        streams.add(self.write_stream)
+      if not streams:
+        return
+      for stream_name in streams:
+        try:
+          await self.write_client.finalize_write_stream(name=stream_name)
+        except asyncio.CancelledError:
+          raise
+        except Exception as e:
+          # Keep failed names pending so a later shutdown/close can retry.
+          self._pending_finalize_streams.add(stream_name)
+          logger.warning(
+              "Could not finalize BigQuery committed stream %s: %s",
+              stream_name,
+              e,
+          )
+          continue
+        self._pending_finalize_streams.discard(stream_name)
+        if stream_name == self.write_stream:
+          self._stream_finalized = True
+
+  def _desync_stream(self) -> None:
+    """Prevents later batches from guessing the next committed offset."""
+    self._offset_desynced = True
+
+  def _confirm_committed_delivery(
+      self, offset: Optional[int], row_count: int
+  ) -> None:
+    """Advances a committed offset, or poisons an invalid local state."""
+    if offset is None:
+      logger.error(
+          "Committed-stream delivery was confirmed without a batch offset;"
+          " rotating the stream before the next batch."
+      )
+      self._desync_stream()
+      return
+    self._next_offset = offset + row_count
+
+  async def _ensure_writable_stream(self, row_count: int) -> bool:
+    """Rotates a desynchronized committed stream before another append."""
+    if not self.exactly_once_delivery or not self._offset_desynced:
+      return True
+    now = time.monotonic()
+    if self._create_stream is None or now < self._rotation_retry_at:
+      self._dropped["offset_conflict"] += row_count
+      return False
+
+    old_stream = self.write_stream
+    await self._finalize_stream()
+    if not self._stream_finalized:
+      self._pending_finalize_streams.add(old_stream)
+    try:
+      new_stream = await self._create_stream()
+    except asyncio.CancelledError:
+      raise
+    except Exception as e:
+      self._rotation_retry_at = now + 30.0
+      self._dropped["offset_conflict"] += row_count
+      logger.error(
+          "Could not replace desynchronized BigQuery stream %s; dropping %d"
+          " row(s): %s",
+          old_stream,
+          row_count,
+          e,
+      )
+      return False
+
+    self.write_stream = new_stream
+    self._next_offset = 0
+    self._offset_desynced = False
+    self._rotation_retry_at = 0.0
+    self._stream_finalized = False
+    return True
+
   async def _write_rows_with_retry(self, rows: list[dict[str, Any]]) -> None:
     """Writes a batch of rows to BigQuery with retry logic.
 
     Args:
         rows: list of row dictionaries to write.
     """
+    if not await self._ensure_writable_stream(len(rows)):
+      return
+
     attempt = 0
     delay = self.retry_config.initial_delay
+    offset_for_batch = self._next_offset if self.exactly_once_delivery else None
 
     try:
       arrow_batch = self._prepare_arrow_batch(rows)
@@ -2451,6 +2557,8 @@ class BatchProcessor:
           write_stream=self.write_stream,
           trace_id=f"{trace_id_prefix}/{__version__}",
       )
+      if offset_for_batch is not None:
+        req.offset = offset_for_batch
       req.arrow_rows.writer_schema.serialized_schema = serialized_schema
       req.arrow_rows.rows.serialized_record_batch = serialized_batch
     except Exception as e:
@@ -2465,12 +2573,17 @@ class BatchProcessor:
       return
 
     while attempt <= self.retry_config.max_retries:
+      request_sent = False
+      definitive_rejection = False
       try:
 
         async def requests_iter() -> AsyncIterator[Any]:
+          nonlocal request_sent
+          request_sent = True
           yield req
 
         async def perform_write() -> None:
+          nonlocal definitive_rejection
           # The AppendRows streaming RPC does not auto-populate the
           # request-routing header, so writes to any region other than
           # the US multiregion fail with a "session not found" /
@@ -2496,6 +2609,15 @@ class BatchProcessor:
                   error_code,
                   error_message,
               )
+              definitive_rejection = True
+              if self.exactly_once_delivery:
+                if error_code == _GRPC_ALREADY_EXISTS:
+                  self._confirm_committed_delivery(offset_for_batch, len(rows))
+                  return
+                if error_code in (_GRPC_NOT_FOUND, _GRPC_OUT_OF_RANGE):
+                  self._desync_stream()
+                  self._dropped["offset_conflict"] += len(rows)
+                  return
               if error_code in [
                   _GRPC_DEADLINE_EXCEEDED,
                   _GRPC_INTERNAL,
@@ -2521,11 +2643,37 @@ class BatchProcessor:
                 )
               self._dropped["non_retryable"] += len(rows)
               return
+            if self.exactly_once_delivery:
+              self._confirm_committed_delivery(offset_for_batch, len(rows))
+            return
+          # An empty response stream leaves the append outcome unknown.
+          if self.exactly_once_delivery:
+            raise asyncio.TimeoutError("BigQuery returned no append response")
           return
 
         await asyncio.wait_for(perform_write(), timeout=30.0)
         return
 
+      except api_exceptions.AlreadyExists as e:
+        if self.exactly_once_delivery:
+          self._confirm_committed_delivery(offset_for_batch, len(rows))
+          return
+        self._dropped["unexpected_error"] += len(rows)
+        logger.error("Unexpected BigQuery Write API error: %s", e)
+        return
+      except (api_exceptions.NotFound, api_exceptions.OutOfRange) as e:
+        if self.exactly_once_delivery:
+          self._desync_stream()
+          self._dropped["offset_conflict"] += len(rows)
+          logger.warning(
+              "BigQuery committed stream rejected offset %s: %s",
+              offset_for_batch,
+              e,
+          )
+          return
+        self._dropped["unexpected_error"] += len(rows)
+        logger.error("Unexpected BigQuery Write API error: %s", e)
+        return
       except (
           ServiceUnavailable,
           TooManyRequests,
@@ -2535,6 +2683,12 @@ class BatchProcessor:
         attempt += 1
         if attempt > self.retry_config.max_retries:
           self._dropped["retry_exhausted"] += len(rows)
+          if (
+              self.exactly_once_delivery
+              and request_sent
+              and not definitive_rejection
+          ):
+            self._desync_stream()
           logger.error(
               "BigQuery Batch Dropped after %s attempts. Last error: %s."
               " Total rows dropped (retry exhausted): %s",
@@ -2558,6 +2712,12 @@ class BatchProcessor:
         delay *= self.retry_config.multiplier
       except Exception as e:
         self._dropped["unexpected_error"] += len(rows)
+        if (
+            self.exactly_once_delivery
+            and request_sent
+            and not definitive_rejection
+        ):
+          self._desync_stream()
         logger.error(
             "Unexpected BigQuery Write API error (Dropping batch): %s."
             " Total rows dropped (unexpected error): %s",
@@ -2586,6 +2746,44 @@ class BatchProcessor:
     return drained
 
   async def shutdown(self, timeout: float = 5.0) -> None:
+    """Drains queued rows and finalizes an opt-in committed stream."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    try:
+      await self._shutdown_worker(timeout)
+    finally:
+      await self._finalize_stream_before(deadline)
+
+  async def _finalize_stream_before(self, deadline: float) -> None:
+    """Finalizes without exceeding the caller's remaining close budget."""
+    if not self.exactly_once_delivery:
+      return
+    if self._stream_finalized and not self._pending_finalize_streams:
+      return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+      logger.warning(
+          "No shutdown budget remained to finalize BigQuery committed stream"
+          " %s.",
+          self.write_stream,
+      )
+      return
+
+    finalize_task = asyncio.create_task(self._finalize_stream())
+    try:
+      await asyncio.wait_for(asyncio.shield(finalize_task), timeout=remaining)
+    except asyncio.TimeoutError:
+      finalize_task.cancel()
+      await asyncio.gather(finalize_task, return_exceptions=True)
+      logger.warning(
+          "Timed out finalizing BigQuery committed stream %s.",
+          self.write_stream,
+      )
+    except asyncio.CancelledError:
+      finalize_task.cancel()
+      await asyncio.gather(finalize_task, return_exceptions=True)
+      raise
+
+  async def _shutdown_worker(self, timeout: float = 5.0) -> None:
     """Shuts down the BatchProcessor, draining the queue.
 
     Args:
@@ -2661,6 +2859,14 @@ class BatchProcessor:
         logger.error("Error during BatchProcessor shutdown: %s", e)
 
   async def close(self) -> None:
+    """Closes queued work and finalizes an opt-in committed stream."""
+    deadline = time.monotonic() + max(0.0, self.shutdown_timeout)
+    try:
+      await self._close_worker()
+    finally:
+      await self._finalize_stream_before(deadline)
+
+  async def _close_worker(self) -> None:
     """Closes the processor and flushes remaining items."""
     if self._shutdown:
       return
@@ -4140,6 +4346,22 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     except Exception:
       logger.warning("Could not close a detached BigQuery write transport.")
 
+  async def _create_committed_write_stream(
+      self, write_client: BigQueryWriteAsyncClient
+  ) -> str:
+    """Creates one loop-local committed stream for offset-aware appends."""
+    parent = (
+        f"projects/{self.project_id}/datasets/{self.dataset_id}/tables/"
+        f"{self.table_id}"
+    )
+    stream = await write_client.create_write_stream(
+        parent=parent,
+        write_stream=bq_storage_types.WriteStream(
+            type_=bq_storage_types.WriteStream.Type.COMMITTED
+        ),
+    )
+    return stream.name
+
   async def _close_detached_loop_transport(self, state: _LoopState) -> None:
     """Best-effort bounded close for a terminal loop state's transport."""
     await self._close_write_transport(state.write_client)
@@ -4269,19 +4491,33 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           client_options=options,
       )
 
-      if not self._write_stream_name:
-        self._write_stream_name = f"projects/{self.project_id}/datasets/{self.dataset_id}/tables/{self.table_id}/_default"
-
       try:
+        if self.config.exactly_once_delivery:
+          write_stream_name = await self._create_committed_write_stream(
+              write_client
+          )
+        else:
+          if not self._write_stream_name:
+            self._write_stream_name = f"projects/{self.project_id}/datasets/{self.dataset_id}/tables/{self.table_id}/_default"
+          write_stream_name = self._write_stream_name
+
         batch_processor = BatchProcessor(
             write_client=write_client,
             arrow_schema=self.arrow_schema,
-            write_stream=self._write_stream_name,
+            write_stream=write_stream_name,
             batch_size=self.config.batch_size,
             flush_interval=self.config.batch_flush_interval,
             retry_config=self.config.retry_config,
             queue_max_size=self.config.queue_max_size,
             shutdown_timeout=self.config.shutdown_timeout,
+            exactly_once_delivery=self.config.exactly_once_delivery,
+            create_stream=(
+                functools.partial(
+                    self._create_committed_write_stream, write_client
+                )
+                if self.config.exactly_once_delivery
+                else None
+            ),
         )
       except BaseException:
         # The write client already exists but no _LoopState can own it yet.

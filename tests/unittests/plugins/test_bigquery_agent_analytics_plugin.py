@@ -40,6 +40,7 @@ from google.adk.tools import base_tool as base_tool_lib
 from google.adk.tools import tool_context as tool_context_lib
 from google.adk.utils._telemetry_context import _is_visual_builder
 from google.adk.version import __version__
+from google.api_core import exceptions as api_exceptions
 import google.auth
 from google.auth import exceptions as auth_exceptions
 import google.auth.credentials
@@ -9196,6 +9197,358 @@ class TestDropStats:
         project_id=PROJECT_ID, dataset_id=DATASET_ID, table_id=TABLE_ID
     )
     assert plugin.get_drop_stats() == {}
+
+
+class TestExactlyOnceDelivery:
+  """Tests the opt-in committed-stream offset protocol."""
+
+  _STREAM = (
+      f"projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}"
+      "/streams/committed-1"
+  )
+
+  def _make_processor(
+      self,
+      arrow_schema,
+      *,
+      write_client=None,
+      create_stream=None,
+      max_retries=0,
+  ):
+    write_client = write_client or mock.MagicMock()
+    processor = bigquery_agent_analytics_plugin.BatchProcessor(
+        write_client=write_client,
+        arrow_schema=arrow_schema,
+        write_stream=self._STREAM,
+        batch_size=2,
+        flush_interval=1.0,
+        retry_config=bigquery_agent_analytics_plugin.RetryConfig(
+            max_retries=max_retries,
+            initial_delay=0.0,
+            multiplier=1.0,
+            max_delay=0.0,
+        ),
+        queue_max_size=10,
+        shutdown_timeout=1.0,
+        exactly_once_delivery=True,
+        create_stream=create_stream,
+    )
+    fake_batch = mock.MagicMock()
+    fake_batch.serialize.return_value.to_pybytes.return_value = b"batch"
+    processor._prepare_arrow_batch = mock.MagicMock(return_value=fake_batch)
+    return processor
+
+  @staticmethod
+  def _response(code=0, message=""):
+    response = mock.MagicMock()
+    response.error.code = code
+    response.error.message = message
+    response.row_errors = []
+    return response
+
+  @pytest.mark.asyncio
+  async def test_default_mode_omits_offset(self, dummy_arrow_schema):
+    assert (
+        not bigquery_agent_analytics_plugin.BigQueryLoggerConfig().exactly_once_delivery
+    )
+    client = mock.MagicMock()
+    captured = []
+
+    async def append_rows(requests, **kwargs):
+      del kwargs
+      captured.extend([request async for request in requests])
+      return _async_gen(self._response())
+
+    client.append_rows.side_effect = append_rows
+    processor = TestDropStats()._make_processor(dummy_arrow_schema)
+    processor.write_client = client
+    TestDropStats()._stub_arrow_prep(processor)
+
+    await processor._write_rows_with_retry([{"a": 1}])
+
+    assert len(captured) == 1
+    assert not captured[0]._pb.HasField("offset")
+
+  @pytest.mark.asyncio
+  async def test_default_mode_keeps_empty_response_as_success(
+      self, dummy_arrow_schema
+  ):
+    client = mock.MagicMock()
+
+    async def empty_responses():
+      if False:
+        yield None
+
+    async def append_rows(requests, **kwargs):
+      del kwargs
+      await anext(requests)
+      return empty_responses()
+
+    client.append_rows.side_effect = append_rows
+    processor = TestDropStats()._make_processor(
+        dummy_arrow_schema,
+        retry_config=bigquery_agent_analytics_plugin.RetryConfig(
+            max_retries=1,
+            initial_delay=0.0,
+            multiplier=1.0,
+            max_delay=0.0,
+        ),
+    )
+    processor.write_client = client
+    TestDropStats()._stub_arrow_prep(processor)
+
+    await processor._write_rows_with_retry([{"a": 1}])
+
+    assert client.append_rows.call_count == 1
+    assert processor.dropped_event_count == 0
+
+  @pytest.mark.asyncio
+  async def test_exactly_once_empty_response_poison_stream(
+      self, dummy_arrow_schema
+  ):
+    client = mock.MagicMock()
+
+    async def empty_responses():
+      if False:
+        yield None
+
+    async def append_rows(requests, **kwargs):
+      del kwargs
+      await anext(requests)
+      return empty_responses()
+
+    client.append_rows.side_effect = append_rows
+    processor = self._make_processor(dummy_arrow_schema, write_client=client)
+
+    await processor._write_rows_with_retry([{"a": 1}])
+
+    assert client.append_rows.call_count == 1
+    assert processor.get_drop_stats()["retry_exhausted"] == 1
+    assert processor._offset_desynced
+
+  @pytest.mark.asyncio
+  async def test_offsets_advance_only_after_confirmed_batches(
+      self, dummy_arrow_schema
+  ):
+    client = mock.MagicMock()
+    offsets = []
+
+    async def append_rows(requests, **kwargs):
+      del kwargs
+      request = [request async for request in requests][0]
+      offsets.append(request.offset)
+      return _async_gen(self._response())
+
+    client.append_rows.side_effect = append_rows
+    processor = self._make_processor(dummy_arrow_schema, write_client=client)
+
+    await processor._write_rows_with_retry([{"a": 1}, {"a": 2}])
+    await processor._write_rows_with_retry([{"a": 3}])
+
+    assert offsets == [0, 2]
+    assert processor._next_offset == 3
+
+  @pytest.mark.asyncio
+  @pytest.mark.parametrize("already_exists_in_band", [False, True])
+  async def test_retry_reuses_offset_and_already_exists_confirms_delivery(
+      self, dummy_arrow_schema, already_exists_in_band
+  ):
+    client = mock.MagicMock()
+    offsets = []
+    calls = 0
+
+    async def append_rows(requests, **kwargs):
+      nonlocal calls
+      del kwargs
+      request = [request async for request in requests][0]
+      offsets.append(request.offset)
+      calls += 1
+      if calls == 1:
+        raise api_exceptions.ServiceUnavailable("retry")
+      if already_exists_in_band:
+        return _async_gen(self._response(6, "offset already exists"))
+      raise api_exceptions.AlreadyExists("offset already exists")
+
+    client.append_rows.side_effect = append_rows
+    processor = self._make_processor(
+        dummy_arrow_schema, write_client=client, max_retries=1
+    )
+
+    await processor._write_rows_with_retry([{"a": 1}, {"a": 2}])
+
+    assert offsets == [0, 0]
+    assert processor._next_offset == 2
+    assert processor.dropped_event_count == 0
+
+  @pytest.mark.asyncio
+  @pytest.mark.parametrize(
+      ("error", "code"),
+      [
+          (api_exceptions.NotFound("stream gone"), None),
+          (api_exceptions.OutOfRange("offset rejected"), None),
+          (None, 5),
+          (None, 11),
+      ],
+  )
+  async def test_offset_conflict_rotates_before_next_batch(
+      self, dummy_arrow_schema, error, code
+  ):
+    client = mock.MagicMock()
+    offsets = []
+    streams = []
+    calls = 0
+    replacement = self._STREAM.replace("committed-1", "committed-2")
+    create_stream = mock.AsyncMock(return_value=replacement)
+
+    async def append_rows(requests, **kwargs):
+      nonlocal calls
+      del kwargs
+      request = [request async for request in requests][0]
+      offsets.append(request.offset)
+      streams.append(request.write_stream)
+      calls += 1
+      if calls == 1:
+        if error is not None:
+          raise error
+        return _async_gen(self._response(code, "offset rejected"))
+      return _async_gen(self._response())
+
+    client.append_rows.side_effect = append_rows
+    client.finalize_write_stream = mock.AsyncMock()
+    processor = self._make_processor(
+        dummy_arrow_schema,
+        write_client=client,
+        create_stream=create_stream,
+    )
+
+    await processor._write_rows_with_retry([{"a": 1}])
+    await processor._write_rows_with_retry([{"a": 2}])
+
+    assert processor.get_drop_stats()["offset_conflict"] == 1
+    assert offsets == [0, 0]
+    assert streams == [self._STREAM, replacement]
+    create_stream.assert_awaited_once_with()
+    client.finalize_write_stream.assert_awaited_once_with(name=self._STREAM)
+
+  @pytest.mark.asyncio
+  async def test_ambiguous_exhaustion_poison_stream_and_rotates(
+      self, dummy_arrow_schema
+  ):
+    client = mock.MagicMock()
+    calls = 0
+    replacement = self._STREAM.replace("committed-1", "committed-2")
+    create_stream = mock.AsyncMock(return_value=replacement)
+
+    async def append_rows(requests, **kwargs):
+      nonlocal calls
+      del kwargs
+      await anext(requests)
+      calls += 1
+      if calls == 1:
+        raise asyncio.TimeoutError()
+      return _async_gen(self._response())
+
+    client.append_rows.side_effect = append_rows
+    client.finalize_write_stream = mock.AsyncMock()
+    processor = self._make_processor(
+        dummy_arrow_schema,
+        write_client=client,
+        create_stream=create_stream,
+    )
+
+    await processor._write_rows_with_retry([{"a": 1}])
+    await processor._write_rows_with_retry([{"a": 2}])
+
+    assert processor.get_drop_stats()["retry_exhausted"] == 1
+    assert processor._next_offset == 1
+    create_stream.assert_awaited_once_with()
+
+  @pytest.mark.asyncio
+  async def test_shutdown_finalizes_terminal_worker_and_retries_failure(
+      self, dummy_arrow_schema
+  ):
+    client = mock.MagicMock()
+    client.finalize_write_stream = mock.AsyncMock(
+        side_effect=[api_exceptions.ServiceUnavailable("try again"), None]
+    )
+    processor = self._make_processor(dummy_arrow_schema, write_client=client)
+    terminal_worker = asyncio.create_task(asyncio.sleep(0))
+    await terminal_worker
+    processor._batch_processor_task = terminal_worker
+
+    await processor.shutdown()
+    await processor.shutdown()
+
+    assert client.finalize_write_stream.await_count == 2
+
+  @pytest.mark.asyncio
+  @pytest.mark.parametrize("method", ["shutdown", "close"])
+  async def test_finalization_respects_remaining_close_budget(
+      self, dummy_arrow_schema, method
+  ):
+    client = mock.MagicMock()
+    finalize_started = asyncio.Event()
+    finalize_cancelled = asyncio.Event()
+
+    async def hang_during_finalize(**kwargs):
+      del kwargs
+      finalize_started.set()
+      try:
+        await asyncio.Event().wait()
+      except asyncio.CancelledError:
+        finalize_cancelled.set()
+        raise
+
+    client.finalize_write_stream = mock.AsyncMock(
+        side_effect=hang_during_finalize
+    )
+    processor = self._make_processor(dummy_arrow_schema, write_client=client)
+    processor.shutdown_timeout = 0.05
+    if method == "shutdown":
+      processor._batch_processor_task = asyncio.create_task(asyncio.sleep(0.03))
+
+    started_at = asyncio.get_running_loop().time()
+    if method == "shutdown":
+      await processor.shutdown(timeout=0.05)
+    else:
+      await processor.close()
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert elapsed < 0.2
+    assert finalize_started.is_set()
+    assert finalize_cancelled.is_set()
+
+  def test_missing_committed_offset_desynchronizes_without_assertion(
+      self, dummy_arrow_schema
+  ):
+    processor = self._make_processor(dummy_arrow_schema)
+
+    processor._confirm_committed_delivery(None, row_count=2)
+
+    assert processor._next_offset == 0
+    assert processor._offset_desynced
+
+  @pytest.mark.asyncio
+  async def test_plugin_creates_committed_stream(self):
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        project_id=PROJECT_ID,
+        dataset_id=DATASET_ID,
+        table_id=TABLE_ID,
+    )
+    client = mock.MagicMock()
+    client.create_write_stream = mock.AsyncMock(
+        return_value=mock.MagicMock(name=self._STREAM)
+    )
+    client.create_write_stream.return_value.name = self._STREAM
+
+    stream_name = await plugin._create_committed_write_stream(client)
+
+    assert stream_name == self._STREAM
+    kwargs = client.create_write_stream.await_args.kwargs
+    assert kwargs["parent"] == (
+        f"projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}"
+    )
+    assert kwargs["write_stream"].type_.name == "COMMITTED"
 
 
 # -----------------------------------------------------------------------------
