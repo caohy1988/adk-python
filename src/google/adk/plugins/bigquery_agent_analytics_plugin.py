@@ -1939,6 +1939,30 @@ def _record_workflow_node_observation(
         last_source_event_timestamp=event.timestamp,
     )
     segment.nodes[node_path] = observation
+  else:
+    observation.last_source_event_id = event.id
+    observation.last_source_event_timestamp = event.timestamp
+    observation.observed_event_count += 1
+
+  if event.long_running_tool_ids:
+    observation.node_interrupt_observed = True
+    for candidate in segment.nodes.values():
+      if node_path.startswith(candidate.node_path + "/"):
+        candidate.descendant_interrupt_observed = True
+
+  if any(
+      candidate.node_interrupt_observed
+      and candidate.node_path.startswith(node_path + "/")
+      for candidate in segment.nodes.values()
+  ):
+    observation.descendant_interrupt_observed = True
+
+  if (
+      event.partial is not True
+      and event.error_code
+      and event.error_code not in _LLM_RESPONSE_ERROR_CODES
+  ):
+    observation.node_error_observed_count += 1
 
   return segment, observation, is_first
 
@@ -6619,6 +6643,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
   ) -> None:
     """Logs state changes, HITL events, A2A interactions, and agent responses.
 
+    - Records path-bearing source events for workflow observation windows.
     - Checks each event for a non-empty state_delta and logs it as a
       STATE_DELTA event.
     - Detects synthetic ``adk_request_*`` function calls (HITL pause
@@ -6991,6 +7016,65 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         callback_ctx,
     )
 
+  async def _drain_workflow_node_observations(
+      self,
+      callback_context: CallbackContext,
+      *,
+      drain_callback: str,
+  ) -> None:
+    """Emits factual summaries for the current runner-call segment."""
+    segment = _workflow_observations_ctx.get()
+    if segment is None:
+      return
+
+    for observation in segment.nodes.values():
+      try:
+        await self._log_event(
+            "WORKFLOW_NODE_OBSERVATION_SUMMARY",
+            callback_context,
+            event_data=EventData(
+                adk_extras={
+                    "workflow_segment_id": segment.segment_id,
+                    "node": {
+                        "path": observation.node_path,
+                        "run_id": observation.node_run_id,
+                        "parent_run_id": observation.node_parent_run_id,
+                    },
+                    "first_source_event_id": (
+                        observation.first_source_event_id
+                    ),
+                    "last_source_event_id": observation.last_source_event_id,
+                    "first_source_event_timestamp": (
+                        observation.first_source_event_timestamp
+                    ),
+                    "last_source_event_timestamp": (
+                        observation.last_source_event_timestamp
+                    ),
+                    "source_event_span_ms": (
+                        observation.last_source_event_timestamp
+                        - observation.first_source_event_timestamp
+                    )
+                    * 1000.0,
+                    "observed_event_count": observation.observed_event_count,
+                    "node_interrupt_observed": (
+                        observation.node_interrupt_observed
+                    ),
+                    "descendant_interrupt_observed": (
+                        observation.descendant_interrupt_observed
+                    ),
+                    "node_error_observed_count": (
+                        observation.node_error_observed_count
+                    ),
+                    "drain_callback": drain_callback,
+                    "boundary_basis": "event_observation",
+                }
+            ),
+        )
+      except Exception:
+        logger.warning(
+            "Could not emit workflow-node observation summary; continuing."
+        )
+
   @_safe_callback
   async def after_run_callback(
       self, *, invocation_context: "InvocationContext"
@@ -7005,6 +7089,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # that INVOCATION_COMPLETED shares the same trace_id as all
       # earlier events in this invocation.
       callback_ctx = CallbackContext(invocation_context)
+      await self._drain_workflow_node_observations(
+          callback_ctx, drain_callback="after_run"
+      )
       trace_id = TraceManager.get_trace_id(callback_ctx)
 
       # Pop the invocation-root span pushed by ensure_invocation_span.
@@ -7024,6 +7111,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     finally:
       # Cleanup must run even if _log_event raises, otherwise
       # stale invocation metadata leaks into the next invocation.
+      _workflow_observations_ctx.set(None)
       TraceManager.clear_stack()
       _active_invocation_id_ctx.set(None)
       _root_agent_name_ctx.set(None)
@@ -7528,6 +7616,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     """
     try:
       callback_ctx = CallbackContext(invocation_context)
+      await self._drain_workflow_node_observations(
+          callback_ctx, drain_callback="on_run_error"
+      )
       trace_id = TraceManager.get_trace_id(callback_ctx)
 
       # Guarded pop: only consume the invocation-root span. If the failure
@@ -7557,6 +7648,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       )
     finally:
       # Cleanup must run even if _log_event raises.
+      _workflow_observations_ctx.set(None)
       TraceManager.clear_stack()
       _active_invocation_id_ctx.set(None)
       _root_agent_name_ctx.set(None)
