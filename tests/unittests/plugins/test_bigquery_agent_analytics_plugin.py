@@ -10414,6 +10414,16 @@ class TestC8ActionAttributes:
 class TestWorkflowNodeEvents:
   """Workflow node outputs and failures are observable through the plugin."""
 
+  @staticmethod
+  async def _start_observation_segment(plugin, invocation_context):
+    with mock.patch.object(plugin, "_log_event", new_callable=mock.AsyncMock):
+      await plugin.before_run_callback(invocation_context=invocation_context)
+
+  @staticmethod
+  async def _finish_observation_segment(plugin, invocation_context):
+    with mock.patch.object(plugin, "_log_event", new_callable=mock.AsyncMock):
+      await plugin.after_run_callback(invocation_context=invocation_context)
+
   @pytest.mark.asyncio
   @pytest.mark.parametrize("output", [{"id": 7}, ["a", "b"], "done"])
   async def test_node_output_preserves_payload_and_identity(
@@ -10492,21 +10502,19 @@ class TestWorkflowNodeEvents:
         node_info=event_lib.NodeInfo(path="wf@1/step@2"),
     )
 
+    await self._start_observation_segment(bq_plugin_inst, invocation_context)
     await bq_plugin_inst.on_event_callback(
         invocation_context=invocation_context, event=event
     )
     await bq_plugin_inst.flush()
 
     rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
-    node_event_types = [
-        row["event_type"]
-        for row in rows
-        if row["event_type"] in ("STATE_DELTA", "NODE_OUTPUT")
-    ]
-    assert node_event_types == [
+    assert [row["event_type"] for row in rows] == [
+        "WORKFLOW_NODE_FIRST_OBSERVED",
         "STATE_DELTA",
         "NODE_OUTPUT",
     ]
+    await self._finish_observation_segment(bq_plugin_inst, invocation_context)
 
   @pytest.mark.asyncio
   async def test_node_error_uses_sanitized_error_column(
@@ -10552,13 +10560,18 @@ class TestWorkflowNodeEvents:
         node_info=event_lib.NodeInfo(path="wf@1/step@2"),
     )
 
+    await self._start_observation_segment(bq_plugin_inst, invocation_context)
     await bq_plugin_inst.on_event_callback(
         invocation_context=invocation_context, event=event
     )
     await bq_plugin_inst.flush()
 
     rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert [row["event_type"] for row in rows] == [
+        "WORKFLOW_NODE_FIRST_OBSERVED"
+    ]
     assert all(row["event_type"] != "NODE_ERROR" for row in rows)
+    await self._finish_observation_segment(bq_plugin_inst, invocation_context)
 
   @pytest.mark.asyncio
   @pytest.mark.parametrize(
@@ -10590,13 +10603,18 @@ class TestWorkflowNodeEvents:
         node_info=event_lib.NodeInfo(path="wf@1/agent@2"),
     )
 
+    await self._start_observation_segment(bq_plugin_inst, invocation_context)
     await bq_plugin_inst.on_event_callback(
         invocation_context=invocation_context, event=event
     )
     await bq_plugin_inst.flush()
 
     rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    assert [row["event_type"] for row in rows] == [
+        "WORKFLOW_NODE_FIRST_OBSERVED"
+    ]
     assert all(row["event_type"] != "NODE_ERROR" for row in rows)
+    await self._finish_observation_segment(bq_plugin_inst, invocation_context)
 
   def test_model_termination_codes_match_enum_instances(self):
     """Enum-valued termination codes match the string-valued lookup set.
@@ -10659,21 +10677,19 @@ class TestWorkflowNodeEvents:
         node_info=event_lib.NodeInfo(path="wf@1/step@2"),
     )
 
+    await self._start_observation_segment(bq_plugin_inst, invocation_context)
     await bq_plugin_inst.on_event_callback(
         invocation_context=invocation_context, event=event
     )
     await bq_plugin_inst.flush()
 
     rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
-    node_event_types = [
-        row["event_type"]
-        for row in rows
-        if row["event_type"] in ("NODE_ERROR", "NODE_OUTPUT")
-    ]
-    assert node_event_types == [
+    assert [row["event_type"] for row in rows] == [
+        "WORKFLOW_NODE_FIRST_OBSERVED",
         "NODE_ERROR",
         "NODE_OUTPUT",
     ]
+    await self._finish_observation_segment(bq_plugin_inst, invocation_context)
 
   @pytest.mark.asyncio
   @pytest.mark.parametrize(
@@ -10721,6 +10737,151 @@ class TestWorkflowNodeObservations:
     return [
         call for call in log_event.await_args_list if call.args[0] == event_type
     ]
+
+  @pytest.mark.asyncio
+  async def test_disabled_plugin_does_not_install_or_mutate_segment(
+      self,
+      invocation_context,
+  ):
+    """Disabled callbacks leave task-local workflow observations untouched."""
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID,
+        DATASET_ID,
+        config=bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+            enabled=False
+        ),
+    )
+    event = event_lib.Event(
+        id="event-1",
+        author="step",
+        node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+    )
+    observations_ctx = (
+        bigquery_agent_analytics_plugin._workflow_observations_ctx
+    )
+    token = observations_ctx.set(None)
+    try:
+      await plugin.before_run_callback(invocation_context=invocation_context)
+      assert observations_ctx.get() is None
+
+      await plugin.on_event_callback(
+          invocation_context=invocation_context, event=event
+      )
+      assert observations_ctx.get() is None
+    finally:
+      observations_ctx.reset(token)
+      await plugin.shutdown()
+
+  @pytest.mark.asyncio
+  async def test_shutting_down_plugin_does_not_mutate_segment(
+      self,
+      bq_plugin_inst,
+      invocation_context,
+  ):
+    """Shutdown-raced path events do not change the active segment."""
+    observations_ctx = (
+        bigquery_agent_analytics_plugin._workflow_observations_ctx
+    )
+    token = observations_ctx.set(None)
+    try:
+      await bq_plugin_inst.before_run_callback(
+          invocation_context=invocation_context
+      )
+      segment = observations_ctx.get()
+      assert segment is not None
+
+      bq_plugin_inst._is_shutting_down = True
+      await bq_plugin_inst.on_event_callback(
+          invocation_context=invocation_context,
+          event=event_lib.Event(
+              id="event-1",
+              author="step",
+              node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+          ),
+      )
+      assert segment.nodes == {}
+    finally:
+      bq_plugin_inst._is_shutting_down = False
+      observations_ctx.reset(token)
+
+  @pytest.mark.asyncio
+  async def test_first_observed_failure_does_not_suppress_node_output(
+      self,
+      bq_plugin_inst,
+      invocation_context,
+      caplog,
+  ):
+    """A synthetic-row failure leaves the source event's telemetry intact."""
+    emitted = []
+
+    async def fail_first_observed(event_type, *args, **kwargs):
+      del args
+      emitted.append((event_type, kwargs))
+      if event_type == "WORKFLOW_NODE_FIRST_OBSERVED":
+        raise RuntimeError("private writer failure")
+
+    event = event_lib.Event(
+        id="event-1",
+        author="step",
+        output={"result": 1},
+        node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+    )
+    with mock.patch.object(
+        bq_plugin_inst, "_log_event", side_effect=fail_first_observed
+    ):
+      await bq_plugin_inst.before_run_callback(
+          invocation_context=invocation_context
+      )
+      with caplog.at_level("WARNING"):
+        await bq_plugin_inst.on_event_callback(
+            invocation_context=invocation_context, event=event
+        )
+
+    assert [event_type for event_type, _ in emitted] == [
+        "INVOCATION_STARTING",
+        "WORKFLOW_NODE_FIRST_OBSERVED",
+        "NODE_OUTPUT",
+    ]
+    node_output = emitted[-1][1]
+    assert node_output["raw_content"] == {"result": 1}
+    assert node_output["event_data"].source_event is event
+    assert any(
+        record.getMessage()
+        == "Could not emit workflow-node first-observed row; continuing."
+        for record in caplog.records
+    )
+    assert "private writer failure" not in caplog.text
+
+  @pytest.mark.asyncio
+  async def test_path_event_without_active_segment_is_not_observed(
+      self,
+      bq_plugin_inst,
+      invocation_context,
+  ):
+    """Only before_run_callback may establish an observation segment."""
+    observations_ctx = (
+        bigquery_agent_analytics_plugin._workflow_observations_ctx
+    )
+    token = observations_ctx.set(None)
+    try:
+      with mock.patch.object(
+          bq_plugin_inst, "_log_event", new_callable=mock.AsyncMock
+      ) as log_event:
+        await bq_plugin_inst.on_event_callback(
+            invocation_context=invocation_context,
+            event=event_lib.Event(
+                id="event-1",
+                author="step",
+                node_info=event_lib.NodeInfo(path="wf@1/step@2"),
+            ),
+        )
+
+      assert observations_ctx.get() is None
+      assert not self._captured_event_calls(
+          log_event, "WORKFLOW_NODE_FIRST_OBSERVED"
+      )
+    finally:
+      observations_ctx.reset(token)
 
   @pytest.mark.asyncio
   async def test_workflow_node_observation_first_path_event_emits_once(
@@ -10852,6 +11013,60 @@ class TestWorkflowNodeObservations:
     ]
     assert len(segment_ids) == 2
     assert segment_ids[0] != segment_ids[1]
+
+  @pytest.mark.asyncio
+  async def test_concurrent_callback_sequences_use_task_local_segments(
+      self,
+      bq_plugin_inst,
+      invocation_context,
+  ):
+    """Concurrent runner callbacks keep segment IDs and paths paired."""
+
+    async def observe(path, event_id):
+      await bq_plugin_inst.before_run_callback(
+          invocation_context=invocation_context
+      )
+      await asyncio.sleep(0)
+      await bq_plugin_inst.on_event_callback(
+          invocation_context=invocation_context,
+          event=event_lib.Event(
+              id=event_id,
+              author="step",
+              node_info=event_lib.NodeInfo(path=path),
+          ),
+      )
+      await asyncio.sleep(0)
+      await bq_plugin_inst.after_run_callback(
+          invocation_context=invocation_context
+      )
+
+    with mock.patch.object(
+        bq_plugin_inst, "_log_event", new_callable=mock.AsyncMock
+    ) as log_event:
+      await asyncio.gather(
+          observe("wf-a@1/step@2", "event-a"),
+          observe("wf-b@3/step@4", "event-b"),
+      )
+
+    first_segments = {
+        call.kwargs["event_data"].source_event.node_info.path: (
+            call.kwargs["event_data"].adk_extras["workflow_segment_id"]
+        )
+        for call in self._captured_event_calls(
+            log_event, "WORKFLOW_NODE_FIRST_OBSERVED"
+        )
+    }
+    summary_segments = {
+        call.kwargs["event_data"].adk_extras["node"]["path"]: (
+            call.kwargs["event_data"].adk_extras["workflow_segment_id"]
+        )
+        for call in self._captured_event_calls(
+            log_event, "WORKFLOW_NODE_OBSERVATION_SUMMARY"
+        )
+    }
+    assert first_segments == summary_segments
+    assert set(first_segments) == {"wf-a@1/step@2", "wf-b@3/step@4"}
+    assert len(set(first_segments.values())) == 2
 
   @pytest.mark.asyncio
   async def test_workflow_node_observation_summary_preserves_signed_span(
@@ -10988,6 +11203,49 @@ class TestWorkflowNodeObservations:
     assert summaries["wf@1/branch@2"]["descendant_interrupt_observed"]
     assert not summaries["wf@1/sibling@3"]["node_interrupt_observed"]
     assert not summaries["wf@1/sibling@3"]["descendant_interrupt_observed"]
+
+  @pytest.mark.asyncio
+  async def test_observed_ancestor_tracks_later_descendant_interrupt(
+      self,
+      bq_plugin_inst,
+      invocation_context,
+  ):
+    """An ancestor observed first records a later descendant interrupt."""
+    ancestor = event_lib.Event(
+        id="branch-1",
+        author="branch",
+        node_info=event_lib.NodeInfo(path="wf@1/branch@2"),
+    )
+    interrupted_leaf = event_lib.Event(
+        id="leaf-1",
+        author="leaf",
+        long_running_tool_ids={"call-1"},
+        node_info=event_lib.NodeInfo(path="wf@1/branch@2/leaf@4"),
+    )
+
+    with mock.patch.object(
+        bq_plugin_inst, "_log_event", new_callable=mock.AsyncMock
+    ) as log_event:
+      await bq_plugin_inst.before_run_callback(
+          invocation_context=invocation_context
+      )
+      for event in (ancestor, interrupted_leaf):
+        await bq_plugin_inst.on_event_callback(
+            invocation_context=invocation_context, event=event
+        )
+      await bq_plugin_inst.after_run_callback(
+          invocation_context=invocation_context
+      )
+
+    summaries = {
+        call.kwargs["event_data"].adk_extras["node"]["path"]: (
+            call.kwargs["event_data"].adk_extras
+        )
+        for call in self._captured_event_calls(
+            log_event, "WORKFLOW_NODE_OBSERVATION_SUMMARY"
+        )
+    }
+    assert summaries["wf@1/branch@2"]["descendant_interrupt_observed"] is True
 
   @pytest.mark.asyncio
   async def test_workflow_node_observation_summary_counts_node_errors(
@@ -11128,12 +11386,10 @@ class TestWorkflowNodeObservations:
       )
 
     assert (
-        len(
-            self._captured_event_calls(
-                log_event, "WORKFLOW_NODE_FIRST_OBSERVED"
-            )
-        )
-        == 1
+        bigquery_agent_analytics_plugin._workflow_observations_ctx.get() is None
+    )
+    assert not self._captured_event_calls(
+        log_event, "WORKFLOW_NODE_FIRST_OBSERVED"
     )
 
   @pytest.mark.asyncio

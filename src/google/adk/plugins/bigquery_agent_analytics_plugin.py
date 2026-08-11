@@ -1932,8 +1932,7 @@ def _record_workflow_node_observation(
 
   segment = _workflow_observations_ctx.get()
   if segment is None:
-    segment = _WorkflowObservationSegment(segment_id=str(uuid.uuid4()))
-    _workflow_observations_ctx.set(segment)
+    return None
 
   observation = segment.nodes.get(node_path)
   is_first = observation is None
@@ -6352,6 +6351,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       attributes["custom_metadata"] = safe
     return bool(truncated)
 
+  def _workflow_observations_enabled(self) -> bool:
+    """Returns whether callbacks may create or mutate observation state."""
+    return self.config.enabled and not self._is_shutting_down
+
   async def _log_event(
       self,
       event_type: str,
@@ -6744,22 +6747,29 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     if getattr(event, "partial", None) is not True:
       TraceManager.pop_span(expected_kind="llm_request")
 
-    workflow_observation = _record_workflow_node_observation(event)
+    workflow_observation = None
+    if self._workflow_observations_enabled():
+      workflow_observation = _record_workflow_node_observation(event)
     if workflow_observation is not None:
       segment, is_first = workflow_observation
       if is_first:
-        await self._log_event(
-            "WORKFLOW_NODE_FIRST_OBSERVED",
-            callback_ctx,
-            event_data=EventData(
-                source_event=event,
-                adk_extras={
-                    "workflow_segment_id": segment.segment_id,
-                    "boundary_basis": "event_observation",
-                    "source_event_timestamp": event.timestamp,
-                },
-            ),
-        )
+        try:
+          await self._log_event(
+              "WORKFLOW_NODE_FIRST_OBSERVED",
+              callback_ctx,
+              event_data=EventData(
+                  source_event=event,
+                  adk_extras={
+                      "workflow_segment_id": segment.segment_id,
+                      "boundary_basis": "event_observation",
+                      "source_event_timestamp": event.timestamp,
+                  },
+              ),
+          )
+        except Exception:
+          logger.warning(
+              "Could not emit workflow-node first-observed row; continuing."
+          )
 
     # --- State delta logging ---
     if event.actions.state_delta:
@@ -7070,9 +7080,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     Args:
         invocation_context: The context of the current invocation.
     """
-    _workflow_observations_ctx.set(
-        _WorkflowObservationSegment(segment_id=str(uuid.uuid4()))
-    )
+    if self._workflow_observations_enabled():
+      _workflow_observations_ctx.set(
+          _WorkflowObservationSegment(segment_id=str(uuid.uuid4()))
+      )
     await self._ensure_started()
     callback_ctx = CallbackContext(invocation_context)
     TraceManager.ensure_invocation_span(callback_ctx)
@@ -7088,6 +7099,8 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       drain_callback: str,
   ) -> None:
     """Emits factual summaries for the current runner-call segment."""
+    if not self._workflow_observations_enabled():
+      return
     segment = _workflow_observations_ctx.get()
     if segment is None:
       return
