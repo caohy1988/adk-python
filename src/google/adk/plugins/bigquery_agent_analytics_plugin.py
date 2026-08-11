@@ -1876,6 +1876,100 @@ _active_invocation_id_ctx: contextvars.ContextVar[Optional[str]] = (
 
 
 @dataclass
+class _WorkflowNodeObservation:
+  """Source-event facts observed for one workflow node in a segment."""
+
+  node_path: str
+  node_run_id: str
+  node_parent_run_id: str | None
+  first_source_event_id: str
+  last_source_event_id: str
+  first_source_event_timestamp: float
+  last_source_event_timestamp: float
+  observed_event_count: int = 1
+  node_interrupt_observed: bool = False
+  descendant_interrupt_observed: bool = False
+  node_error_observed_count: int = 0
+
+
+@dataclass
+class _WorkflowObservationSegment:
+  """Workflow observations scoped to one runner call."""
+
+  segment_id: str
+  nodes: dict[str, _WorkflowNodeObservation] = field(default_factory=dict)
+  interrupted_ancestor_paths: set[str] = field(default_factory=set)
+
+
+_workflow_observations_ctx: contextvars.ContextVar[
+    _WorkflowObservationSegment | None
+] = contextvars.ContextVar("_bq_analytics_workflow_observations", default=None)
+
+
+def _strict_ancestor_node_paths(node_path: str) -> tuple[str, ...]:
+  """Returns a node path's strict ancestors from root to parent."""
+  segments = node_path.split("/")
+  return tuple("/".join(segments[:end]) for end in range(1, len(segments)))
+
+
+def _is_durable_node_error(event: "Event") -> bool:
+  """Returns whether an event carries durable workflow-node error evidence."""
+  return (
+      event.partial is not True
+      and bool(event.error_code)
+      and event.error_code not in _LLM_RESPONSE_ERROR_CODES
+  )
+
+
+def _record_workflow_node_observation(
+    event: "Event",
+) -> tuple[_WorkflowObservationSegment, bool] | None:
+  """Records a path-bearing event and reports whether it was the first."""
+  node_info = getattr(event, "node_info", None)
+  node_path = getattr(node_info, "path", "")
+  if not node_path:
+    return None
+
+  segment = _workflow_observations_ctx.get()
+  if segment is None:
+    return None
+
+  observation = segment.nodes.get(node_path)
+  is_first = observation is None
+  if observation is None:
+    observation = _WorkflowNodeObservation(
+        node_path=node_path,
+        node_run_id=getattr(node_info, "run_id", ""),
+        node_parent_run_id=getattr(node_info, "parent_run_id", None),
+        first_source_event_id=event.id,
+        last_source_event_id=event.id,
+        first_source_event_timestamp=event.timestamp,
+        last_source_event_timestamp=event.timestamp,
+    )
+    segment.nodes[node_path] = observation
+  else:
+    observation.last_source_event_id = event.id
+    observation.last_source_event_timestamp = event.timestamp
+    observation.observed_event_count += 1
+
+  if event.long_running_tool_ids:
+    observation.node_interrupt_observed = True
+    ancestor_paths = _strict_ancestor_node_paths(node_path)
+    segment.interrupted_ancestor_paths.update(ancestor_paths)
+    for ancestor_path in ancestor_paths:
+      if ancestor := segment.nodes.get(ancestor_path):
+        ancestor.descendant_interrupt_observed = True
+
+  if node_path in segment.interrupted_ancestor_paths:
+    observation.descendant_interrupt_observed = True
+
+  if _is_durable_node_error(event):
+    observation.node_error_observed_count += 1
+
+  return segment, is_first
+
+
+@dataclass
 class _SpanRecord:
   """A single record on the BQAA plugin's internal span stack.
 
@@ -3864,6 +3958,12 @@ _VIEW_COMMON_COLUMNS = (
     "is_truncated",
 )
 
+_NODE_IDENTITY_VIEW_COLUMNS = (
+    "JSON_VALUE(attributes, '$.adk.node.path') AS node_path",
+    "JSON_VALUE(attributes, '$.adk.node.run_id') AS node_run_id",
+    "JSON_VALUE(attributes, '$.adk.node.parent_run_id') AS node_parent_run_id",
+)
+
 # Per-event-type column extractions.  Each value is a list of
 # ``"SQL_EXPR AS alias"`` strings that will be appended after the
 # common columns in the view SELECT.
@@ -4056,22 +4156,78 @@ _EVENT_VIEW_DEFS: dict[str, list[str]] = {
         "JSON_VALUE(attributes, '$.adk.function_call_id') AS function_call_id",
     ],
     "NODE_OUTPUT": [
-        "JSON_VALUE(attributes, '$.adk.node.path') AS node_path",
-        "JSON_VALUE(attributes, '$.adk.node.run_id') AS node_run_id",
-        (
-            "JSON_VALUE(attributes, '$.adk.node.parent_run_id')"
-            " AS node_parent_run_id"
-        ),
+        *_NODE_IDENTITY_VIEW_COLUMNS,
         "content AS output",
     ],
     "NODE_ERROR": [
-        "JSON_VALUE(attributes, '$.adk.node.path') AS node_path",
-        "JSON_VALUE(attributes, '$.adk.node.run_id') AS node_run_id",
-        (
-            "JSON_VALUE(attributes, '$.adk.node.parent_run_id')"
-            " AS node_parent_run_id"
-        ),
+        *_NODE_IDENTITY_VIEW_COLUMNS,
         "JSON_VALUE(content, '$.error_code') AS error_code",
+    ],
+    "WORKFLOW_NODE_FIRST_OBSERVED": [
+        "JSON_VALUE(attributes, '$.adk.app_name') AS app_name",
+        (
+            "JSON_VALUE(attributes, '$.adk.workflow_segment_id')"
+            " AS workflow_segment_id"
+        ),
+        *_NODE_IDENTITY_VIEW_COLUMNS,
+        "JSON_VALUE(attributes, '$.adk.source_event_id') AS source_event_id",
+        (
+            "TIMESTAMP_MICROS(CAST(SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.source_event_timestamp') AS FLOAT64) * 1000000"
+            " AS INT64)) AS source_event_timestamp"
+        ),
+        "JSON_VALUE(attributes, '$.adk.boundary_basis') AS boundary_basis",
+    ],
+    "WORKFLOW_NODE_OBSERVATION_SUMMARY": [
+        "JSON_VALUE(attributes, '$.adk.app_name') AS app_name",
+        (
+            "JSON_VALUE(attributes, '$.adk.workflow_segment_id')"
+            " AS workflow_segment_id"
+        ),
+        *_NODE_IDENTITY_VIEW_COLUMNS,
+        (
+            "JSON_VALUE(attributes, '$.adk.first_source_event_id')"
+            " AS first_source_event_id"
+        ),
+        (
+            "JSON_VALUE(attributes, '$.adk.last_source_event_id')"
+            " AS last_source_event_id"
+        ),
+        (
+            "TIMESTAMP_MICROS(CAST(SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.first_source_event_timestamp') AS FLOAT64) * 1000000"
+            " AS INT64)) AS first_source_event_timestamp"
+        ),
+        (
+            "TIMESTAMP_MICROS(CAST(SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.last_source_event_timestamp') AS FLOAT64) * 1000000"
+            " AS INT64)) AS last_source_event_timestamp"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes, '$.adk.source_event_span_ms')"
+            " AS FLOAT64) AS source_event_span_ms"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes, '$.adk.observed_event_count')"
+            " AS INT64) AS observed_event_count"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.node_interrupt_observed') AS BOOL)"
+            " AS node_interrupt_observed"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.descendant_interrupt_observed') AS BOOL)"
+            " AS descendant_interrupt_observed"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.node_error_observed_count') AS INT64)"
+            " AS node_error_observed_count"
+        ),
+        "JSON_VALUE(attributes, '$.adk.drain_callback') AS drain_callback",
+        "JSON_VALUE(attributes, '$.adk.boundary_basis') AS boundary_basis",
     ],
 }
 
@@ -6195,6 +6351,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       attributes["custom_metadata"] = safe
     return bool(truncated)
 
+  def _workflow_observations_enabled(self) -> bool:
+    """Returns whether callbacks may create or mutate observation state."""
+    return self.config.enabled and not self._is_shutting_down
+
   async def _log_event(
       self,
       event_type: str,
@@ -6551,6 +6711,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
   ) -> None:
     """Logs state changes, HITL events, A2A interactions, and agent responses.
 
+    - Records path-bearing source events for workflow observation windows.
     - Checks each event for a non-empty state_delta and logs it as a
       STATE_DELTA event.
     - Detects synthetic ``adk_request_*`` function calls (HITL pause
@@ -6586,6 +6747,30 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     if getattr(event, "partial", None) is not True:
       TraceManager.pop_span(expected_kind="llm_request")
 
+    workflow_observation = None
+    if self._workflow_observations_enabled():
+      workflow_observation = _record_workflow_node_observation(event)
+    if workflow_observation is not None:
+      segment, is_first = workflow_observation
+      if is_first:
+        try:
+          await self._log_event(
+              "WORKFLOW_NODE_FIRST_OBSERVED",
+              callback_ctx,
+              event_data=EventData(
+                  source_event=event,
+                  adk_extras={
+                      "workflow_segment_id": segment.segment_id,
+                      "boundary_basis": "event_observation",
+                      "source_event_timestamp": event.timestamp,
+                  },
+              ),
+          )
+        except Exception:
+          logger.warning(
+              "Could not emit workflow-node first-observed row; continuing."
+          )
+
     # --- State delta logging ---
     if event.actions.state_delta:
       await self._log_event(
@@ -6600,7 +6785,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     node_info = getattr(event, "node_info", None)
     node_path = getattr(node_info, "path", "")
     if node_path and event.partial is not True:
-      if event.error_code and event.error_code not in _LLM_RESPONSE_ERROR_CODES:
+      if _is_durable_node_error(event):
         await self._log_event(
             "NODE_ERROR",
             callback_ctx,
@@ -6895,6 +7080,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     Args:
         invocation_context: The context of the current invocation.
     """
+    if self._workflow_observations_enabled():
+      _workflow_observations_ctx.set(
+          _WorkflowObservationSegment(segment_id=str(uuid.uuid4()))
+      )
     await self._ensure_started()
     callback_ctx = CallbackContext(invocation_context)
     TraceManager.ensure_invocation_span(callback_ctx)
@@ -6902,6 +7091,67 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         "INVOCATION_STARTING",
         callback_ctx,
     )
+
+  async def _drain_workflow_node_observations(
+      self,
+      callback_context: CallbackContext,
+      *,
+      drain_callback: str,
+  ) -> None:
+    """Emits factual summaries for the current runner-call segment."""
+    if not self._workflow_observations_enabled():
+      return
+    segment = _workflow_observations_ctx.get()
+    if segment is None:
+      return
+
+    for observation in segment.nodes.values():
+      try:
+        await self._log_event(
+            "WORKFLOW_NODE_OBSERVATION_SUMMARY",
+            callback_context,
+            event_data=EventData(
+                adk_extras={
+                    "workflow_segment_id": segment.segment_id,
+                    "node": {
+                        "path": observation.node_path,
+                        "run_id": observation.node_run_id,
+                        "parent_run_id": observation.node_parent_run_id,
+                    },
+                    "first_source_event_id": observation.first_source_event_id,
+                    "last_source_event_id": observation.last_source_event_id,
+                    "first_source_event_timestamp": (
+                        observation.first_source_event_timestamp
+                    ),
+                    "last_source_event_timestamp": (
+                        observation.last_source_event_timestamp
+                    ),
+                    "source_event_span_ms": (
+                        (
+                            observation.last_source_event_timestamp
+                            - observation.first_source_event_timestamp
+                        )
+                        * 1000.0
+                    ),
+                    "observed_event_count": observation.observed_event_count,
+                    "node_interrupt_observed": (
+                        observation.node_interrupt_observed
+                    ),
+                    "descendant_interrupt_observed": (
+                        observation.descendant_interrupt_observed
+                    ),
+                    "node_error_observed_count": (
+                        observation.node_error_observed_count
+                    ),
+                    "drain_callback": drain_callback,
+                    "boundary_basis": "event_observation",
+                }
+            ),
+        )
+      except Exception:
+        logger.warning(
+            "Could not emit workflow-node observation summary; continuing."
+        )
 
   @_safe_callback
   async def after_run_callback(
@@ -6917,6 +7167,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # that INVOCATION_COMPLETED shares the same trace_id as all
       # earlier events in this invocation.
       callback_ctx = CallbackContext(invocation_context)
+      await self._drain_workflow_node_observations(
+          callback_ctx, drain_callback="after_run"
+      )
       trace_id = TraceManager.get_trace_id(callback_ctx)
 
       # Pop the invocation-root span pushed by ensure_invocation_span.
@@ -6936,6 +7189,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     finally:
       # Cleanup must run even if _log_event raises, otherwise
       # stale invocation metadata leaks into the next invocation.
+      _workflow_observations_ctx.set(None)
       TraceManager.clear_stack()
       _active_invocation_id_ctx.set(None)
       _root_agent_name_ctx.set(None)
@@ -7440,6 +7694,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     """
     try:
       callback_ctx = CallbackContext(invocation_context)
+      await self._drain_workflow_node_observations(
+          callback_ctx, drain_callback="on_run_error"
+      )
       trace_id = TraceManager.get_trace_id(callback_ctx)
 
       # Guarded pop: only consume the invocation-root span. If the failure
@@ -7469,6 +7726,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       )
     finally:
       # Cleanup must run even if _log_event raises.
+      _workflow_observations_ctx.set(None)
       TraceManager.clear_stack()
       _active_invocation_id_ctx.set(None)
       _root_agent_name_ctx.set(None)
