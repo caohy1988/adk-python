@@ -1876,6 +1876,74 @@ _active_invocation_id_ctx: contextvars.ContextVar[Optional[str]] = (
 
 
 @dataclass
+class _WorkflowNodeObservation:
+  """Source-event facts observed for one workflow node in a segment."""
+
+  node_path: str
+  node_run_id: str
+  node_parent_run_id: str | None
+  first_source_event_id: str
+  last_source_event_id: str
+  first_source_event_timestamp: float
+  last_source_event_timestamp: float
+  observed_event_count: int = 1
+  node_interrupt_observed: bool = False
+  descendant_interrupt_observed: bool = False
+  node_error_observed_count: int = 0
+
+
+@dataclass
+class _WorkflowObservationSegment:
+  """Workflow observations scoped to one runner call."""
+
+  segment_id: str
+  nodes: dict[str, _WorkflowNodeObservation] = field(default_factory=dict)
+
+
+_workflow_observations_ctx: contextvars.ContextVar[
+    _WorkflowObservationSegment | None
+] = contextvars.ContextVar(
+    "_bq_analytics_workflow_observations", default=None
+)
+
+
+def _record_workflow_node_observation(
+    event: "Event",
+) -> (
+    tuple[
+        _WorkflowObservationSegment, _WorkflowNodeObservation, bool
+    ]
+    | None
+):
+  """Records a path-bearing event and reports whether it was the first."""
+  node_info = getattr(event, "node_info", None)
+  node_path = getattr(node_info, "path", "")
+  if not node_path:
+    return None
+
+  segment = _workflow_observations_ctx.get()
+  if segment is None:
+    segment = _WorkflowObservationSegment(segment_id=str(uuid.uuid4()))
+    _workflow_observations_ctx.set(segment)
+
+  observation = segment.nodes.get(node_path)
+  is_first = observation is None
+  if observation is None:
+    observation = _WorkflowNodeObservation(
+        node_path=node_path,
+        node_run_id=getattr(node_info, "run_id", ""),
+        node_parent_run_id=getattr(node_info, "parent_run_id", None),
+        first_source_event_id=event.id,
+        last_source_event_id=event.id,
+        first_source_event_timestamp=event.timestamp,
+        last_source_event_timestamp=event.timestamp,
+    )
+    segment.nodes[node_path] = observation
+
+  return segment, observation, is_first
+
+
+@dataclass
 class _SpanRecord:
   """A single record on the BQAA plugin's internal span stack.
 
@@ -6586,6 +6654,23 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     if getattr(event, "partial", None) is not True:
       TraceManager.pop_span(expected_kind="llm_request")
 
+    workflow_observation = _record_workflow_node_observation(event)
+    if workflow_observation is not None:
+      segment, _, is_first = workflow_observation
+      if is_first:
+        await self._log_event(
+            "WORKFLOW_NODE_FIRST_OBSERVED",
+            callback_ctx,
+            event_data=EventData(
+                source_event=event,
+                adk_extras={
+                    "workflow_segment_id": segment.segment_id,
+                    "boundary_basis": "event_observation",
+                    "source_event_timestamp": event.timestamp,
+                },
+            ),
+        )
+
     # --- State delta logging ---
     if event.actions.state_delta:
       await self._log_event(
@@ -6895,6 +6980,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     Args:
         invocation_context: The context of the current invocation.
     """
+    _workflow_observations_ctx.set(
+        _WorkflowObservationSegment(segment_id=str(uuid.uuid4()))
+    )
     await self._ensure_started()
     callback_ctx = CallbackContext(invocation_context)
     TraceManager.ensure_invocation_span(callback_ctx)
