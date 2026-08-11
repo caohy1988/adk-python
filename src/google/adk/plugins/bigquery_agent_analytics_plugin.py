@@ -1898,23 +1898,32 @@ class _WorkflowObservationSegment:
 
   segment_id: str
   nodes: dict[str, _WorkflowNodeObservation] = field(default_factory=dict)
+  interrupted_ancestor_paths: set[str] = field(default_factory=set)
 
 
 _workflow_observations_ctx: contextvars.ContextVar[
     _WorkflowObservationSegment | None
-] = contextvars.ContextVar(
-    "_bq_analytics_workflow_observations", default=None
-)
+] = contextvars.ContextVar("_bq_analytics_workflow_observations", default=None)
+
+
+def _strict_ancestor_node_paths(node_path: str) -> tuple[str, ...]:
+  """Returns a node path's strict ancestors from root to parent."""
+  segments = node_path.split("/")
+  return tuple("/".join(segments[:end]) for end in range(1, len(segments)))
+
+
+def _is_durable_node_error(event: "Event") -> bool:
+  """Returns whether an event carries durable workflow-node error evidence."""
+  return (
+      event.partial is not True
+      and bool(event.error_code)
+      and event.error_code not in _LLM_RESPONSE_ERROR_CODES
+  )
 
 
 def _record_workflow_node_observation(
     event: "Event",
-) -> (
-    tuple[
-        _WorkflowObservationSegment, _WorkflowNodeObservation, bool
-    ]
-    | None
-):
+) -> tuple[_WorkflowObservationSegment, bool] | None:
   """Records a path-bearing event and reports whether it was the first."""
   node_info = getattr(event, "node_info", None)
   node_path = getattr(node_info, "path", "")
@@ -1946,25 +1955,19 @@ def _record_workflow_node_observation(
 
   if event.long_running_tool_ids:
     observation.node_interrupt_observed = True
-    for candidate in segment.nodes.values():
-      if node_path.startswith(candidate.node_path + "/"):
-        candidate.descendant_interrupt_observed = True
+    ancestor_paths = _strict_ancestor_node_paths(node_path)
+    segment.interrupted_ancestor_paths.update(ancestor_paths)
+    for ancestor_path in ancestor_paths:
+      if ancestor := segment.nodes.get(ancestor_path):
+        ancestor.descendant_interrupt_observed = True
 
-  if any(
-      candidate.node_interrupt_observed
-      and candidate.node_path.startswith(node_path + "/")
-      for candidate in segment.nodes.values()
-  ):
+  if node_path in segment.interrupted_ancestor_paths:
     observation.descendant_interrupt_observed = True
 
-  if (
-      event.partial is not True
-      and event.error_code
-      and event.error_code not in _LLM_RESPONSE_ERROR_CODES
-  ):
+  if _is_durable_node_error(event):
     observation.node_error_observed_count += 1
 
-  return segment, observation, is_first
+  return segment, is_first
 
 
 @dataclass
@@ -3956,6 +3959,12 @@ _VIEW_COMMON_COLUMNS = (
     "is_truncated",
 )
 
+_NODE_IDENTITY_VIEW_COLUMNS = (
+    "JSON_VALUE(attributes, '$.adk.node.path') AS node_path",
+    "JSON_VALUE(attributes, '$.adk.node.run_id') AS node_run_id",
+    "JSON_VALUE(attributes, '$.adk.node.parent_run_id') AS node_parent_run_id",
+)
+
 # Per-event-type column extractions.  Each value is a list of
 # ``"SQL_EXPR AS alias"`` strings that will be appended after the
 # common columns in the view SELECT.
@@ -4148,22 +4157,78 @@ _EVENT_VIEW_DEFS: dict[str, list[str]] = {
         "JSON_VALUE(attributes, '$.adk.function_call_id') AS function_call_id",
     ],
     "NODE_OUTPUT": [
-        "JSON_VALUE(attributes, '$.adk.node.path') AS node_path",
-        "JSON_VALUE(attributes, '$.adk.node.run_id') AS node_run_id",
-        (
-            "JSON_VALUE(attributes, '$.adk.node.parent_run_id')"
-            " AS node_parent_run_id"
-        ),
+        *_NODE_IDENTITY_VIEW_COLUMNS,
         "content AS output",
     ],
     "NODE_ERROR": [
-        "JSON_VALUE(attributes, '$.adk.node.path') AS node_path",
-        "JSON_VALUE(attributes, '$.adk.node.run_id') AS node_run_id",
-        (
-            "JSON_VALUE(attributes, '$.adk.node.parent_run_id')"
-            " AS node_parent_run_id"
-        ),
+        *_NODE_IDENTITY_VIEW_COLUMNS,
         "JSON_VALUE(content, '$.error_code') AS error_code",
+    ],
+    "WORKFLOW_NODE_FIRST_OBSERVED": [
+        "JSON_VALUE(attributes, '$.adk.app_name') AS app_name",
+        (
+            "JSON_VALUE(attributes, '$.adk.workflow_segment_id')"
+            " AS workflow_segment_id"
+        ),
+        *_NODE_IDENTITY_VIEW_COLUMNS,
+        "JSON_VALUE(attributes, '$.adk.source_event_id') AS source_event_id",
+        (
+            "TIMESTAMP_MICROS(CAST(SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.source_event_timestamp') AS FLOAT64) * 1000000"
+            " AS INT64)) AS source_event_timestamp"
+        ),
+        "JSON_VALUE(attributes, '$.adk.boundary_basis') AS boundary_basis",
+    ],
+    "WORKFLOW_NODE_OBSERVATION_SUMMARY": [
+        "JSON_VALUE(attributes, '$.adk.app_name') AS app_name",
+        (
+            "JSON_VALUE(attributes, '$.adk.workflow_segment_id')"
+            " AS workflow_segment_id"
+        ),
+        *_NODE_IDENTITY_VIEW_COLUMNS,
+        (
+            "JSON_VALUE(attributes, '$.adk.first_source_event_id')"
+            " AS first_source_event_id"
+        ),
+        (
+            "JSON_VALUE(attributes, '$.adk.last_source_event_id')"
+            " AS last_source_event_id"
+        ),
+        (
+            "TIMESTAMP_MICROS(CAST(SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.first_source_event_timestamp') AS FLOAT64) * 1000000"
+            " AS INT64)) AS first_source_event_timestamp"
+        ),
+        (
+            "TIMESTAMP_MICROS(CAST(SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.last_source_event_timestamp') AS FLOAT64) * 1000000"
+            " AS INT64)) AS last_source_event_timestamp"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes, '$.adk.source_event_span_ms')"
+            " AS FLOAT64) AS source_event_span_ms"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes, '$.adk.observed_event_count')"
+            " AS INT64) AS observed_event_count"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.node_interrupt_observed') AS BOOL)"
+            " AS node_interrupt_observed"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.descendant_interrupt_observed') AS BOOL)"
+            " AS descendant_interrupt_observed"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.adk.node_error_observed_count') AS INT64)"
+            " AS node_error_observed_count"
+        ),
+        "JSON_VALUE(attributes, '$.adk.drain_callback') AS drain_callback",
+        "JSON_VALUE(attributes, '$.adk.boundary_basis') AS boundary_basis",
     ],
 }
 
@@ -6681,7 +6746,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
     workflow_observation = _record_workflow_node_observation(event)
     if workflow_observation is not None:
-      segment, _, is_first = workflow_observation
+      segment, is_first = workflow_observation
       if is_first:
         await self._log_event(
             "WORKFLOW_NODE_FIRST_OBSERVED",
@@ -6710,7 +6775,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     node_info = getattr(event, "node_info", None)
     node_path = getattr(node_info, "path", "")
     if node_path and event.partial is not True:
-      if event.error_code and event.error_code not in _LLM_RESPONSE_ERROR_CODES:
+      if _is_durable_node_error(event):
         await self._log_event(
             "NODE_ERROR",
             callback_ctx,
@@ -7040,9 +7105,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
                         "run_id": observation.node_run_id,
                         "parent_run_id": observation.node_parent_run_id,
                     },
-                    "first_source_event_id": (
-                        observation.first_source_event_id
-                    ),
+                    "first_source_event_id": observation.first_source_event_id,
                     "last_source_event_id": observation.last_source_event_id,
                     "first_source_event_timestamp": (
                         observation.first_source_event_timestamp
@@ -7051,10 +7114,12 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
                         observation.last_source_event_timestamp
                     ),
                     "source_event_span_ms": (
-                        observation.last_source_event_timestamp
-                        - observation.first_source_event_timestamp
-                    )
-                    * 1000.0,
+                        (
+                            observation.last_source_event_timestamp
+                            - observation.first_source_event_timestamp
+                        )
+                        * 1000.0
+                    ),
                     "observed_event_count": observation.observed_event_count,
                     "node_interrupt_observed": (
                         observation.node_interrupt_observed

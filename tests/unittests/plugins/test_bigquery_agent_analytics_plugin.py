@@ -10093,9 +10093,8 @@ class TestAdkEnvelope:
         invocation_context=invocation_context, event=event
     )
     await bq_plugin_inst.flush()
-    log_entry = await _get_captured_event_dict_async(
-        mock_write_client, dummy_arrow_schema
-    )
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    log_entry = next(row for row in rows if row["event_type"] == "STATE_DELTA")
     adk = json.loads(log_entry["attributes"])["adk"]
     assert adk["node"]["path"] == "wf/A@1/B@2"
     assert adk["node"]["run_id"] == "2"
@@ -10720,9 +10719,7 @@ class TestWorkflowNodeObservations:
   @staticmethod
   def _captured_event_calls(log_event, event_type):
     return [
-        call
-        for call in log_event.await_args_list
-        if call.args[0] == event_type
+        call for call in log_event.await_args_list if call.args[0] == event_type
     ]
 
   @pytest.mark.asyncio
@@ -10738,9 +10735,7 @@ class TestWorkflowNodeObservations:
         author="step",
         node_info=event_lib.NodeInfo(path="wf@1/step@2"),
     )
-    second = first.model_copy(
-        update={"id": "event-2", "timestamp": 101.5}
-    )
+    second = first.model_copy(update={"id": "event-2", "timestamp": 101.5})
 
     with mock.patch.object(
         bq_plugin_inst, "_log_event", new_callable=mock.AsyncMock
@@ -10755,11 +10750,9 @@ class TestWorkflowNodeObservations:
           invocation_context=invocation_context, event=second
       )
 
-    first_rows = [
-        call
-        for call in log_event.await_args_list
-        if call.args[0] == "WORKFLOW_NODE_FIRST_OBSERVED"
-    ]
+    first_rows = self._captured_event_calls(
+        log_event, "WORKFLOW_NODE_FIRST_OBSERVED"
+    )
     assert len(first_rows) == 1
     event_data = first_rows[0].kwargs["event_data"]
     assert event_data.source_event is first
@@ -10814,11 +10807,9 @@ class TestWorkflowNodeObservations:
           invocation_context=invocation_context, event=event
       )
 
-    first_rows = [
-        call
-        for call in log_event.await_args_list
-        if call.args[0] == "WORKFLOW_NODE_FIRST_OBSERVED"
-    ]
+    first_rows = self._captured_event_calls(
+        log_event, "WORKFLOW_NODE_FIRST_OBSERVED"
+    )
     assert len(first_rows) == 1
     assert first_rows[0].kwargs["event_data"].source_event is event
 
@@ -10852,11 +10843,9 @@ class TestWorkflowNodeObservations:
           invocation_context=invocation_context, event=resumed
       )
 
-    first_rows = [
-        call
-        for call in log_event.await_args_list
-        if call.args[0] == "WORKFLOW_NODE_FIRST_OBSERVED"
-    ]
+    first_rows = self._captured_event_calls(
+        log_event, "WORKFLOW_NODE_FIRST_OBSERVED"
+    )
     segment_ids = [
         call.kwargs["event_data"].adk_extras["workflow_segment_id"]
         for call in first_rows
@@ -10877,9 +10866,7 @@ class TestWorkflowNodeObservations:
         author="step",
         node_info=event_lib.NodeInfo(path="wf@1/step@2"),
     )
-    second = first.model_copy(
-        update={"id": "event-2", "timestamp": 100.0}
-    )
+    second = first.model_copy(update={"id": "event-2", "timestamp": 100.0})
 
     with mock.patch.object(
         bq_plugin_inst, "_log_event", new_callable=mock.AsyncMock
@@ -10907,9 +10894,11 @@ class TestWorkflowNodeObservations:
     summary = self._captured_event_calls(
         log_event, "WORKFLOW_NODE_OBSERVATION_SUMMARY"
     )[0].kwargs["event_data"]
-    segment_id = self._captured_event_calls(
-        log_event, "WORKFLOW_NODE_FIRST_OBSERVED"
-    )[0].kwargs["event_data"].adk_extras["workflow_segment_id"]
+    segment_id = (
+        self._captured_event_calls(log_event, "WORKFLOW_NODE_FIRST_OBSERVED")[0]
+        .kwargs["event_data"]
+        .adk_extras["workflow_segment_id"]
+    )
     assert summary.source_event is None
     assert summary.adk_extras == {
         "workflow_segment_id": segment_id,
@@ -10986,23 +10975,19 @@ class TestWorkflowNodeObservations:
         "wf@1/sibling@3",
     ]
     summaries = {
-        call.kwargs["event_data"].adk_extras["node"]["path"]: call.kwargs[
-            "event_data"
-        ].adk_extras
+        call.kwargs["event_data"].adk_extras["node"]["path"]: (
+            call.kwargs["event_data"].adk_extras
+        )
         for call in summary_calls
     }
-    assert summaries["wf@1/branch@2/leaf@4"][
-        "node_interrupt_observed"
-    ]
+    assert summaries["wf@1/branch@2/leaf@4"]["node_interrupt_observed"]
     assert not summaries["wf@1/branch@2/leaf@4"][
         "descendant_interrupt_observed"
     ]
     assert not summaries["wf@1/branch@2"]["node_interrupt_observed"]
     assert summaries["wf@1/branch@2"]["descendant_interrupt_observed"]
     assert not summaries["wf@1/sibling@3"]["node_interrupt_observed"]
-    assert not summaries["wf@1/sibling@3"][
-        "descendant_interrupt_observed"
-    ]
+    assert not summaries["wf@1/sibling@3"]["descendant_interrupt_observed"]
 
   @pytest.mark.asyncio
   async def test_workflow_node_observation_summary_counts_node_errors(
@@ -11042,9 +11027,13 @@ class TestWorkflowNodeObservations:
           invocation_context=invocation_context
       )
 
-    extras = self._captured_event_calls(
-        log_event, "WORKFLOW_NODE_OBSERVATION_SUMMARY"
-    )[0].kwargs["event_data"].adk_extras
+    extras = (
+        self._captured_event_calls(
+            log_event, "WORKFLOW_NODE_OBSERVATION_SUMMARY"
+        )[0]
+        .kwargs["event_data"]
+        .adk_extras
+    )
     assert extras["node_error_observed_count"] == 1
     assert extras["observed_event_count"] == 2
     assert "workflow_node_status" not in extras
@@ -11082,9 +11071,13 @@ class TestWorkflowNodeObservations:
         "WORKFLOW_NODE_OBSERVATION_SUMMARY",
         "INVOCATION_ERROR",
     ]
-    extras = self._captured_event_calls(
-        log_event, "WORKFLOW_NODE_OBSERVATION_SUMMARY"
-    )[0].kwargs["event_data"].adk_extras
+    extras = (
+        self._captured_event_calls(
+            log_event, "WORKFLOW_NODE_OBSERVATION_SUMMARY"
+        )[0]
+        .kwargs["event_data"]
+        .adk_extras
+    )
     assert extras["drain_callback"] == "on_run_error"
     assert "workflow_node_status" not in extras
 
@@ -11134,11 +11127,14 @@ class TestWorkflowNodeObservations:
           event=event.model_copy(update={"id": "event-2"}),
       )
 
-    assert len(
-        self._captured_event_calls(
-            log_event, "WORKFLOW_NODE_FIRST_OBSERVED"
+    assert (
+        len(
+            self._captured_event_calls(
+                log_event, "WORKFLOW_NODE_FIRST_OBSERVED"
+            )
         )
-    ) == 1
+        == 1
+    )
 
   @pytest.mark.asyncio
   async def test_workflow_node_observation_summary_survives_row_filtering(
@@ -11149,9 +11145,7 @@ class TestWorkflowNodeObservations:
       dummy_arrow_schema,
   ):
     """Filtering FIRST_OBSERVED does not remove its source observation."""
-    bq_plugin_inst.config.event_denylist = [
-        "WORKFLOW_NODE_FIRST_OBSERVED"
-    ]
+    bq_plugin_inst.config.event_denylist = ["WORKFLOW_NODE_FIRST_OBSERVED"]
     event = event_lib.Event(
         id="event-1",
         author="step",
@@ -11185,6 +11179,63 @@ class TestWorkflowNodeObservations:
 class TestViewDefsRegistration:
   """The plugin's own per-event-type view defs cover the new types."""
 
+  def test_workflow_observation_view_first_observed_columns(self):
+    """FIRST_OBSERVED exposes pair keys and fractional source time."""
+    columns = "\n".join(
+        bigquery_agent_analytics_plugin._EVENT_VIEW_DEFS[
+            "WORKFLOW_NODE_FIRST_OBSERVED"
+        ]
+    )
+
+    for alias in (
+        "app_name",
+        "workflow_segment_id",
+        "node_path",
+        "node_run_id",
+        "node_parent_run_id",
+        "source_event_id",
+        "source_event_timestamp",
+        "boundary_basis",
+    ):
+      assert f" AS {alias}" in columns
+    assert "TIMESTAMP_MICROS" in columns
+    assert "AS FLOAT64" in columns
+    assert "TIMESTAMP_SECONDS" not in columns
+
+  def test_workflow_observation_view_summary_columns(self):
+    """The summary view types provenance, counts, spans, and evidence."""
+    columns = "\n".join(
+        bigquery_agent_analytics_plugin._EVENT_VIEW_DEFS[
+            "WORKFLOW_NODE_OBSERVATION_SUMMARY"
+        ]
+    )
+
+    for alias in (
+        "app_name",
+        "workflow_segment_id",
+        "node_path",
+        "node_run_id",
+        "node_parent_run_id",
+        "first_source_event_id",
+        "last_source_event_id",
+        "first_source_event_timestamp",
+        "last_source_event_timestamp",
+        "source_event_span_ms",
+        "observed_event_count",
+        "node_interrupt_observed",
+        "descendant_interrupt_observed",
+        "node_error_observed_count",
+        "drain_callback",
+        "boundary_basis",
+    ):
+      assert f" AS {alias}" in columns
+    assert columns.count("TIMESTAMP_MICROS") == 2
+    assert "AS FLOAT64) AS source_event_span_ms" in columns
+    assert "AS INT64) AS observed_event_count" in columns
+    assert "AS BOOL) AS node_interrupt_observed" in columns
+    assert "AS BOOL) AS descendant_interrupt_observed" in columns
+    assert "AS INT64) AS node_error_observed_count" in columns
+
   def test_new_event_types_registered_in_view_defs(self):
     defs = bigquery_agent_analytics_plugin._EVENT_VIEW_DEFS
     for event_type in (
@@ -11192,6 +11243,8 @@ class TestViewDefsRegistration:
         "EVENT_COMPACTION",
         "AGENT_STATE_CHECKPOINT",
         "TOOL_PAUSED",
+        "WORKFLOW_NODE_FIRST_OBSERVED",
+        "WORKFLOW_NODE_OBSERVATION_SUMMARY",
     ):
       assert event_type in defs, f"{event_type} missing from _EVENT_VIEW_DEFS"
       assert isinstance(defs[event_type], list)
