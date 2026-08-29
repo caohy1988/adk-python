@@ -1,0 +1,999 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Agent-authored typed Workflows — reference spike (RFC #93).
+
+A minimal, faithful implementation of the RFC's authoring layer:
+
+* ``WorkflowSpec`` — a plain ``kind``-tagged recursive union (a typed plan
+  vocabulary; not Pydantic's discriminated union — see the SpecNode note).
+* ``CapabilityRegistry`` — the closed set of agents/tools a plan may compose.
+* ``WorkflowSpecValidator`` — semantic validation (capability refs, binding
+  scope, list/loop/branch rules) + an open-map output-schema warning.
+* ``SpecInterpreter`` — executes a validated spec on the real ADK Workflow
+  engine via the #92 ``DynamicNodeSupervisor`` (step / fan_out / pipeline /
+  branch / loop_until).
+* ``FrozenWorkflowRecord`` / ``export_plan`` / ``import_plan`` — the frozen spec
+  as a first-class, portable artifact (DESIGN.md §10): export to a JSON
+  envelope; import recomputes the hash and re-validates against the *current*
+  registry, never trusting the envelope's own ``validation``.
+
+This is a demand-gate artifact, not production code. See README.md.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+from typing import Any
+from typing import Literal
+from typing import Optional
+from typing import Union
+
+from pydantic import BaseModel
+from pydantic import Field
+from pydantic import model_validator
+
+# The #92 supervisor lives in a sibling sample dir.
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "dynamic_supervisor_spike",
+    ),
+)
+from supervisor import DynamicNodeSupervisor  # noqa: E402
+
+
+# ----------------------------------------------------------------- WorkflowSpec
+class Binding(BaseModel):
+  """The only way a node sources input: a source + optional dotted path."""
+
+  source: Literal["task", "step"]
+  step: Optional[str] = None
+  path: Optional[str] = None
+
+  @model_validator(mode="after")
+  def _invariant(self):
+    if (self.source == "step") != (self.step is not None):
+      raise ValueError("source=='step' iff `step` is set")
+    return self
+
+
+class StepRef(BaseModel):
+  kind: Literal["step"]
+  id: str
+  capability: str
+  input: Binding
+
+
+class FanOut(BaseModel):
+  kind: Literal["fan_out"]
+  id: str
+  over: Binding
+  capability: str
+  collect: Literal["list"] = "list"
+
+
+class PipelineStage(BaseModel):
+  capability: str  # registered; takes an item
+  input: Binding | None = (
+      None  # defaults to the previous stage's per-item output
+  )
+
+
+class Pipeline(BaseModel):
+  # Barrier-free per-item multi-stage flow: each item runs through ALL stages
+  # via #92 ctx.pipeline (item A can be in stage k while item B is in stage 1) —
+  # NOT two barriered fan_outs. Compiles to DynamicNodeSupervisor.pipeline.
+  kind: Literal["pipeline"]
+  id: str
+  over: Binding  # MUST resolve to a list
+  stages: list[PipelineStage]
+  collect: Literal["list"] = "list"
+
+
+class Route(BaseModel):
+  value: str
+  block: list["SpecNode"]
+
+
+class Branch(BaseModel):
+  kind: Literal["branch"]
+  id: str
+  on: Binding
+  # Enumerated LIST of routes, NOT an open dict[str, ...] map: open maps are a
+  # structured-output reliability hazard (the model leaves them empty). The
+  # spike's branch shape exposed exactly this — see README.
+  routes: list[Route]
+  unmatched: Literal["fail"] = "fail"
+
+
+class LoopUntil(BaseModel):
+  kind: Literal["loop_until"]
+  id: str
+  body: list["SpecNode"]
+  until_capability: str
+  until_input: Binding
+  max_iters: int = Field(ge=1)
+  # Loop-carried state (optional): seeds the value a body step reads when it
+  # binds the loop's OWN id; after each iteration the carried value becomes the
+  # body's last-node output. Surfaced by the pattern-coverage sweep: a
+  # tournament (pairs recomputed each round from the prior round's winners)
+  # is inexpressible without it — every other accumulate-and-refine loop too.
+  init: Optional[Binding] = None
+
+
+# NOTE: a PLAIN union, not Pydantic's Field(discriminator="kind"). The discriminated
+# form emits a JSON schema with a `discriminator` keyword that genai's response_schema
+# rejects (Schema: extra_forbidden — verified on gemini-3.5-flash). Each member still
+# carries a `kind` Literal, so this is a structurally-tagged union: unambiguous to parse
+# and to switch on, AND accepted as a Gemini response_schema.
+SpecNode = Union[StepRef, FanOut, Pipeline, Branch, LoopUntil]
+
+
+class WorkflowSpec(BaseModel):
+  goal: str
+  steps: list[SpecNode]
+  output: Binding
+
+
+for _m in (
+    StepRef,
+    FanOut,
+    PipelineStage,
+    Pipeline,
+    Branch,
+    Route,
+    LoopUntil,
+    WorkflowSpec,
+):
+  _m.model_rebuild()
+
+
+# ----------------------------------------------------------------- registry
+class Capability(BaseModel):
+  """A registered capability the planner may compose by name."""
+
+  model_config = {"arbitrary_types_allowed": True}
+
+  name: str
+  build: Any  # () -> NodeLike  (an ADK Agent, or a deterministic @node fn)
+  input_kind: Literal["item", "list"]
+  output_model: Optional[type[BaseModel]] = None
+  serialize_input: bool = (
+      True  # json.dumps the node_input (True for LLM agents)
+  )
+  max_fan_out: int = 100
+  side_effect: bool = False
+  version: str = "1"  # manual bump — a coarse SECONDARY drift signal only
+  # Lint policy: same-capability chains (draft -> critique own draft ->
+  # redraft) are legitimate refinement for some capabilities; opting in here
+  # suppresses the self-review lint for this capability.
+  allow_self_chain: bool = False
+
+  def contract_hash(self) -> str:
+    """Derived drift signal — sha256 over the capability's declared contract.
+
+    Manual version strings don't get bumped when someone tweaks a schema; the
+    contract hash changes automatically, so drift detection on import does
+    not rely on developer discipline.
+    """
+    schema = (
+        None
+        if self.output_model is None
+        else self.output_model.model_json_schema()
+    )
+    return sha256_hex({"input_kind": self.input_kind, "output_schema": schema})
+
+
+class CapabilityRegistry:
+
+  def __init__(self, capabilities: list[Capability], *, version: str = "1"):
+    self._by_name = {c.name: c for c in capabilities}
+    self.version = version  # registry_version (coarse drift signal)
+
+  def __contains__(self, name):
+    return name in self._by_name
+
+  def __getitem__(self, name):
+    return self._by_name[name]
+
+  def names(self) -> list[str]:
+    return list(self._by_name)
+
+  def capability_versions(
+      self, only: Optional[set[str]] = None
+  ) -> dict[str, str]:
+    """name -> MANUAL version (coarse secondary drift signal)."""
+    return {
+        n: c.version
+        for n, c in self._by_name.items()
+        if only is None or n in only
+    }
+
+  def capability_contract_hashes(
+      self, only: Optional[set[str]] = None
+  ) -> dict[str, str]:
+    """name -> DERIVED contract hash (the primary drift signal on import)."""
+    return {
+        n: c.contract_hash()
+        for n, c in self._by_name.items()
+        if only is None or n in only
+    }
+
+  def open_map_warnings(self) -> list[str]:
+    """Spike lesson: open-ended dict[str, X] output fields are a structured-
+    output reliability hazard (Gemini fills them unreliably). Warn on them."""
+    warnings = []
+    for cap in self._by_name.values():
+      model = cap.output_model
+      if model is None:
+        continue
+      for fname, field in model.model_fields.items():
+        ann = str(field.annotation)
+        if "dict[" in ann.replace(" ", "") and "int]" not in ann.lower()[:0]:
+          if ann.replace(" ", "").startswith(
+              "dict[str,"
+          ) or "dict[str," in ann.replace(" ", ""):
+            warnings.append(
+                f"capability '{cap.name}': output field '{fname}' is an open"
+                f" map ({ann}); prefer enumerated fields for reliable"
+                " structured output"
+            )
+    return warnings
+
+
+# ----------------------------------------------------------------- validator
+class SpecValidationError(Exception):
+  pass
+
+
+class WorkflowSpecValidator:
+
+  def __init__(self, registry: CapabilityRegistry):
+    self.registry = registry
+
+  def validate(
+      self,
+      spec: WorkflowSpec,
+      *,
+      lint_waivers: Optional[dict[str, str]] = None,
+  ) -> list[str]:
+    """Raises SpecValidationError on a hard error; returns soft warnings.
+
+    `lint_waivers` (node id -> justification) suppresses plan-quality lints
+    for the named nodes; record waivers in the FrozenWorkflowRecord so the
+    suppression itself is auditable.
+    """
+    ids: set[str] = set()
+    self._walk(spec.steps, set(), ids)
+    if spec.output.source == "step" and spec.output.step not in ids:
+      raise SpecValidationError(
+          f"output references unknown step {spec.output.step!r}"
+      )
+    return self.registry.open_map_warnings() + self.quality_lints(
+        spec, lint_waivers=lint_waivers
+    )
+
+  def quality_lints(
+      self,
+      spec: WorkflowSpec,
+      *,
+      lint_waivers: Optional[dict[str, str]] = None,
+  ) -> list[str]:
+    """Plan-quality lints (soft warnings, never hard errors).
+
+    Multi-agent quality rests on isolation: it is what mitigates
+    self-preferential bias (an agent grading its own output) and goal drift.
+    Typed bindings make two such properties STATICALLY checkable — something
+    model-authored orchestration *code* cannot offer:
+
+    * self-review: a node consuming output produced by the SAME capability
+      cannot provide independent verification;
+    * unsynthesized fan-out: a plan whose terminal output is a bare per-item
+      fan_out never combined or verified by a downstream capability.
+
+    Suppression (so the lints stay credible instead of globally disabled):
+    a capability registered with `allow_self_chain=True` opts out of the
+    self-review lint (legitimate draft -> critique -> redraft refinement);
+    `lint_waivers` suppresses lints for specific node ids per plan.
+    """
+    waivers = lint_waivers or {}
+    lints: list[str] = []
+    producer_cap: dict[str, str] = {}  # node id -> capability producing output
+    consumed: set[str] = set()  # step ids some other node reads from
+
+    def walk(nodes):
+      for n in nodes:
+        if isinstance(n, (StepRef, FanOut)):
+          producer_cap[n.id] = n.capability
+        elif isinstance(n, Pipeline):
+          producer_cap[n.id] = n.stages[-1].capability if n.stages else ""
+        for b in _bindings(n):
+          if b.source == "step":
+            consumed.add(b.step)
+        if isinstance(n, Pipeline):
+          for prev, st in zip(n.stages, n.stages[1:]):
+            if st.input is not None and st.input.source == "step":
+              consumed.add(st.input.step)
+            if (
+                st.capability == prev.capability
+                and st.input is None
+                and n.id not in waivers
+                and not (
+                    st.capability in self.registry
+                    and self.registry[st.capability].allow_self_chain
+                )
+            ):
+              lints.append(
+                  f"plan-quality: pipeline {n.id!r} stage"
+                  f" {st.capability!r} re-checks its own capability's output —"
+                  " same-capability review cannot provide independent"
+                  " verification (self-preferential bias)"
+              )
+        if isinstance(n, Branch):
+          for route in n.routes:
+            walk(route.block)
+        if isinstance(n, LoopUntil):
+          walk(n.body)
+
+    walk(spec.steps)
+
+    def walk_consumers(nodes):
+      for n in nodes:
+        my_cap = getattr(n, "capability", None)
+        b = getattr(n, "input", None) or getattr(n, "over", None)
+        if (
+            my_cap
+            and isinstance(b, Binding)
+            and b.source == "step"
+            and producer_cap.get(b.step) == my_cap
+            and n.id not in waivers
+            and not (
+                my_cap in self.registry
+                and self.registry[my_cap].allow_self_chain
+            )
+        ):
+          lints.append(
+              f"plan-quality: {n.id!r} consumes the output of {b.step!r} via"
+              f" the same capability {my_cap!r} — same-capability review"
+              " cannot provide independent verification (self-preferential"
+              " bias)"
+          )
+        for route in getattr(n, "routes", None) or []:
+          walk_consumers(route.block)
+        if getattr(n, "body", None):
+          walk_consumers(n.body)
+
+    walk_consumers(spec.steps)
+
+    if spec.output.source == "step":
+      terminal = spec.output.step
+
+      def find(nodes):
+        for n in nodes:
+          if n.id == terminal:
+            return n
+          for route in getattr(n, "routes", None) or []:
+            hit = find(route.block)
+            if hit is not None:
+              return hit
+          if getattr(n, "body", None):
+            hit = find(n.body)
+            if hit is not None:
+              return hit
+        return None
+
+      node_ = find(spec.steps)
+      if (
+          isinstance(node_, FanOut)
+          and terminal not in consumed
+          and terminal not in waivers
+      ):
+        lints.append(
+            f"plan-quality: output binds directly to fan_out {terminal!r}"
+            " with no downstream synthesis or verification step — parallel"
+            " findings are never combined or independently checked"
+        )
+    return lints
+
+  def _walk(self, nodes, preceding: set[str], ids: set[str]) -> set[str]:
+    preceding = set(preceding)
+    for n in nodes:
+      if n.id in ids:
+        raise SpecValidationError(f"duplicate id {n.id!r}")
+      ids.add(n.id)
+      if isinstance(n, (StepRef, FanOut)) and n.capability not in self.registry:
+        raise SpecValidationError(f"unknown capability {n.capability!r}")
+      if isinstance(n, LoopUntil) and n.until_capability not in self.registry:
+        raise SpecValidationError(
+            f"unknown until_capability {n.until_capability!r}"
+        )
+      # Entry bindings (input/over/on/init) reference a PRIOR step on this path.
+      for f in ("input", "over", "on", "init"):
+        b = getattr(n, f, None)
+        if (
+            isinstance(b, Binding)
+            and b.source == "step"
+            and b.step not in preceding
+        ):
+          raise SpecValidationError(
+              f"{n.id}: binding references non-preceding step {b.step!r}"
+          )
+      if (
+          isinstance(n, FanOut)
+          and self.registry[n.capability].input_kind != "item"
+      ):
+        raise SpecValidationError(
+            f"fan_out {n.id}: capability must take an item"
+        )
+      if isinstance(n, Pipeline):
+        if not n.stages:
+          raise SpecValidationError(f"pipeline {n.id}: needs >= 1 stage")
+        for st in n.stages:
+          if st.capability not in self.registry:
+            raise SpecValidationError(f"unknown capability {st.capability!r}")
+          if self.registry[st.capability].input_kind != "item":
+            raise SpecValidationError(
+                f"pipeline {n.id}: stage {st.capability!r} must take an item"
+            )
+          if (
+              isinstance(st.input, Binding)
+              and st.input.source == "step"
+              and st.input.step not in preceding
+          ):
+            raise SpecValidationError(
+                f"pipeline {n.id}: stage input references non-preceding step"
+                f" {st.input.step!r}"
+            )
+      if isinstance(n, LoopUntil):
+        # A body step may bind the loop's OWN id to read the loop-carried
+        # value — but only if `init` seeds it (else iteration 0 has nothing).
+        if n.init is None and _references_step(n.body, n.id):
+          raise SpecValidationError(
+              f"loop {n.id}: body reads the loop-carried value (binds the"
+              " loop's own id) but no `init` binding seeds it"
+          )
+        # body executes in-scope; until_input may reference a body step.
+        body_scope = self._walk(n.body, preceding | {n.id}, ids)
+        ui = n.until_input
+        if ui.source == "step" and ui.step not in body_scope:
+          raise SpecValidationError(
+              f"loop {n.id}: until_input references step {ui.step!r} not in its"
+              " body/scope"
+          )
+      if isinstance(n, Branch):
+        for route in n.routes:
+          self._walk(route.block, preceding | {n.id}, ids)
+      preceding.add(n.id)
+    return preceding
+
+
+def _bindings(n) -> list[Binding]:
+  out = []
+  for f in ("input", "over", "on", "until_input", "init"):
+    b = getattr(n, f, None)
+    if isinstance(b, Binding):
+      out.append(b)
+  for st in getattr(n, "stages", None) or []:
+    if isinstance(st.input, Binding):
+      out.append(st.input)
+  return out
+
+
+def _references_step(nodes, step_id: str) -> bool:
+  """True if any binding in `nodes` (recursively) reads `step_id`."""
+  for n in nodes:
+    if any(b.source == "step" and b.step == step_id for b in _bindings(n)):
+      return True
+    for route in getattr(n, "routes", None) or []:
+      if _references_step(route.block, step_id):
+        return True
+    if getattr(n, "body", None) and _references_step(n.body, step_id):
+      return True
+  return False
+
+
+# ----------------------------------------------------------- export / import
+#
+# DESIGN.md §10: the frozen spec is a first-class, exportable artifact. The
+# source of truth is the typed WorkflowSpec; the compiled Workflow is derived
+# and never stored. A single canonical hash definition keeps two exporters in
+# agreement, and import NEVER trusts the envelope's own `validation` — it
+# recomputes the hash and re-validates against the *current* registry.
+
+
+def canonical_json(value) -> str:
+  """The one fixed serialization for hashing (no whitespace/key-order drift)."""
+  return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_hex(value) -> str:
+  return hashlib.sha256(canonical_json(value).encode()).hexdigest()
+
+
+def referenced_capabilities(spec: WorkflowSpec) -> set[str]:
+  """Every capability name a spec composes (walks pipeline stages, branch
+  routes, and loop bodies — not just top-level steps)."""
+  found: set[str] = set()
+
+  def walk(nodes):
+    for n in nodes:
+      cap = getattr(n, "capability", None)
+      if cap:
+        found.add(cap)
+      for st in getattr(n, "stages", None) or []:
+        found.add(st.capability)
+      for route in getattr(n, "routes", None) or []:
+        walk(route.block)
+      if getattr(n, "until_capability", None):
+        found.add(n.until_capability)
+      if getattr(n, "body", None):
+        walk(n.body)
+
+  walk(spec.steps)
+  return found
+
+
+def independence_facts(spec: WorkflowSpec) -> list[str]:
+  """Human-readable provenance facts derivable STATICALLY from the bindings.
+
+  Each fact states what a step can possibly see — its only input is a typed
+  binding, so isolation (no shared context, no inherited reasoning) is a
+  checkable property of the frozen plan, not a runtime hope. This is what
+  makes structural bias controls auditable: the record proves a verifier saw
+  only the producer's output and that synthesis traces back to the task input.
+  """
+  facts: list[str] = []
+
+  def walk(nodes):
+    for n in nodes:
+      if isinstance(n, Pipeline):
+        for prev, st in zip(n.stages, n.stages[1:]):
+          if st.input is None and st.capability != prev.capability:
+            facts.append(
+                f"pipeline {n.id!r}: stage {st.capability!r} sees ONLY stage"
+                f" {prev.capability!r}'s per-item output — independent"
+                " verification, per item"
+            )
+      b = getattr(n, "input", None) or getattr(n, "over", None)
+      if isinstance(b, Binding):
+        src = (
+            "the task input"
+            if b.source == "task"
+            else f"the typed output of {b.step!r}"
+        )
+        facts.append(f"{n.id!r} consumes ONLY {src}")
+      for route in getattr(n, "routes", None) or []:
+        walk(route.block)
+      if getattr(n, "body", None):
+        walk(n.body)
+
+  walk(spec.steps)
+  return facts
+
+
+class ValidationResult(BaseModel):
+  passed: bool
+  warnings: list[str] = Field(default_factory=list)
+
+
+class FrozenWorkflowRecord(BaseModel):
+  """The single shape behind session state, the audit event, and the export
+  envelope (DESIGN.md §5) — v1 storage is never a weaker subset."""
+
+  schema_version: str = "v1"
+  spec: WorkflowSpec
+  spec_hash: str
+  planner_model: str
+  registry_version: str
+  capability_versions: dict[str, str]
+  # DERIVED sha256 over each referenced capability's declared contract — the
+  # primary drift signal (manual versions above are secondary).
+  capability_contract_hashes: dict[str, str] = Field(default_factory=dict)
+  # Per-plan lint waivers (node id -> justification), recorded so a
+  # suppressed lint is an AUDITABLE decision, not a silenced one.
+  lint_waivers: dict[str, str] = Field(default_factory=dict)
+  validation: ValidationResult
+  created_at: str  # ISO-8601, stamped at freeze (caller supplies; not now())
+  task_input_schema: Optional[dict] = None
+  task_input_digest: Optional[str] = None
+
+  @classmethod
+  def freeze(
+      cls,
+      spec: WorkflowSpec,
+      *,
+      planner_model: str,
+      registry: CapabilityRegistry,
+      created_at: str,
+      task_input=None,
+      task_input_schema: Optional[dict] = None,
+      lint_waivers: Optional[dict[str, str]] = None,
+  ) -> "FrozenWorkflowRecord":
+    """Validate + capture everything needed for replay and drift detection."""
+    warnings = WorkflowSpecValidator(registry).validate(
+        spec, lint_waivers=lint_waivers
+    )  # raises on hard error
+    refs = referenced_capabilities(spec)
+    return cls(
+        spec=spec,
+        spec_hash=sha256_hex(spec.model_dump(mode="json")),
+        planner_model=planner_model,
+        registry_version=registry.version,
+        capability_versions=registry.capability_versions(only=refs),
+        capability_contract_hashes=registry.capability_contract_hashes(
+            only=refs
+        ),
+        lint_waivers=dict(lint_waivers or {}),
+        validation=ValidationResult(passed=True, warnings=warnings),
+        created_at=created_at,
+        task_input_schema=task_input_schema,
+        task_input_digest=(
+            None if task_input is None else sha256_hex(task_input)
+        ),
+    )
+
+
+class PlanImportError(Exception):
+  """Raised when an exported plan fails integrity, drift, or input checks."""
+
+
+SUPPORTED_SCHEMA_VERSION = "v1"
+
+
+def export_plan(record: FrozenWorkflowRecord) -> dict:
+  """Serialize the §5 record to a portable JSON-able envelope."""
+  return record.model_dump(mode="json")
+
+
+def import_plan(
+    envelope: dict, registry: CapabilityRegistry, *, task_input=None
+) -> WorkflowSpec:
+  """Re-hydrate an exported plan, NEVER trusting the envelope's own checks.
+
+  Integrity + drift (DESIGN.md §10):
+    0. reject an unsupported schema_version;
+    1. recompute sha256(canonical_json(spec)); REJECT if != envelope spec_hash;
+    2. re-run WorkflowSpecValidator against the CURRENT registry (catches a
+       dropped/renamed capability);
+    3. registry-version and per-capability version drift -> fail loudly.
+  Execution-input contract:
+    * replay   (no schema): task_input digest MUST match the envelope's;
+    * template (schema):    task_input is validated against task_input_schema;
+    * neither: do NOT execute against arbitrary new input.
+  """
+  # 0. schema_version — a defensive importer refuses formats it doesn't know.
+  schema_version = envelope.get("schema_version")
+  if schema_version != SUPPORTED_SCHEMA_VERSION:
+    raise PlanImportError(
+        f"unsupported schema_version {schema_version!r} (this importer supports"
+        f" {SUPPORTED_SCHEMA_VERSION!r})"
+    )
+
+  spec = WorkflowSpec.model_validate(envelope["spec"])
+
+  # 1. integrity — recompute, don't trust.
+  recomputed = sha256_hex(spec.model_dump(mode="json"))
+  if recomputed != envelope.get("spec_hash"):
+    raise PlanImportError(
+        "spec_hash mismatch: envelope has"
+        f" {envelope.get('spec_hash')!r}, recomputed {recomputed!r} — the spec"
+        " was tampered with or re-serialized under a different definition"
+    )
+
+  # 2. re-validate against the CURRENT registry (dropped capability fails here).
+  try:
+    WorkflowSpecValidator(registry).validate(spec)
+  except SpecValidationError as e:
+    raise PlanImportError(f"re-validation against current registry failed: {e}")
+
+  # 3a. registry-version drift is a hard error (DESIGN.md §10).
+  if envelope.get("registry_version") != registry.version:
+    raise PlanImportError(
+        "registry_version drift (recorded"
+        f" {envelope.get('registry_version')!r} vs current"
+        f" {registry.version!r}) — re-validate / migrate before reuse"
+    )
+
+  # 3b. per-capability MANUAL version drift (coarse secondary signal).
+  current = registry.capability_versions(only=referenced_capabilities(spec))
+  recorded = envelope.get("capability_versions", {})
+  drifted = {
+      n: (recorded.get(n), current.get(n))
+      for n in current
+      if recorded.get(n) != current.get(n)
+  }
+  if drifted:
+    raise PlanImportError(
+        f"capability version drift (recorded vs current): {drifted} — promote"
+        " to a template with explicit migration before reuse"
+    )
+
+  # 3c. per-capability CONTRACT drift (primary, derived signal): catches a
+  # changed input_kind / output schema even when nobody bumped a version.
+  # FAIL CLOSED: a v1 envelope MUST record a contract hash for every
+  # referenced capability — otherwise stripping the field (or one entry)
+  # from the envelope would silently bypass drift detection.
+  current_ch = registry.capability_contract_hashes(
+      only=referenced_capabilities(spec)
+  )
+  recorded_ch = envelope.get("capability_contract_hashes") or {}
+  missing_ch = sorted(n for n in current_ch if n not in recorded_ch)
+  if missing_ch:
+    raise PlanImportError(
+        f"envelope is missing contract hashes for {missing_ch} — a v1"
+        " envelope must record a contract hash for every referenced"
+        " capability (fail closed: a stripped field must not bypass drift"
+        " detection)"
+    )
+  contract_drift = {
+      n: (recorded_ch[n], current_ch[n])
+      for n in current_ch
+      if recorded_ch[n] != current_ch[n]
+  }
+  if contract_drift:
+    raise PlanImportError(
+        "capability contract drift (recorded vs current schema hash):"
+        f" {contract_drift} — the capability's declared contract changed"
+        " since export; re-validate / migrate before reuse"
+    )
+
+  # Execution-input contract.
+  if task_input is not None:
+    schema = envelope.get("task_input_schema")
+    if schema is not None:
+      missing = [k for k in schema.get("required", []) if k not in task_input]
+      if missing:
+        raise PlanImportError(
+            f"task input missing required keys {missing} for this template"
+        )
+    else:
+      digest = sha256_hex(task_input)
+      if digest != envelope.get("task_input_digest"):
+        raise PlanImportError(
+            "task_input digest mismatch and no task_input_schema captured:"
+            " this plan can only be REPLAYED on its original input (promote to"
+            " a template to reuse it on new input)"
+        )
+
+  return spec
+
+
+# ------------------------------------------------- AgentConfig lowering (§11)
+# A STRUCTURAL PROJECTION of a WorkflowSpec's static skeleton onto ADK
+# `AgentConfig` shapes — the convergence direction from DESIGN §11, shown
+# concretely. It is deliberately NOT a loadable `root_agent.yaml`:
+#   * the static subset projects to SequentialAgent / LoopAgent / LlmAgent shapes;
+#   * leaf agents are referenced by ALLOW-LISTED capability name, never by an
+#     importable FQN (the trust-boundary point — a model never names an import);
+#   * the dynamic blocks (fan_out over a runtime list, pipeline, branch) have NO
+#     `AgentConfig` equivalent and are emitted as explicit `unsupported` markers,
+#     never fabricated as config.
+# A full loadable-config compiler (child YAML / an allow-listed capability-ref
+# field) is future work (DESIGN §12).
+
+AGENTCONFIG_UNSUPPORTED = "<no-AgentConfig-equivalent>"
+
+
+def _lower_block(node) -> dict:
+  if isinstance(node, StepRef):
+    return {
+        "agent_class": "LlmAgent",
+        "name": node.id,
+        "capability": node.capability,
+    }
+  if isinstance(node, LoopUntil):
+    return {
+        "agent_class": "LoopAgent",
+        "name": node.id,
+        "max_iterations": node.max_iters,
+        "sub_agents": [_lower_block(b) for b in node.body],
+        "_note": (
+            f"until-predicate ({node.until_capability}) has no AgentConfig"
+            " field; enforced by SpecInterpreter"
+        ),
+    }
+  if isinstance(node, FanOut):
+    return {
+        "agent_class": AGENTCONFIG_UNSUPPORTED,
+        "workflowspec_kind": "fan_out",
+        "name": node.id,
+        "capability": node.capability,
+    }
+  if isinstance(node, Pipeline):
+    return {
+        "agent_class": AGENTCONFIG_UNSUPPORTED,
+        "workflowspec_kind": "pipeline",
+        "name": node.id,
+        "stages": [st.capability for st in node.stages],
+    }
+  if isinstance(node, Branch):
+    return {
+        "agent_class": AGENTCONFIG_UNSUPPORTED,
+        "workflowspec_kind": "branch",
+        "name": node.id,
+    }
+  raise TypeError(f"unknown block: {type(node).__name__}")
+
+
+def lower_to_agent_config(
+    spec: WorkflowSpec, *, name: str = "authored_workflow"
+) -> dict:
+  """Project the static skeleton of `spec` onto an ADK `AgentConfig` shape.
+
+  Illustrative (see the module note above), not a loadable `root_agent.yaml`:
+  the ordered `steps` sequence projects to a `SequentialAgent`; leaf steps to
+  `LlmAgent` (by capability name, not FQN); dynamic blocks are flagged
+  `unsupported`, never fabricated.
+  """
+  return {
+      "agent_class": "SequentialAgent",
+      "name": name,
+      "sub_agents": [_lower_block(s) for s in spec.steps],
+  }
+
+
+def agent_config_coverage(spec: WorkflowSpec) -> dict:
+  """A quick 'X of N top-level blocks lower to config' number for the demo."""
+  lowered = lower_to_agent_config(spec)["sub_agents"]
+  dynamic = [
+      b["workflowspec_kind"]
+      for b in lowered
+      if b["agent_class"] == AGENTCONFIG_UNSUPPORTED
+  ]
+  return {
+      "total": len(lowered),
+      "lowerable": len(lowered) - len(dynamic),
+      "dynamic": dynamic,
+  }
+
+
+# ----------------------------------------------------------------- interpreter
+class SpecInterpreter:
+  """Executes a validated WorkflowSpec on the real ADK engine via the #92
+  supervisor. Handles step / fan_out / pipeline / branch / loop_until."""
+
+  def __init__(self, registry: CapabilityRegistry, ctx, *, gate: int = 8):
+    self.registry = registry
+    self.ctx = ctx
+    self.sup = DynamicNodeSupervisor(ctx, gate=gate)
+    self.state: dict[str, Any] = {}
+    self.dispatch_count = 0  # capability dispatches — cheap cost visibility
+
+  def _resolve(self, binding: Binding, task_input):
+    base = task_input if binding.source == "task" else self.state[binding.step]
+    if binding.path:
+      cur = base
+      for part in binding.path.split("."):
+        cur = cur[part] if isinstance(cur, dict) else getattr(cur, part)
+      return cur
+    return base
+
+  def _arg(self, cap: Capability, value):
+    return json.dumps(value, default=str) if cap.serialize_input else value
+
+  def _dispatch_cap(self, cap: Capability, value, run_id: str):
+    self.dispatch_count += 1
+    return self.sup.dispatch(
+        cap.build(), node_input=self._arg(cap, value), run_id=run_id
+    )
+
+  async def _dispatch(self, cap_name: str, value, run_id: str):
+    return await self._dispatch_cap(self.registry[cap_name], value, run_id)
+
+  async def execute(self, spec: WorkflowSpec, task_input) -> Any:
+    await self._run_block(spec.steps, task_input, prefix="")
+    return self._resolve(spec.output, task_input)
+
+  async def _run_block(self, nodes, task_input, prefix: str):
+    last = None
+    for n in nodes:
+      rid = f"{prefix}{n.id}"
+      if isinstance(n, StepRef):
+        self.state[n.id] = await self._dispatch(
+            n.capability, self._resolve(n.input, task_input), rid
+        )
+      elif isinstance(n, FanOut):
+        cap = self.registry[n.capability]
+        items = self._resolve(n.over, task_input)
+        if len(items) > cap.max_fan_out:
+          raise SpecValidationError(
+              f"runtime: fan_out {len(items)} exceeds max_fan_out"
+              f" {cap.max_fan_out}"
+          )
+        self.state[n.id] = await self.sup.pipeline(
+            items,
+            (
+                lambda _p, it, i, c=cap, rid=rid: self._dispatch_cap(
+                    c, it, f"{rid}_{i}"
+                )
+            ),
+        )
+      elif isinstance(n, Pipeline):
+        # Barrier-free per-item multi-stage flow via #92 ctx.pipeline — each item
+        # threads ALL stages; item A can be in stage k while item B is in stage 1
+        # (NOT two barriered fan_outs). stage[0] input defaults to the per-item
+        # element; stage[k] input defaults to stage[k-1]'s per-item output.
+        items = self._resolve(n.over, task_input)
+        # Each stage dispatches once per item, so every stage capability is
+        # subject to the same data-dependent fan-out cap as a FanOut.
+        for st in n.stages:
+          cap = self.registry[st.capability]
+          if len(items) > cap.max_fan_out:
+            raise SpecValidationError(
+                f"runtime: pipeline stage {st.capability!r} fan_out"
+                f" {len(items)} exceeds max_fan_out {cap.max_fan_out}"
+            )
+        stage_fns = []
+        for si, st in enumerate(n.stages):
+
+          def stage(prev, it, i, si=si, st=st, rid=rid):
+            cap = self.registry[st.capability]
+            value = (
+                self._resolve(st.input, task_input)
+                if st.input is not None
+                else (it if si == 0 else prev)
+            )
+            return self._dispatch_cap(cap, value, f"{rid}_{i}_{si}")
+
+          stage_fns.append(stage)
+        self.state[n.id] = await self.sup.pipeline(items, *stage_fns)
+      elif isinstance(n, Branch):
+        value = str(self._resolve(n.on, task_input))
+        routes = {r.value: r.block for r in n.routes}
+        if value not in routes:
+          raise SpecValidationError(
+              f"runtime: branch {n.id} unmatched value {value!r}"
+              " (unmatched=fail)"
+          )
+        out = await self._run_block(
+            routes[value], task_input, prefix=f"{rid}_{value}_"
+        )
+        self.state[n.id] = out
+      elif isinstance(n, LoopUntil):
+        # Loop-carried state: `init` seeds state[loop.id]; after every
+        # iteration the carried value becomes the body's last-node output, so
+        # a body step binding the loop's own id reads the PRIOR round's result
+        # (tournament: pairs recomputed each round from the prior winners).
+        if n.init is not None:
+          self.state[n.id] = self._resolve(n.init, task_input)
+        out = None
+        for i in range(n.max_iters):
+          out = await self._run_block(n.body, task_input, prefix=f"{rid}_i{i}_")
+          self.state[n.id] = out
+          verdict = await self._dispatch(
+              n.until_capability,
+              self._resolve(n.until_input, task_input),
+              f"{rid}_i{i}_until",
+          )
+          if _truthy(verdict):
+            break
+        self.state[n.id] = out
+      last = self.state.get(n.id)
+    return last
+
+
+def _truthy(v) -> bool:
+  if isinstance(v, bool):
+    return v
+  if isinstance(v, dict):
+    for k in ("result", "value", "done", "ok"):
+      if k in v:
+        return bool(v[k])
+  return bool(v)
