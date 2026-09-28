@@ -3813,6 +3813,301 @@ class TestBigQueryAgentAnalyticsPlugin:
       assert attributes.get("labels") == gen_config_kwargs["labels"]
 
 
+# ==============================================================================
+# TEST CLASS: content_formatter failure diagnostics
+# ==============================================================================
+# Formatters that fail in each way the error_message column must describe.
+# They live at module level so that _RedactionServiceError is bound in this
+# module the way a library binds its exception classes.
+
+
+class _RedactionServiceError(Exception):
+  """A module-level exception class, like one a redaction library defines."""
+
+
+class _ClaimsStaticTypeMeta(type):
+  """Metaclass whose classes report the type flags of a built-in type."""
+
+  @property
+  def __flags__(cls):
+    return int.__flags__
+
+
+def _identifier_from_content(content):
+  """Turns the logged message text into a valid class name."""
+  return content.parts[0].text.replace("-", "_")
+
+
+def _raise_import_error(content, event_type):
+  raise ImportError(f"cannot import name 'redact' (formatting {content})")
+
+
+def _raise_module_level_exception(content, event_type):
+  raise _RedactionServiceError("redaction backend unavailable")
+
+
+def _raise_local_exception_subclass(content, event_type):
+  class LocalLookupError(KeyError):
+    pass
+
+  raise LocalLookupError("missing field")
+
+
+def _raise_payload_named_exception(content, event_type):
+  raise type(_identifier_from_content(content), (ValueError,), {})()
+
+
+def _raise_payload_named_exception_claiming_static_type(content, event_type):
+  raise _ClaimsStaticTypeMeta(
+      _identifier_from_content(content), (ValueError,), {}
+  )()
+
+
+def _return_tuple(content, event_type):
+  return ("not", "supported")
+
+
+def _return_generator(content, event_type):
+  yield content
+
+
+def _return_local_llm_request_subclass(content, event_type):
+  class LocalRequest(llm_request_lib.LlmRequest):
+    pass
+
+  return LocalRequest()
+
+
+@pytest.mark.usefixtures(
+    "mock_auth_default",
+    "mock_bq_client",
+    "mock_to_arrow_schema",
+    "mock_asyncio_to_thread",
+)
+class TestContentFormatterFailureDiagnostics:
+  """A failing content_formatter is diagnosable without leaking content.
+
+  The row's error_message names the failure by class. The formatter's input
+  and the exception's message never reach the row, and the traceback reaches
+  the local log only when debug_content_formatter_errors is enabled.
+  """
+
+  SECRET = "TOPSECRET-4111-1111-1111-1111"
+
+  async def _log_user_message(
+      self, config, mock_write_client, invocation_context, dummy_arrow_schema
+  ):
+    """Logs SECRET as a user message; returns the row and the drop stats."""
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    ) as plugin:
+      await plugin._ensure_started()
+      mock_write_client.append_rows.reset_mock()
+      bigquery_agent_analytics_plugin.TraceManager.push_span(invocation_context)
+      await plugin.on_user_message_callback(
+          invocation_context=invocation_context,
+          user_message=types.Content(parts=[types.Part(text=self.SECRET)]),
+      )
+      await plugin.flush()
+      row = await _get_captured_event_dict_async(
+          mock_write_client, dummy_arrow_schema
+      )
+      return row, plugin.get_drop_stats()
+
+  @staticmethod
+  def _formatter_warnings(caplog):
+    return [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("Content formatter failed")
+    ]
+
+  @pytest.mark.parametrize(
+      ("formatter", "expected_error_message"),
+      [
+          pytest.param(
+              _raise_import_error,
+              "content_formatter raised ImportError",
+              id="builtin_exception",
+          ),
+          pytest.param(
+              _raise_module_level_exception,
+              "content_formatter raised _RedactionServiceError",
+              id="module_level_exception",
+          ),
+          pytest.param(
+              _raise_local_exception_subclass,
+              "content_formatter raised <subclass of KeyError>",
+              id="function_local_exception",
+          ),
+          pytest.param(
+              _raise_payload_named_exception,
+              "content_formatter raised <subclass of ValueError>",
+              id="payload_named_exception",
+          ),
+          pytest.param(
+              _raise_payload_named_exception_claiming_static_type,
+              "content_formatter raised <subclass of ValueError>",
+              id="payload_named_exception_misreporting_type_flags",
+          ),
+          pytest.param(
+              _return_tuple,
+              "content_formatter returned unsupported type tuple",
+              id="unsupported_builtin_result",
+          ),
+          pytest.param(
+              _return_generator,
+              "content_formatter returned unsupported type generator",
+              id="unsupported_unexported_builtin_result",
+          ),
+          pytest.param(
+              _return_local_llm_request_subclass,
+              "content_formatter returned unsupported type"
+              " <subclass of LlmRequest>",
+              id="unsupported_model_subclass_result",
+          ),
+      ],
+  )
+  async def test_failed_row_names_the_formatter_failure_by_class(
+      self,
+      formatter,
+      expected_error_message,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """A failed formatter's row fails closed and names the failure's class.
+
+    A class name chosen at runtime, e.g. by type(name, ...) from the content,
+    is replaced by its nearest code-defined ancestor.
+    """
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=formatter
+    )
+
+    row, drop_stats = await self._log_user_message(
+        config, mock_write_client, invocation_context, dummy_arrow_schema
+    )
+
+    assert row["error_message"] == expected_error_message
+    assert (
+        row["content"]
+        == bigquery_agent_analytics_plugin._FORMATTER_FAILED_SENTINEL
+    )
+    assert drop_stats.get("formatter_failed") == 1
+
+  async def test_formatter_exception_text_never_reaches_the_row(
+      self, mock_write_client, invocation_context, dummy_arrow_schema
+  ):
+    """Neither the exception's message nor the content it embeds is written."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=_raise_import_error
+    )
+
+    row, _ = await self._log_user_message(
+        config, mock_write_client, invocation_context, dummy_arrow_schema
+    )
+
+    written = json.dumps(row, default=str)
+    assert "cannot import name" not in written
+    assert self.SECRET not in written
+
+  @pytest.mark.parametrize(
+      ("tool_error_text", "expected_error_message"),
+      [
+          pytest.param(
+              "upstream timed out after 30s",
+              "upstream timed out after 30s;"
+              " content_formatter raised ImportError",
+              id="appended_after_existing_message",
+          ),
+          pytest.param(
+              "",
+              "content_formatter raised ImportError",
+              id="empty_existing_message",
+          ),
+      ],
+  )
+  async def test_formatter_failure_follows_the_events_own_error_message(
+      self,
+      tool_error_text,
+      expected_error_message,
+      mock_write_client,
+      tool_context,
+      dummy_arrow_schema,
+  ):
+    """An error row keeps its own diagnostic first; the formatter's follows."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=_raise_import_error
+    )
+    tool = mock.create_autospec(
+        base_tool_lib.BaseTool, instance=True, spec_set=True
+    )
+    type(tool).name = mock.PropertyMock(return_value="lookup")
+
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    ) as plugin:
+      await plugin._ensure_started()
+      mock_write_client.append_rows.reset_mock()
+      bigquery_agent_analytics_plugin.TraceManager.push_span(tool_context)
+      await plugin.on_tool_error_callback(
+          tool=tool,
+          tool_args={"account": self.SECRET},
+          tool_context=tool_context,
+          error=RuntimeError(tool_error_text),
+      )
+      await plugin.flush()
+      row = await _get_captured_event_dict_async(
+          mock_write_client, dummy_arrow_schema
+      )
+
+    assert row["error_message"] == expected_error_message
+
+  async def test_formatter_traceback_is_not_logged_by_default(
+      self, mock_write_client, invocation_context, dummy_arrow_schema, caplog
+  ):
+    """By default the formatter-failure warning carries no traceback."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=_raise_import_error
+    )
+
+    with caplog.at_level(logging.WARNING):
+      await self._log_user_message(
+          config, mock_write_client, invocation_context, dummy_arrow_schema
+      )
+
+    warnings = self._formatter_warnings(caplog)
+    assert len(warnings) == 1
+    assert not warnings[0].exc_info
+    assert self.SECRET not in caplog.text
+
+  async def test_debug_flag_logs_traceback_locally_but_not_to_the_row(
+      self, mock_write_client, invocation_context, dummy_arrow_schema, caplog
+  ):
+    """debug_content_formatter_errors sends the traceback to the log only.
+
+    The traceback carries the exception message and the content it embeds,
+    so the row still names only the exception class.
+    """
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=_raise_import_error,
+        debug_content_formatter_errors=True,
+    )
+
+    with caplog.at_level(logging.WARNING):
+      row, _ = await self._log_user_message(
+          config, mock_write_client, invocation_context, dummy_arrow_schema
+      )
+
+    warnings = self._formatter_warnings(caplog)
+    assert len(warnings) == 1
+    assert warnings[0].exc_info[0] is ImportError
+    assert self.SECRET in caplog.text
+    assert row["error_message"] == "content_formatter raised ImportError"
+    assert self.SECRET not in json.dumps(row, default=str)
+
+
 class TestSafeCallbackDecorator:
   """Tests that _safe_callback prevents plugin errors from propagating."""
 
