@@ -88,6 +88,7 @@ from google.cloud.bigquery_storage_v1.services.big_query_write.async_client impo
 import google.cloud.storage as cloud_storage
 from google.genai import types
 from opentelemetry import trace
+import pydantic
 
 try:
   import pyarrow as pa
@@ -1877,23 +1878,6 @@ def _safe_getattr(obj: Any, name: str) -> Any:
     return None
 
 
-def _model_dump_quietly(model_dump: Callable[..., Any], **options: Any) -> Any:
-  """Calls a ``model_dump`` without letting Pydantic warn about the values.
-
-  Pydantic still dumps a field whose value no longer matches its type, such as
-  a list field appended to after validation, but first warns with a
-  ``UserWarning`` that quotes the value, before a ``content_formatter``, a
-  column denylist or ``log_multi_modal_content`` can apply to it.
-  ``warnings=False`` turns that off for this call only. A ``model_dump`` that
-  does not take the keyword, such as a narrower override, is called without
-  it, since the override may be what leaves out what must not be reported.
-  """
-  try:
-    return model_dump(warnings=False, **options)
-  except TypeError:
-    return model_dump(**options)
-
-
 # Stdlib scalar types whose str() form is canonical, side-effect free, and
 # cannot embed attribute state beyond the value itself. Only these keep the
 # stringify fallback; arbitrary objects' repr/str output is payload-
@@ -2157,8 +2141,21 @@ def _recursive_smart_truncate(
       # at the fallback. Progress includes SCALARS: a RootModel[str] dumps
       # to a plain string that may itself be a credential blob, and
       # falling through to the generic fallback bypassed blob redaction.
+      #
+      # model_dump is called with warnings=False: Pydantic still dumps a field
+      # whose value no longer matches its type, but otherwise first warns with
+      # a UserWarning that quotes the value, before any content_formatter
+      # runs. A Pydantic model whose model_dump is an override is not called,
+      # since the override may not pass the flag on to Pydantic's. It is
+      # recorded as a sentinel, as is a model_dump that fails or does not take
+      # the flag: reading the fields instead would record what it leaves out.
       try:
-        dumped = _model_dump_quietly(model_dump_fn)
+        if _is_instance(obj, pydantic.BaseModel) and (
+            getattr(model_dump_fn, "__func__", None)
+            is not pydantic.BaseModel.model_dump
+        ):
+          return "[UNSUPPORTED_OBJECT]", True
+        dumped = model_dump_fn(warnings=False)
         if isinstance(
             dumped,
             (collections.abc.Mapping, list, tuple, str, bytes, bytearray),
@@ -2169,7 +2166,7 @@ def _recursive_smart_truncate(
         if dumped is None or isinstance(dumped, (int, float, bool)):
           return dumped, False
       except Exception:
-        pass
+        return "[UNSUPPORTED_OBJECT]", True
     elif dict_fn is not None and callable(dict_fn):
       # Pydantic v1 (same progress requirement as above, scalars included).
       try:
@@ -4052,9 +4049,11 @@ class HybridContentParser:
 
   def _serialize_part_model(self, value: Any) -> tuple[dict[str, Any], bool]:
     """Returns bounded JSON-native fields for a supported structured part."""
-    dumped = _model_dump_quietly(
-        value.model_dump, exclude_none=True, mode="json"
-    )
+    # warnings=False: a field that no longer fits its type, even in a model
+    # nested in a function response, is otherwise quoted in a UserWarning.
+    # Pydantic serializes nested models itself, without calling their own
+    # model_dump.
+    dumped = value.model_dump(exclude_none=True, mode="json", warnings=False)
     sanitized, content_lost = _recursive_smart_truncate(dumped, self.max_length)
     if not isinstance(sanitized, dict):
       return {"value": "[UNSUPPORTED_OBJECT]"}, True

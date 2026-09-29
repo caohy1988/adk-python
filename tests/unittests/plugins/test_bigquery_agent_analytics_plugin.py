@@ -57,6 +57,8 @@ from google.genai import types
 from opentelemetry import trace
 import pyarrow as pa
 from pydantic import BaseModel
+from pydantic import Field
+from pydantic import field_serializer
 import pytest
 
 PROJECT_ID = "test-gcp-project"
@@ -6504,14 +6506,50 @@ class _Summary(BaseModel):
   summary: str
 
 
-class _SummaryWithOwnDump(BaseModel):
-  """A result model whose own model_dump takes no keywords and drops a field."""
+class _DelegatingDump(BaseModel):
+  """A result model whose model_dump takes no keywords and calls Pydantic's."""
 
-  summary: str
-  token: str
+  number: int = 1
+  excluded: str = "omit this field"
 
   def model_dump(self):  # pylint: disable=arguments-differ
-    return {"summary": self.summary}
+    return super().model_dump(exclude={"excluded"})
+
+
+class _KeywordDroppingDump(_DelegatingDump):
+  """A result model whose model_dump takes keywords but does not pass them on."""
+
+  def model_dump(self, **kwargs):  # pylint: disable=arguments-differ
+    return BaseModel.model_dump(self, exclude={"excluded"})
+
+
+class _OwnDump(_DelegatingDump):
+  """A result model whose model_dump builds its own dict."""
+
+  def model_dump(self):  # pylint: disable=arguments-differ
+    return {"number": self.number}
+
+
+class _ModelLike:
+  """A result that is not a Pydantic model but has a model_dump."""
+
+  def __init__(self):
+    self.received = None
+
+  def model_dump(self, **kwargs):
+    self.received = kwargs
+    return {"rows": 1}
+
+
+class _FailingDump(BaseModel):
+  """A result model whose dump fails, and which leaves a field out of it."""
+
+  summary: str = "ok"
+  secret: str = Field(default="never recorded", exclude=True)
+
+  @field_serializer("summary")
+  def _serialize_summary(self, value):
+    raise RuntimeError("the serializer failed")
 
 
 def _print_warning(message, category, filename, lineno, file=None, line=None):
@@ -7269,7 +7307,13 @@ class TestToolResultErrorClassification:
   @pytest.mark.parametrize("display", ["stderr", "py.warnings"])
   @pytest.mark.asyncio
   async def test_result_field_that_no_longer_fits_is_not_quoted_in_a_turn(
-      self, _mock_bq_infra, dummy_arrow_schema, caplog, capsys, display
+      self,
+      _mock_bq_infra,
+      dummy_arrow_schema,
+      caplog,
+      capsys,
+      monkeypatch,
+      display,
   ):
     """No row of a real turn quotes such a result in a warning.
 
@@ -7278,6 +7322,10 @@ class TestToolResultErrorClassification:
     log_multi_modal_content keeps it out of the row.
     """
     from google.adk.tools.function_tool import FunctionTool
+
+    # ADK's span content capture dumps the same response with Pydantic's
+    # warnings on once any test has installed a recording tracer.
+    monkeypatch.setenv("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false")
 
     mcp_types = pytest.importorskip("mcp.types")
 
@@ -7303,23 +7351,138 @@ class TestToolResultErrorClassification:
     assert _PAYLOAD_SECRET not in capsys.readouterr().err
     assert _PAYLOAD_SECRET not in caplog.text
 
+  @pytest.mark.parametrize("display", ["stderr", "py.warnings"])
+  @pytest.mark.parametrize("nesting", ["top_level", "nested"])
+  @pytest.mark.parametrize(
+      "model",
+      [_DelegatingDump, _KeywordDroppingDump, _OwnDump],
+      ids=["delegating", "keyword_dropping", "own_dict"],
+  )
   @pytest.mark.asyncio
-  async def test_model_dump_of_the_result_is_used_even_without_keywords(
+  async def test_result_model_with_its_own_model_dump_is_recorded_as_a_sentinel(
+      self,
+      _mock_bq_infra,
+      dummy_arrow_schema,
+      tool_context,
+      caplog,
+      capsys,
+      model,
+      nesting,
+      display,
+  ):
+    """A result whose model_dump is not Pydantic's own is not called.
+
+    Such a model_dump may not take warnings=False, or may take it and not pass
+    it on to Pydantic's, which then quotes a field that no longer fits in a
+    warning before content_formatter runs. Reading the fields instead would
+    record what it leaves out. So the row records the sentinel in its place,
+    whether the model is the result or is nested in it.
+    """
+    result = model()
+    result.number = _PAYLOAD_SECRET
+    if nesting == "nested":
+      result = {"nested": result}
+
+    with _warnings_shown(display):
+      rows = await self._record_tool_call(
+          _mock_bq_infra, dummy_arrow_schema, tool_context, result
+      )
+
+    recorded = json.loads(rows[1]["content"])["result"]
+    sentinel = "[UNPARSEABLE_JSON_BLOB]"
+    assert recorded == (
+        sentinel if nesting == "top_level" else {"nested": sentinel}
+    )
+    assert _PAYLOAD_SECRET not in rows[1]["content"]
+    assert "omit this field" not in rows[1]["content"]
+    assert _PAYLOAD_SECRET not in capsys.readouterr().err
+    assert _PAYLOAD_SECRET not in caplog.text
+
+  @pytest.mark.parametrize("display", ["stderr", "py.warnings"])
+  @pytest.mark.parametrize("nesting", ["top_level", "nested"])
+  @pytest.mark.asyncio
+  async def test_result_model_with_its_own_model_dump_is_not_quoted_in_a_turn(
+      self,
+      _mock_bq_infra,
+      dummy_arrow_schema,
+      caplog,
+      capsys,
+      monkeypatch,
+      nesting,
+      display,
+  ):
+    """No row of a real turn quotes such a model in a warning.
+
+    That covers the TOOL_COMPLETED row, and the next LLM_REQUEST row, whose
+    function response Pydantic dumps without calling the model's own
+    model_dump.
+    """
+    from google.adk.tools.function_tool import FunctionTool
+
+    # ADK's span content capture dumps the same response with Pydantic's
+    # warnings on once any test has installed a recording tracer.
+    monkeypatch.setenv("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false")
+
+    def fetch_rows():
+      result = _DelegatingDump()
+      result.number = _PAYLOAD_SECRET
+      return result if nesting == "top_level" else {"nested": result}
+
+    with _warnings_shown(display):
+      _, rows = await self._run_turn(
+          _mock_bq_infra,
+          dummy_arrow_schema,
+          FunctionTool(fetch_rows),
+          lambda bq_plugin: [bq_plugin],
+          config=bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+              log_multi_modal_content=False
+          ),
+      )
+
+    event_types = [r["event_type"] for r in rows]
+    assert "TOOL_COMPLETED" in event_types
+    assert event_types.count("LLM_REQUEST") == 2
+    assert _PAYLOAD_SECRET not in capsys.readouterr().err
+    assert _PAYLOAD_SECRET not in caplog.text
+
+  @pytest.mark.asyncio
+  async def test_result_that_only_looks_like_a_model_is_dumped_quietly(
       self, _mock_bq_infra, dummy_arrow_schema, tool_context
   ):
-    """A result model's own model_dump runs even if it takes no keywords.
+    """A result that is not a Pydantic model is dumped by its model_dump.
 
-    Its override may leave out what the model must not report, so the result
-    is dumped by that override rather than read field by field.
+    Only a Pydantic model's own override is left uncalled. Another object's
+    model_dump still produces the recorded value, and it is asked for
+    warnings=False too.
     """
+    result = _ModelLike()
+
     rows = await self._record_tool_call(
-        _mock_bq_infra,
-        dummy_arrow_schema,
-        tool_context,
-        _SummaryWithOwnDump(summary="ok", token=_PAYLOAD_SECRET),
+        _mock_bq_infra, dummy_arrow_schema, tool_context, result
     )
 
-    assert json.loads(rows[1]["content"])["result"] == {"summary": "ok"}
+    assert json.loads(rows[1]["content"])["result"] == {"rows": 1}
+    assert result.received == {"warnings": False}
+
+  @pytest.mark.asyncio
+  async def test_result_model_whose_dump_fails_is_recorded_as_a_sentinel(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A result model whose own Pydantic dump fails is recorded as a sentinel.
+
+    Reading its fields instead would record what its serializers and
+    Field(exclude=True) leave out.
+    """
+    rows = await self._record_tool_call(
+        _mock_bq_infra, dummy_arrow_schema, tool_context, _FailingDump()
+    )
+
+    assert [r["event_type"] for r in rows] == [
+        "TOOL_STARTING",
+        "TOOL_COMPLETED",
+    ]
+    assert json.loads(rows[1]["content"])["result"] == "[UNPARSEABLE_JSON_BLOB]"
+    assert "never recorded" not in rows[1]["content"]
 
   @pytest.mark.asyncio
   async def test_failure_to_classify_a_result_still_records_the_call(
