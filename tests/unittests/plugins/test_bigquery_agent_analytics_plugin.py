@@ -6352,6 +6352,727 @@ class TestToolProvenance:
     result = bigquery_agent_analytics_plugin._get_tool_origin(tool)
     assert result == "UNKNOWN"
 
+  def test_toolbox_tool_returns_toolbox(self):
+    """A tool loaded by ToolboxToolset is classified TOOLBOX."""
+    toolbox_adk = pytest.importorskip("toolbox_adk")
+    tool = toolbox_adk.ToolboxTool.__new__(toolbox_adk.ToolboxTool)
+
+    result = bigquery_agent_analytics_plugin._get_tool_origin(tool)
+
+    assert result == "TOOLBOX"
+
+  def test_classifying_a_tool_does_not_import_toolbox_adk(self, monkeypatch):
+    """toolbox_adk is optional, so classification never imports it."""
+    tool = mock.MagicMock(spec=base_tool_lib.BaseTool)
+    tool.name = "mystery"
+    monkeypatch.delitem(sys.modules, "toolbox_adk", raising=False)
+
+    result = bigquery_agent_analytics_plugin._get_tool_origin(tool)
+
+    assert result == "UNKNOWN"
+    assert "toolbox_adk" not in sys.modules
+
+  def test_skill_toolset_tools_return_skill(self):
+    """Every tool SkillToolset defines for working with skills is SKILL."""
+    from google.adk.tools import skill_toolset
+
+    toolset = skill_toolset.SkillToolset(
+        [],
+        registry=mock.create_autospec(
+            skill_toolset.SkillRegistry, instance=True
+        ),
+    )
+    skill_tool_types = [
+        value
+        for value in vars(skill_toolset).values()
+        if isinstance(value, type)
+        and issubclass(value, base_tool_lib.BaseTool)
+        and value.__module__ == skill_toolset.__name__
+    ]
+
+    origins = {
+        tool_type.__name__: bigquery_agent_analytics_plugin._get_tool_origin(
+            tool_type(toolset)
+        )
+        for tool_type in skill_tool_types
+    }
+
+    assert origins == {
+        "ListSkillsTool": "SKILL",
+        "LoadSkillResourceTool": "SKILL",
+        "LoadSkillTool": "SKILL",
+        "RunSkillScriptTool": "SKILL",
+        "SearchSkillsTool": "SKILL",
+        "UnloadSkillTool": "SKILL",
+    }
+
+
+def _run_query(query: str) -> dict:
+  """Tool function used by the tool-result classification tests."""
+  return {"query": query}
+
+
+class TestToolResultErrorClassification:
+  """Tests for recording error-bearing tool results as ``TOOL_ERROR``.
+
+  A tool can fail without its exception reaching ``on_tool_error_callback``:
+  an MCP tool returns its ``CallToolResult`` with ``isError`` set, and
+  ``ReflectAndRetryToolPlugin`` registered ahead of the analytics plugin
+  answers a raised error with a response that reaches
+  ``after_tool_callback`` in its place. The row must record the failure
+  while the result the model receives stays unchanged.
+  """
+
+  @pytest.fixture
+  def _mock_bq_infra(
+      self,
+      mock_auth_default,
+      mock_bq_client,
+      mock_write_client,
+      mock_to_arrow_schema,
+      mock_asyncio_to_thread,
+  ):
+    """Bundle all BQ mocking fixtures."""
+    yield mock_write_client
+
+  async def _record_tool_call(
+      self,
+      mock_write_client,
+      dummy_arrow_schema,
+      tool_context,
+      result,
+      *,
+      config=None,
+      tool=None,
+      tool_args=None,
+  ):
+    """Runs the tool callbacks for one call and returns the rows written."""
+    from google.adk.tools.function_tool import FunctionTool
+
+    tool = tool or FunctionTool(_run_query)
+    tool_args = tool_args or {"query": "SELECT 1"}
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    ) as plugin:
+      await plugin._ensure_started()
+      mock_write_client.append_rows.reset_mock()
+      await plugin.before_tool_callback(
+          tool=tool, tool_args=tool_args, tool_context=tool_context
+      )
+      await plugin.after_tool_callback(
+          tool=tool,
+          tool_args=tool_args,
+          tool_context=tool_context,
+          result=result,
+      )
+      await plugin.flush()
+      return await _get_captured_rows_async(
+          mock_write_client, dummy_arrow_schema
+      )
+
+  @pytest.mark.parametrize("error_flag", ["isError", "is_error"])
+  @pytest.mark.asyncio
+  async def test_mcp_result_with_error_flag_is_recorded_as_tool_error(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context, error_flag
+  ):
+    """An MCP result whose isError (is_error in SDK 2.x dumps) is True fails.
+
+    The row takes the shape on_tool_error_callback writes: the call's tool,
+    args and origin as content, status ERROR and a non-null error_message.
+    """
+    result = {
+        "content": [{"type": "text", "text": "Git reset to remote failed."}],
+        error_flag: True,
+    }
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra, dummy_arrow_schema, tool_context, result
+    )
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", "TOOL_ERROR"]
+    error_row = rows[1]
+    assert error_row["status"] == "ERROR"
+    assert "isError" in error_row["error_message"]
+    assert json.loads(error_row["content"]) == {
+        "tool": "_run_query",
+        "args": {"query": "SELECT 1"},
+        "tool_origin": "LOCAL",
+    }
+
+  @pytest.mark.asyncio
+  async def test_mcp_error_text_is_not_recorded_in_the_tool_error_row(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """The MCP error text is tool output, so the TOOL_ERROR row omits it.
+
+    error_message bypasses content_formatter and payload_column_denylist,
+    and a formatter written for TOOL_COMPLETED results would not scrub a
+    result copied into TOOL_ERROR content.
+    """
+    result = {
+        "content": [{"type": "text", "text": "secret-bearing tool output"}],
+        "isError": True,
+    }
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra, dummy_arrow_schema, tool_context, result
+    )
+
+    error_row = rows[-1]
+    assert error_row["event_type"] == "TOOL_ERROR"
+    assert "secret-bearing tool output" not in json.dumps(
+        error_row, default=str
+    )
+
+  @pytest.mark.parametrize(
+      "result",
+      [
+          {"content": [{"type": "text", "text": "3 rows"}], "isError": False},
+          {"content": [{"type": "text", "text": "3 rows"}], "is_error": False},
+          {"content": [{"type": "text", "text": "3 rows"}], "isError": "no"},
+          {"content": [{"type": "text", "text": "3 rows"}]},
+      ],
+      ids=["is_error_false", "snake_case_false", "non_bool_flag", "no_flag"],
+  )
+  @pytest.mark.asyncio
+  async def test_mcp_result_without_error_flag_is_recorded_as_tool_completed(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context, result
+  ):
+    """Only an error flag that is exactly True marks an MCP result failed."""
+    rows = await self._record_tool_call(
+        _mock_bq_infra, dummy_arrow_schema, tool_context, result
+    )
+
+    assert [r["event_type"] for r in rows] == [
+        "TOOL_STARTING",
+        "TOOL_COMPLETED",
+    ]
+    assert rows[1]["status"] == "OK"
+    assert rows[1]["error_message"] is None
+
+  @pytest.mark.asyncio
+  async def test_reflect_and_retry_response_is_recorded_as_tool_error(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A ReflectAndRetryToolPlugin answer to a raised error is a TOOL_ERROR.
+
+    Its error_message is the text on_tool_error_callback records for the
+    same exception when no plugin answers it first.
+    """
+    from google.adk.plugins.reflect_retry_tool_plugin import ReflectAndRetryToolPlugin
+    from google.adk.tools.function_tool import FunctionTool
+
+    reflect_response = await ReflectAndRetryToolPlugin(
+        max_retries=3
+    ).on_tool_error_callback(
+        tool=FunctionTool(_run_query),
+        tool_args={"query": "SELECT 1"},
+        tool_context=tool_context,
+        error=RuntimeError("MCP request failed with code 403: Access Denied"),
+    )
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra, dummy_arrow_schema, tool_context, reflect_response
+    )
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", "TOOL_ERROR"]
+    assert rows[1]["status"] == "ERROR"
+    assert (
+        rows[1]["error_message"]
+        == "MCP request failed with code 403: Access Denied"
+    )
+
+  @pytest.mark.asyncio
+  async def test_reflect_and_retry_error_text_is_redacted(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """The retry plugin's error text passes the error_message redaction."""
+    from google.adk.plugins.reflect_retry_tool_plugin import ReflectAndRetryToolPlugin
+    from google.adk.tools.function_tool import FunctionTool
+
+    reflect_response = await ReflectAndRetryToolPlugin().on_tool_error_callback(
+        tool=FunctionTool(_run_query),
+        tool_args={"query": "SELECT 1"},
+        tool_context=tool_context,
+        error=RuntimeError("upstream rejected api_key=sk-live-123"),
+    )
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra, dummy_arrow_schema, tool_context, reflect_response
+    )
+
+    assert rows[1]["event_type"] == "TOOL_ERROR"
+    assert "sk-live-123" not in rows[1]["error_message"]
+
+  @pytest.mark.asyncio
+  async def test_unrelated_error_details_key_is_recorded_as_tool_completed(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A tool's own error_details field does not make its result a failure."""
+    result = {"status": "SUCCESS", "error_details": "2 duplicate rows skipped"}
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra, dummy_arrow_schema, tool_context, result
+    )
+
+    assert [r["event_type"] for r in rows] == [
+        "TOOL_STARTING",
+        "TOOL_COMPLETED",
+    ]
+    assert rows[1]["status"] == "OK"
+    assert rows[1]["error_message"] is None
+
+  @pytest.mark.asyncio
+  async def test_classifier_records_an_application_failure_as_tool_error(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """tool_result_classifier flags a failure shape the built-ins ignore."""
+
+    def classify(tool, result):
+      del tool  # Unused.
+      if result.get("status") == "ERROR":
+        return bigquery_agent_analytics_plugin.ToolResultClassification(
+            status="ERROR", error_message="query failed"
+        )
+      return None
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=classify
+    )
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {"status": "ERROR", "error_details": "Table not found"},
+        config=config,
+    )
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", "TOOL_ERROR"]
+    assert rows[1]["status"] == "ERROR"
+    assert rows[1]["error_message"] == "query failed"
+
+  @pytest.mark.asyncio
+  async def test_classifier_ok_overrides_the_builtin_rules(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A classifier that returns OK keeps a flagged result TOOL_COMPLETED."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=lambda tool, result: (
+            bigquery_agent_analytics_plugin.ToolResultClassification(
+                status="OK"
+            )
+        )
+    )
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {"content": [], "isError": True},
+        config=config,
+    )
+
+    assert [r["event_type"] for r in rows] == [
+        "TOOL_STARTING",
+        "TOOL_COMPLETED",
+    ]
+    assert rows[1]["status"] == "OK"
+
+  @pytest.mark.asyncio
+  async def test_classifier_returning_none_defers_to_the_builtin_rules(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A classifier with no opinion leaves the result to the built-ins."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=lambda tool, result: None
+    )
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {"content": [], "isError": True},
+        config=config,
+    )
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", "TOOL_ERROR"]
+
+  @pytest.mark.asyncio
+  async def test_classifier_error_without_message_records_a_message(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """An ERROR classification without a message still sets error_message."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=lambda tool, result: (
+            bigquery_agent_analytics_plugin.ToolResultClassification(
+                status="ERROR"
+            )
+        )
+    )
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {"rows": 0},
+        config=config,
+    )
+
+    assert rows[1]["event_type"] == "TOOL_ERROR"
+    assert rows[1]["error_message"]
+
+  @pytest.mark.asyncio
+  async def test_classifier_that_raises_falls_back_to_the_builtin_rules(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context, caplog
+  ):
+    """A failing classifier neither drops the row nor logs the result."""
+
+    def classify(tool, result):
+      raise ValueError(f"cannot classify {tool.name}: {result}")
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=classify
+    )
+    result = {
+        "content": [{"type": "text", "text": "sensitive tool output"}],
+        "isError": True,
+    }
+
+    with caplog.at_level(logging.DEBUG):
+      rows = await self._record_tool_call(
+          _mock_bq_infra,
+          dummy_arrow_schema,
+          tool_context,
+          result,
+          config=config,
+      )
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", "TOOL_ERROR"]
+    assert "tool_result_classifier" in caplog.text
+    assert "sensitive tool output" not in caplog.text
+
+  @pytest.mark.asyncio
+  async def test_classifier_returning_an_unsupported_value_is_ignored(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A classifier result other than a classification or None is ignored."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=lambda tool, result: ("ERROR", "query failed")
+    )
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {"rows": 3},
+        config=config,
+    )
+
+    assert [r["event_type"] for r in rows] == [
+        "TOOL_STARTING",
+        "TOOL_COMPLETED",
+    ]
+
+  def test_non_callable_classifier_is_rejected(self):
+    """A tool_result_classifier that cannot be called fails at construction."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier="ERROR"
+    )
+
+    with pytest.raises(ValueError, match="tool_result_classifier"):
+      bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+          PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+      )
+
+  def test_classification_rejects_an_unknown_status(self):
+    """A classification can only record a call as OK or ERROR."""
+    with pytest.raises(ValueError, match="status"):
+      bigquery_agent_analytics_plugin.ToolResultClassification(status="FAILED")
+
+  @pytest.mark.asyncio
+  async def test_errored_final_response_tool_does_not_log_agent_response(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A final-response tool that failed delivered no final answer."""
+    from google.adk.tools.function_tool import FunctionTool
+
+    def submit_final_response(answer: str) -> dict:
+      return {"answer": answer}
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        final_response_tool_names=frozenset({"submit_final_response"})
+    )
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {"content": [], "isError": True},
+        config=config,
+        tool=FunctionTool(submit_final_response),
+        tool_args={"answer": "The table has 241 rows."},
+    )
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", "TOOL_ERROR"]
+
+  @pytest.mark.asyncio
+  async def test_tool_error_from_a_result_closes_the_tool_span(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """The TOOL_ERROR row pairs with TOOL_STARTING as TOOL_COMPLETED does."""
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {"content": [], "isError": True},
+    )
+
+    starting_row, error_row = rows
+    assert error_row["event_type"] == "TOOL_ERROR"
+    assert error_row["span_id"] == starting_row["span_id"]
+    assert json.loads(error_row["latency_ms"])["total_ms"] >= 0
+    current_span_id = (
+        bigquery_agent_analytics_plugin.TraceManager.get_current_span_id()
+    )
+    assert current_span_id != starting_row["span_id"]
+
+  @pytest.mark.asyncio
+  async def test_answer_to_a_recorded_error_adds_no_row_and_pops_no_span(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A later plugin's answer to a recorded error changes nothing.
+
+    Setup: the analytics plugin runs before ReflectAndRetryToolPlugin, so its
+      on_tool_error_callback records the failure before the retry plugin
+      answers it.
+    Act: the answer reaches after_tool_callback as the call's result.
+    Assert: the call has one TOOL_ERROR row, and the span that was current
+      before the call is current again.
+    """
+    from google.adk.plugins.reflect_retry_tool_plugin import ReflectAndRetryToolPlugin
+    from google.adk.tools.function_tool import FunctionTool
+
+    tool = FunctionTool(_run_query)
+    tool_args = {"query": "SELECT 1"}
+    error = RuntimeError("boom")
+    trace_manager = bigquery_agent_analytics_plugin.TraceManager
+    trace_manager.clear_stack()
+    caller_span_id = trace_manager.push_span(tool_context, "agent")
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    ) as plugin:
+      await plugin._ensure_started()
+      _mock_bq_infra.append_rows.reset_mock()
+      await plugin.before_tool_callback(
+          tool=tool, tool_args=tool_args, tool_context=tool_context
+      )
+      await plugin.on_tool_error_callback(
+          tool=tool, tool_args=tool_args, tool_context=tool_context, error=error
+      )
+      answer = await ReflectAndRetryToolPlugin().on_tool_error_callback(
+          tool=tool, tool_args=tool_args, tool_context=tool_context, error=error
+      )
+      await plugin.after_tool_callback(
+          tool=tool,
+          tool_args=tool_args,
+          tool_context=tool_context,
+          result=answer,
+      )
+      span_id_after_call = trace_manager.get_current_span_id()
+      await plugin.flush()
+      rows = await _get_captured_rows_async(_mock_bq_infra, dummy_arrow_schema)
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", "TOOL_ERROR"]
+    assert span_id_after_call == caller_span_id
+
+  @pytest.mark.asyncio
+  async def test_recorded_error_of_one_call_does_not_skip_the_next_call(
+      self, _mock_bq_infra, dummy_arrow_schema, invocation_context
+  ):
+    """after_tool_callback skips only the call on_tool_error_callback saw."""
+    from google.adk.tools.function_tool import FunctionTool
+
+    tool = FunctionTool(_run_query)
+    failed_call = tool_context_lib.ToolContext(
+        invocation_context=invocation_context
+    )
+    next_call = tool_context_lib.ToolContext(
+        invocation_context=invocation_context
+    )
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    ) as plugin:
+      await plugin._ensure_started()
+      _mock_bq_infra.append_rows.reset_mock()
+      await plugin.before_tool_callback(
+          tool=tool, tool_args={"query": "a"}, tool_context=failed_call
+      )
+      await plugin.on_tool_error_callback(
+          tool=tool,
+          tool_args={"query": "a"},
+          tool_context=failed_call,
+          error=RuntimeError("boom"),
+      )
+      await plugin.before_tool_callback(
+          tool=tool, tool_args={"query": "b"}, tool_context=next_call
+      )
+      await plugin.after_tool_callback(
+          tool=tool,
+          tool_args={"query": "b"},
+          tool_context=next_call,
+          result={"rows": 1},
+      )
+      await plugin.flush()
+      rows = await _get_captured_rows_async(_mock_bq_infra, dummy_arrow_schema)
+
+    assert [r["event_type"] for r in rows] == [
+        "TOOL_STARTING",
+        "TOOL_ERROR",
+        "TOOL_STARTING",
+        "TOOL_COMPLETED",
+    ]
+
+  async def _run_turn(
+      self, mock_write_client, dummy_arrow_schema, tool, plugins_around
+  ):
+    """Runs a turn in which the model calls ``tool`` once, then answers.
+
+    ``plugins_around`` receives the analytics plugin and returns the
+    plugin list in registration order.
+
+    Returns:
+      The function responses the model received, and the rows written.
+    """
+    from google.adk.agents.llm_agent import LlmAgent
+
+    from .. import testing_utils
+
+    mock_model = testing_utils.MockModel(
+        responses=[
+            testing_utils.LlmResponse(
+                content=testing_utils.ModelContent(
+                    parts=[
+                        types.Part(
+                            function_call=types.FunctionCall(
+                                name=tool.name, args={}
+                            )
+                        )
+                    ]
+                )
+            ),
+            testing_utils.LlmResponse(
+                content=testing_utils.ModelContent(
+                    parts=[types.Part(text="done")]
+                )
+            ),
+        ]
+    )
+    bq_plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        project_id=PROJECT_ID, dataset_id=DATASET_ID, table_id=TABLE_ID
+    )
+    await bq_plugin._ensure_started()
+    mock_write_client.append_rows.reset_mock()
+    agent = LlmAgent(name="agent", model=mock_model, tools=[tool])
+    runner = testing_utils.InMemoryRunner(
+        root_agent=agent, plugins=plugins_around(bq_plugin)
+    )
+    try:
+      events = await runner.run_async(testing_utils.UserContent("go"))
+      await bq_plugin.flush()
+      rows = await _get_captured_rows_async(
+          mock_write_client, dummy_arrow_schema
+      )
+    finally:
+      await bq_plugin.shutdown()
+
+    function_responses = [
+        part.function_response.response
+        for event in events
+        if event.content
+        for part in event.content.parts
+        if part.function_response
+    ]
+    return function_responses, rows
+
+  @pytest.mark.parametrize(
+      "analytics_first", [False, True], ids=["retry_first", "analytics_first"]
+  )
+  @pytest.mark.asyncio
+  async def test_raised_error_answered_by_retry_plugin_is_recorded_once(
+      self, _mock_bq_infra, dummy_arrow_schema, analytics_first
+  ):
+    """Either plugin order records one TOOL_ERROR row and no TOOL_COMPLETED.
+
+    Setup: a tool that raises, ReflectAndRetryToolPlugin and the analytics
+      plugin, registered in either order.
+    Act: run one turn in which the model calls the tool once.
+    Assert: the tool's rows are TOOL_STARTING then one TOOL_ERROR carrying
+      the exception text, and the model still receives the retry guidance.
+    """
+    from google.adk.plugins.reflect_retry_tool_plugin import ReflectAndRetryToolPlugin
+    from google.adk.tools.function_tool import FunctionTool
+
+    def raising_tool() -> str:
+      raise RuntimeError("MCP request failed with code 403: Access Denied")
+
+    retry_plugin = ReflectAndRetryToolPlugin(max_retries=3)
+
+    function_responses, rows = await self._run_turn(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        FunctionTool(raising_tool),
+        lambda bq_plugin: (
+            [bq_plugin, retry_plugin]
+            if analytics_first
+            else [retry_plugin, bq_plugin]
+        ),
+    )
+
+    assert [
+        (r["event_type"], r["status"], r["error_message"])
+        for r in rows
+        if r["event_type"].startswith("TOOL_")
+    ] == [
+        ("TOOL_STARTING", "OK", None),
+        (
+            "TOOL_ERROR",
+            "ERROR",
+            "MCP request failed with code 403: Access Denied",
+        ),
+    ]
+    assert [r["response_type"] for r in function_responses] == [
+        "ERROR_HANDLED_BY_REFLECT_AND_RETRY_PLUGIN"
+    ]
+
+  @pytest.mark.asyncio
+  async def test_mcp_error_result_reaches_the_model_unchanged(
+      self, _mock_bq_infra, dummy_arrow_schema
+  ):
+    """Recording a TOOL_ERROR row leaves the result the model receives as is."""
+    from google.adk.tools.function_tool import FunctionTool
+
+    def mcp_style_failure() -> dict:
+      return {
+          "content": [{"type": "text", "text": "Git reset to remote failed."}],
+          "isError": True,
+      }
+
+    function_responses, rows = await self._run_turn(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        FunctionTool(mcp_style_failure),
+        lambda bq_plugin: [bq_plugin],
+    )
+
+    assert [
+        r["event_type"] for r in rows if r["event_type"].startswith("TOOL_")
+    ] == ["TOOL_STARTING", "TOOL_ERROR"]
+    assert function_responses == [{
+        "content": [{"type": "text", "text": "Git reset to remote failed."}],
+        "isError": True,
+    }]
+
 
 class TestHITLTracing:
   """Tests for HITL-specific event emission via on_event_callback.

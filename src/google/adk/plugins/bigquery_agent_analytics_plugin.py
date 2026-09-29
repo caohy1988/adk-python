@@ -49,6 +49,7 @@ os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 
 import random
 import re
+import sys
 import threading
 import time
 from types import MappingProxyType
@@ -58,6 +59,7 @@ from typing import AsyncIterator
 from typing import Callable
 from typing import cast
 from typing import Coroutine
+from typing import Literal
 from typing import Optional
 from typing import ParamSpec
 from typing import Protocol
@@ -103,6 +105,7 @@ from ..tools.base_tool import BaseTool
 from ..tools.tool_context import ToolContext
 from ..utils._telemetry_context import _get_telemetry_surface
 from ..version import __version__
+from ._reflect_retry_utils import REFLECT_AND_RETRY_RESPONSE_TYPE
 from .base_plugin import BasePlugin
 
 if TYPE_CHECKING:
@@ -645,6 +648,44 @@ def _find_transfer_target(agent: Any, agent_name: str) -> Any:
   return None
 
 
+_SKILL_TOOLSET_MODULE = "google.adk.tools.skill_toolset"
+# The tools SkillToolset itself provides to list, load and run skills. Tools
+# an application adds to a SkillToolset keep their own origin.
+_SKILL_TOOL_TYPE_NAMES = (
+    "ListSkillsTool",
+    "LoadSkillResourceTool",
+    "LoadSkillTool",
+    "RunSkillScriptTool",
+    "SearchSkillsTool",
+    "UnloadSkillTool",
+)
+
+
+def _imported_types(
+    module_name: str, *type_names: str
+) -> tuple[type[object], ...]:
+  """Returns the named classes of a module the process has already imported.
+
+  Looking the module up in ``sys.modules`` never imports it: ``toolbox_adk`` is
+  an optional dependency, and importing a module the application does not use
+  would slow down its first tool call. No tool can be an instance of a class
+  whose module was never imported, so an empty result is still exact.
+
+  Args:
+      module_name: The module that defines the classes.
+      *type_names: The names of the classes.
+
+  Returns:
+      The classes found, or an empty tuple if the module is not imported.
+  """
+  module = sys.modules.get(module_name)
+  return tuple(
+      candidate
+      for name in type_names
+      if isinstance(candidate := getattr(module, name, None), type)
+  )
+
+
 def _get_tool_origin(
     tool: "BaseTool",
     tool_args: Optional[dict[str, Any]] = None,
@@ -669,7 +710,7 @@ def _get_tool_origin(
 
   Returns:
       One of LOCAL, MCP, A2A, SUB_AGENT, TRANSFER_AGENT,
-      TRANSFER_A2A, or UNKNOWN.
+      TRANSFER_A2A, TOOLBOX, SKILL, or UNKNOWN.
   """
   # Import lazily to avoid circular dependencies.
   # pylint: disable=g-import-not-at-top
@@ -715,7 +756,59 @@ def _get_tool_origin(
     return "SUB_AGENT"
   if isinstance(tool, FunctionTool):
     return "LOCAL"
+  if isinstance(tool, _imported_types("toolbox_adk", "ToolboxTool")):
+    return "TOOLBOX"
+  if isinstance(
+      tool, _imported_types(_SKILL_TOOLSET_MODULE, *_SKILL_TOOL_TYPE_NAMES)
+  ):
+    return "SKILL"
   return "UNKNOWN"
+
+
+_MCP_TOOL_ERROR_MESSAGE = "Tool returned an MCP result with isError=true."
+_REFLECT_AND_RETRY_TOOL_ERROR_MESSAGE = (
+    "Tool raised an error that ReflectAndRetryToolPlugin handled."
+)
+_CLASSIFIED_TOOL_ERROR_MESSAGE = (
+    "tool_result_classifier classified the tool result as an error."
+)
+
+
+def _builtin_tool_result_error_message(result: Any) -> Optional[str]:
+  """Returns the error message for a result shape ADK uses to report failure.
+
+  Two shapes count as failures:
+
+  * A ``ReflectAndRetryToolPlugin`` response, identified by its
+    ``response_type``. The tool raised, and the retry plugin answered the error
+    before this plugin's ``on_tool_error_callback`` saw it. The response's
+    ``error_details`` is ``str(error)``, the text ``on_tool_error_callback``
+    records for the same exception; an exception without a message leaves it
+    empty, and the exception's type name is recorded instead.
+  * An MCP ``CallToolResult`` whose ``isError`` (``is_error`` in an unaliased
+    MCP SDK 2.x dump) is ``True``. Its text is tool output, which
+    ``content_formatter`` and ``payload_column_denylist`` govern but
+    ``error_message`` bypasses, so the message is fixed.
+
+  Any other result succeeded, including one that merely has an
+  ``error_details`` key.
+
+  Args:
+      result: The tool result.
+
+  Returns:
+      The error message, or None if the result does not report a failure.
+  """
+  if not isinstance(result, dict):
+    return None
+  if result.get("response_type") == REFLECT_AND_RETRY_RESPONSE_TYPE:
+    message = result.get("error_details") or result.get("error_type")
+    if isinstance(message, str):
+      return message
+    return _REFLECT_AND_RETRY_TOOL_ERROR_MESSAGE
+  if result.get("isError") is True or result.get("is_error") is True:
+    return _MCP_TOOL_ERROR_MESSAGE
+  return None
 
 
 def _extract_tool_declarations(
@@ -1436,7 +1529,7 @@ def _validate_runtime_config(config: "BigQueryLoggerConfig") -> None:
 
   Raises:
       ValueError: If any batch, queue, duration, or retry setting is
-        invalid.
+        invalid, or ``tool_result_classifier`` is not callable.
   """
   _require_count("batch_size", config.batch_size, 1)
   _require_finite("batch_flush_interval", config.batch_flush_interval, 0)
@@ -1479,6 +1572,13 @@ def _validate_runtime_config(config: "BigQueryLoggerConfig") -> None:
     raise ValueError(
         "retry_config.max_delay must be >= initial_delay, got"
         f" max_delay={retry.max_delay} initial_delay={retry.initial_delay}."
+    )
+  if config.tool_result_classifier is not None and not callable(
+      config.tool_result_classifier
+  ):
+    raise ValueError(
+        "tool_result_classifier must be callable, got"
+        f" {type(config.tool_result_classifier).__name__}."
     )
 
 
@@ -2070,6 +2170,41 @@ class RetryConfig:
   max_delay: float = 10.0
 
 
+@dataclass(frozen=True)
+class ToolResultClassification:
+  """A ``BigQueryLoggerConfig.tool_result_classifier`` verdict on a result.
+
+  For example, to record a tool that reports failure in a ``status`` field:
+
+  ```python
+  def classify(tool, result):
+    if isinstance(result, dict) and result.get("status") == "ERROR":
+      return ToolResultClassification(status="ERROR", error_message="failed")
+    return None  # Leave every other result to the built-in rules.
+
+  config = BigQueryLoggerConfig(tool_result_classifier=classify)
+  ```
+
+  Attributes:
+      status: ``"ERROR"`` records the call as ``TOOL_ERROR`` with status
+        ``ERROR``. ``"OK"`` records it as ``TOOL_COMPLETED``, even when a
+        built-in rule would have recorded a failure.
+      error_message: The ``error_message`` of the ``TOOL_ERROR`` row, ignored
+        for ``"OK"``. A fixed message is recorded when it is empty. It is
+        redacted and truncated like every error message, but
+        ``content_formatter`` and ``payload_column_denylist`` do not apply to
+        it, so copy tool output into it only where storing that output is
+        acceptable.
+  """
+
+  status: Literal["OK", "ERROR"]
+  error_message: Optional[str] = None
+
+  def __post_init__(self) -> None:
+    if self.status not in ("OK", "ERROR"):
+      raise ValueError(f"status must be 'OK' or 'ERROR', got {self.status!r}.")
+
+
 @dataclass
 class BigQueryLoggerConfig:
   """Configuration for the BigQueryAgentAnalyticsPlugin.
@@ -2148,6 +2283,17 @@ class BigQueryLoggerConfig:
       credentials_identifier: Optional explicit string identifier to
         disambiguate or share background loop states across plugin instances
         with equivalent credential identities.
+      tool_result_classifier: Optional callable ``(tool, result)``, called
+        synchronously on each result that reaches ``after_tool_callback``,
+        that decides whether the result reports a failure. Return a
+        ``ToolResultClassification`` to record the call as ``TOOL_ERROR``
+        (``status="ERROR"``) or as ``TOOL_COMPLETED`` (``status="OK"``), or
+        ``None`` to leave it to the built-in rules, which record a
+        ``ReflectAndRetryToolPlugin`` response and an MCP result with
+        ``isError`` set as ``TOOL_ERROR``. ``result`` is the object the model
+        receives and must not be modified. If the callable raises or returns
+        anything else, the built-in rules apply and the logged warning names
+        only the tool.
   """
 
   enabled: bool = True
@@ -2233,6 +2379,10 @@ class BigQueryLoggerConfig:
   # flush_on_run_end is False.
   use_dedicated_background_loop: Optional[bool] = None
   credentials_identifier: Optional[str] = None
+  # Application rules for tool results that report a failure without raising.
+  tool_result_classifier: Optional[
+      Callable[[BaseTool, Any], Optional[ToolResultClassification]]
+  ] = None
 
 
 # ==============================================================================
@@ -2258,6 +2408,16 @@ _root_agent_name_ctx: contextvars.ContextVar[Optional[str]] = (
 _active_invocation_id_ctx: contextvars.ContextVar[Optional[str]] = (
     contextvars.ContextVar("_bq_analytics_active_invocation_id", default=None)
 )
+
+# The tool call whose failure on_tool_error_callback recorded last. When a
+# plugin registered after this one answers that error (ReflectAndRetryToolPlugin,
+# for example), the answer reaches after_tool_callback as the call's result, and
+# that callback must neither record the failure again nor pop the span the error
+# callback already closed. The reference is weak so that a call ending without
+# after_tool_callback does not keep its context alive.
+_tool_error_recorded_ctx: contextvars.ContextVar[
+    Optional[weakref.ref[ToolContext]]
+] = contextvars.ContextVar("_bq_analytics_tool_error_recorded", default=None)
 
 
 @dataclass
@@ -8216,21 +8376,24 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
   ) -> None:
     """Callback after tool execution.
 
+    A result that reports a failure is recorded as ``TOOL_ERROR``, the row
+    ``on_tool_error_callback`` writes for a raised error; see
+    ``_tool_result_error_message``. The result itself is left unchanged.
+
     Args:
         tool: The tool that was executed.
         tool_args: The arguments passed to the tool.
         tool_context: The tool context.
         result: The response from the tool.
     """
-    resp_truncated, is_truncated = _recursive_smart_truncate(
-        result, self.config.max_content_length
-    )
+    recorded = _tool_error_recorded_ctx.get()
+    if recorded is not None and recorded() is tool_context:
+      # on_tool_error_callback already recorded this call's failure and closed
+      # its span; the result is the answer a later plugin gave to the error.
+      _tool_error_recorded_ctx.set(None)
+      return
+
     tool_origin = _get_tool_origin(tool, tool_args, tool_context)
-    content_dict = {
-        "tool": tool.name,
-        "result": resp_truncated,
-        "tool_origin": tool_origin,
-    }
     span_id, duration = TraceManager.pop_span()
     parent_span_id, _ = TraceManager.get_current_span_and_parent()
 
@@ -8239,6 +8402,37 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         span_id_override=span_id,
         parent_span_id_override=parent_span_id,
     )
+    error_message = self._tool_result_error_message(tool, result)
+    if error_message is not None:
+      # The content is what on_tool_error_callback records. The result stays
+      # out: its error text is tool output, and a content_formatter written
+      # for TOOL_COMPLETED rows would not scrub it from a TOOL_ERROR row.
+      args_truncated, args_is_truncated = _recursive_smart_truncate(
+          tool_args, self.config.max_content_length
+      )
+      event_data.status = "ERROR"
+      event_data.error_message = error_message
+      await self._log_event(
+          "TOOL_ERROR",
+          tool_context,
+          raw_content={
+              "tool": tool.name,
+              "args": args_truncated,
+              "tool_origin": tool_origin,
+          },
+          is_truncated=args_is_truncated,
+          event_data=event_data,
+      )
+      return
+
+    resp_truncated, is_truncated = _recursive_smart_truncate(
+        result, self.config.max_content_length
+    )
+    content_dict = {
+        "tool": tool.name,
+        "result": resp_truncated,
+        "tool_origin": tool_origin,
+    }
     await self._log_event(
         "TOOL_COMPLETED",
         tool_context,
@@ -8265,6 +8459,49 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           is_truncated=args_is_truncated,
           event_data=EventData(extra_attributes={"source_tool": tool.name}),
       )
+
+  def _tool_result_error_message(
+      self, tool: BaseTool, result: Any
+  ) -> Optional[str]:
+    """Returns the error message to record for a tool result that failed.
+
+    ``config.tool_result_classifier`` decides first, then
+    ``_builtin_tool_result_error_message``. A classifier that raises or
+    returns anything other than a ``ToolResultClassification`` or None is
+    skipped with a warning that names only the tool: its exception, the
+    traceback, and its return value can all carry the result.
+
+    Args:
+        tool: The tool that produced the result.
+        result: The result the model receives.
+
+    Returns:
+        The message of a ``TOOL_ERROR`` row, or None to record the result as
+        ``TOOL_COMPLETED``.
+    """
+    classifier = self.config.tool_result_classifier
+    if classifier is not None:
+      try:
+        classification = classifier(tool, result)
+      except Exception:  # pylint: disable=broad-except
+        logger.warning(
+            "tool_result_classifier failed for tool %s; applying the built-in"
+            " rules instead.",
+            tool.name,
+        )
+      else:
+        if isinstance(classification, ToolResultClassification):
+          if classification.status == "OK":
+            return None
+          return classification.error_message or _CLASSIFIED_TOOL_ERROR_MESSAGE
+        if classification is not None:
+          logger.warning(
+              "tool_result_classifier returned neither a"
+              " ToolResultClassification nor None for tool %s; applying the"
+              " built-in rules instead.",
+              tool.name,
+          )
+    return _builtin_tool_result_error_message(result)
 
   @_safe_callback
   async def on_tool_error_callback(
@@ -8294,6 +8531,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     }
     span_id, duration = TraceManager.pop_span()
     parent_span_id, _ = TraceManager.get_current_span_and_parent()
+    _tool_error_recorded_ctx.set(weakref.ref(tool_context))
 
     await self._log_event(
         "TOOL_ERROR",
