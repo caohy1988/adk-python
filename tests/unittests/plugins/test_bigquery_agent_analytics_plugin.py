@@ -6498,6 +6498,50 @@ class _UnprintableValue:
     raise RuntimeError(_PAYLOAD_SECRET)
 
 
+class _Summary(BaseModel):
+  """An application's result model with one typed field."""
+
+  summary: str
+
+
+class _SummaryWithOwnDump(BaseModel):
+  """A result model whose own model_dump takes no keywords and drops a field."""
+
+  summary: str
+  token: str
+
+  def model_dump(self):  # pylint: disable=arguments-differ
+    return {"summary": self.summary}
+
+
+def _print_warning(message, category, filename, lineno, file=None, line=None):
+  """Prints a warning to stderr, as Python shows one by default."""
+  sys.stderr.write(
+      warnings.formatwarning(message, category, filename, lineno, line)
+  )
+
+
+@contextlib.contextmanager
+def _warnings_shown(display):
+  """Shows every warning the way an application would see it.
+
+  pytest records warnings instead of showing them, so this restores one of the
+  two usual displays: printed to stderr, or logged to ``py.warnings`` once an
+  application calls ``logging.captureWarnings(True)``.
+  """
+  with warnings.catch_warnings():
+    warnings.simplefilter("always")
+    if display == "stderr":
+      warnings.showwarning = _print_warning
+      yield
+    else:
+      logging.captureWarnings(True)
+      try:
+        yield
+      finally:
+        logging.captureWarnings(False)
+
+
 class _CollidingKey:
   """A dict key that hashes like another key and raises when compared."""
 
@@ -7177,6 +7221,105 @@ class TestToolResultErrorClassification:
     ]
     assert json.loads(rows[1]["content"])["result"] == "[UNPARSEABLE_JSON_BLOB]"
     assert _PAYLOAD_SECRET not in caplog.text
+
+  @pytest.mark.parametrize("display", ["stderr", "py.warnings"])
+  @pytest.mark.parametrize("kind", ["mcp_model", "application_model"])
+  @pytest.mark.asyncio
+  async def test_result_field_that_no_longer_fits_is_not_quoted_in_a_warning(
+      self,
+      _mock_bq_infra,
+      dummy_arrow_schema,
+      tool_context,
+      caplog,
+      capsys,
+      kind,
+      display,
+  ):
+    """Dumping a tool result raises no Pydantic warning that quotes it.
+
+    Pydantic still dumps a model whose field no longer matches its type, such
+    as an MCP result whose content list was appended to after validation, but
+    first warns with a UserWarning that quotes the value, before any
+    content_formatter sees it. The row keeps the dumped result.
+    """
+    if kind == "mcp_model":
+      mcp_types = pytest.importorskip("mcp.types")
+      result = mcp_types.CallToolResult(content=[], isError=False)
+      result.content.append({"type": "text", "text": _PAYLOAD_SECRET})
+      dumped_field = ("content", [{"type": "text", "text": _PAYLOAD_SECRET}])
+    else:
+      result = _Summary(summary="ok")
+      result.summary = {"details": _PAYLOAD_SECRET}
+      dumped_field = ("summary", {"details": _PAYLOAD_SECRET})
+
+    with _warnings_shown(display):
+      rows = await self._record_tool_call(
+          _mock_bq_infra, dummy_arrow_schema, tool_context, result
+      )
+
+    assert [r["event_type"] for r in rows] == [
+        "TOOL_STARTING",
+        "TOOL_COMPLETED",
+    ]
+    name, value = dumped_field
+    assert json.loads(rows[1]["content"])["result"][name] == value
+    assert _PAYLOAD_SECRET not in capsys.readouterr().err
+    assert _PAYLOAD_SECRET not in caplog.text
+
+  @pytest.mark.parametrize("display", ["stderr", "py.warnings"])
+  @pytest.mark.asyncio
+  async def test_result_field_that_no_longer_fits_is_not_quoted_in_a_turn(
+      self, _mock_bq_infra, dummy_arrow_schema, caplog, capsys, display
+  ):
+    """No row of a real turn quotes such a result in a warning.
+
+    The TOOL_COMPLETED row dumps the result, and the next LLM_REQUEST row
+    dumps the function response that carries it to the model, even when
+    log_multi_modal_content keeps it out of the row.
+    """
+    from google.adk.tools.function_tool import FunctionTool
+
+    mcp_types = pytest.importorskip("mcp.types")
+
+    def fetch_rows():
+      result = mcp_types.CallToolResult(content=[], isError=False)
+      result.content.append({"type": "text", "text": _PAYLOAD_SECRET})
+      return result
+
+    with _warnings_shown(display):
+      _, rows = await self._run_turn(
+          _mock_bq_infra,
+          dummy_arrow_schema,
+          FunctionTool(fetch_rows),
+          lambda bq_plugin: [bq_plugin],
+          config=bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+              log_multi_modal_content=False
+          ),
+      )
+
+    event_types = [r["event_type"] for r in rows]
+    assert "TOOL_COMPLETED" in event_types
+    assert event_types.count("LLM_REQUEST") == 2
+    assert _PAYLOAD_SECRET not in capsys.readouterr().err
+    assert _PAYLOAD_SECRET not in caplog.text
+
+  @pytest.mark.asyncio
+  async def test_model_dump_of_the_result_is_used_even_without_keywords(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A result model's own model_dump runs even if it takes no keywords.
+
+    Its override may leave out what the model must not report, so the result
+    is dumped by that override rather than read field by field.
+    """
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        _SummaryWithOwnDump(summary="ok", token=_PAYLOAD_SECRET),
+    )
+
+    assert json.loads(rows[1]["content"])["result"] == {"summary": "ok"}
 
   @pytest.mark.asyncio
   async def test_failure_to_classify_a_result_still_records_the_call(

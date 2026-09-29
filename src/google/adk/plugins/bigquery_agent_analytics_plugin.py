@@ -956,8 +956,10 @@ def _release_awaitable(awaitable: Any) -> None:
   A coroutine, native or generator-based, is closed, so that Python does not
   warn it was never awaited. An asyncio future or task that is still pending
   is cancelled, so a task that has not started never runs, and the exception
-  it ends with is retrieved, as is the exception of one already done. Any other
-  awaitable only runs code when it is awaited, so it is left as it is.
+  it ends with is retrieved, as is the exception of one already done. A task
+  that ignores the cancellation and never ends is still reported by asyncio
+  when it is destroyed. Any other awaitable only runs code when it is awaited,
+  so it is left as it is, along with any future it wraps.
   """
   if inspect.iscoroutine(awaitable) or inspect.isgenerator(awaitable):
     awaitable.close()
@@ -1875,6 +1877,23 @@ def _safe_getattr(obj: Any, name: str) -> Any:
     return None
 
 
+def _model_dump_quietly(model_dump: Callable[..., Any], **options: Any) -> Any:
+  """Calls a ``model_dump`` without letting Pydantic warn about the values.
+
+  Pydantic still dumps a field whose value no longer matches its type, such as
+  a list field appended to after validation, but first warns with a
+  ``UserWarning`` that quotes the value, before a ``content_formatter``, a
+  column denylist or ``log_multi_modal_content`` can apply to it.
+  ``warnings=False`` turns that off for this call only. A ``model_dump`` that
+  does not take the keyword, such as a narrower override, is called without
+  it, since the override may be what leaves out what must not be reported.
+  """
+  try:
+    return model_dump(warnings=False, **options)
+  except TypeError:
+    return model_dump(**options)
+
+
 # Stdlib scalar types whose str() form is canonical, side-effect free, and
 # cannot embed attribute state beyond the value itself. Only these keep the
 # stringify fallback; arbitrary objects' repr/str output is payload-
@@ -2139,7 +2158,7 @@ def _recursive_smart_truncate(
       # to a plain string that may itself be a credential blob, and
       # falling through to the generic fallback bypassed blob redaction.
       try:
-        dumped = model_dump_fn()
+        dumped = _model_dump_quietly(model_dump_fn)
         if isinstance(
             dumped,
             (collections.abc.Mapping, list, tuple, str, bytes, bytearray),
@@ -4033,7 +4052,9 @@ class HybridContentParser:
 
   def _serialize_part_model(self, value: Any) -> tuple[dict[str, Any], bool]:
     """Returns bounded JSON-native fields for a supported structured part."""
-    dumped = value.model_dump(exclude_none=True, mode="json")
+    dumped = _model_dump_quietly(
+        value.model_dump, exclude_none=True, mode="json"
+    )
     sanitized, content_lost = _recursive_smart_truncate(dumped, self.max_length)
     if not isinstance(sanitized, dict):
       return {"value": "[UNSUPPORTED_OBJECT]"}, True
@@ -8824,8 +8845,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
        its traceback and the returned value can all carry the result. A
        returned awaitable is ignored too, once ``_release_awaitable`` has
        closed it if it is a coroutine, or cancelled it and retrieved its
-       exception if it is an asyncio future or task, so that neither Python
-       nor asyncio later logs anything about it. A ``BaseException`` that is
+       exception if it is an asyncio future or task, so that Python does not
+       warn about the coroutine and asyncio does not later log an exception
+       the future or task holds. A ``BaseException`` that is
        not an ``Exception``, such as a cancellation, ``KeyboardInterrupt`` or
        ``SystemExit``, propagates as it does from every callback of this
        plugin, because absorbing it would keep a task or the process from
