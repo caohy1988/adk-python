@@ -17,6 +17,8 @@ import asyncio
 import concurrent.futures
 import contextlib
 import dataclasses
+import functools
+import gc
 import json
 import logging
 import os
@@ -25,6 +27,7 @@ import sys
 import threading
 import time
 from unittest import mock
+import warnings
 
 from google.adk.agents import base_agent
 from google.adk.agents.callback_context import CallbackContext
@@ -6412,6 +6415,83 @@ def _run_query(query: str) -> dict:
   return {"query": query}
 
 
+# Marks text a hostile value puts into the exceptions it raises, standing in
+# for tool output that must never reach the log.
+_PAYLOAD_SECRET = "PAYLOAD-SECRET"
+
+
+class _RaisingEq:
+  """A value whose == raises an exception that carries payload text."""
+
+  def __eq__(self, other):
+    raise RuntimeError(_PAYLOAD_SECRET)
+
+  __hash__ = object.__hash__
+
+
+class _RaisingBool:
+  """A value whose truth test raises an exception that carries payload text."""
+
+  def __bool__(self):
+    raise RuntimeError(_PAYLOAD_SECRET)
+
+
+class _RaisingGetDict(dict):
+  """A dict whose get() raises an exception that carries payload text."""
+
+  def get(self, *args, **kwargs):
+    raise RuntimeError(_PAYLOAD_SECRET)
+
+
+class _RaisingGetattr:
+  """An object whose missing attributes raise with payload text."""
+
+  def __getattr__(self, name):
+    raise RuntimeError(_PAYLOAD_SECRET)
+
+
+class _EqualsEverything:
+  """A value that claims to equal anything it is compared with."""
+
+  def __eq__(self, other):
+    return True
+
+  __hash__ = object.__hash__
+
+
+def _unvalidated_classification(**fields):
+  """Returns an ERROR classification with fields set past its validation."""
+  classification = bigquery_agent_analytics_plugin.ToolResultClassification(
+      status="ERROR"
+  )
+  for name, value in fields.items():
+    object.__setattr__(classification, name, value)
+  return classification
+
+
+class _UnreadableClassification(
+    bigquery_agent_analytics_plugin.ToolResultClassification
+):
+  """A classification whose fields raise with payload text when read."""
+
+  def __getattribute__(self, name):
+    if name in ("status", "error_message"):
+      raise RuntimeError(_PAYLOAD_SECRET)
+    return super().__getattribute__(name)
+
+
+async def _async_classifier(*_, **__):
+  """An asynchronous classifier, whose result the plugin cannot await."""
+  return None
+
+
+class _AsyncCallableClassifier:
+  """A classifier object whose __call__ is asynchronous."""
+
+  async def __call__(self, *_, **__):
+    return None
+
+
 class TestToolResultErrorClassification:
   """Tests for recording error-bearing tool results as ``TOOL_ERROR``.
 
@@ -6628,8 +6708,8 @@ class TestToolResultErrorClassification:
   ):
     """tool_result_classifier flags a failure shape the built-ins ignore."""
 
-    def classify(tool, result):
-      del tool  # Unused.
+    def classify(*, tool, tool_args, tool_context, result):
+      del tool, tool_args, tool_context  # Unused.
       if result.get("status") == "ERROR":
         return bigquery_agent_analytics_plugin.ToolResultClassification(
             status="ERROR", error_message="query failed"
@@ -6658,7 +6738,7 @@ class TestToolResultErrorClassification:
   ):
     """A classifier that returns OK keeps a flagged result TOOL_COMPLETED."""
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
-        tool_result_classifier=lambda tool, result: (
+        tool_result_classifier=lambda **_: (
             bigquery_agent_analytics_plugin.ToolResultClassification(
                 status="OK"
             )
@@ -6685,7 +6765,7 @@ class TestToolResultErrorClassification:
   ):
     """A classifier with no opinion leaves the result to the built-ins."""
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
-        tool_result_classifier=lambda tool, result: None
+        tool_result_classifier=lambda **_: None
     )
 
     rows = await self._record_tool_call(
@@ -6704,7 +6784,7 @@ class TestToolResultErrorClassification:
   ):
     """An ERROR classification without a message still sets error_message."""
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
-        tool_result_classifier=lambda tool, result: (
+        tool_result_classifier=lambda **_: (
             bigquery_agent_analytics_plugin.ToolResultClassification(
                 status="ERROR"
             )
@@ -6728,7 +6808,7 @@ class TestToolResultErrorClassification:
   ):
     """A failing classifier neither drops the row nor logs the result."""
 
-    def classify(tool, result):
+    def classify(*, tool, result, **_):
       raise ValueError(f"cannot classify {tool.name}: {result}")
 
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
@@ -6758,7 +6838,7 @@ class TestToolResultErrorClassification:
   ):
     """A classifier result other than a classification or None is ignored."""
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
-        tool_result_classifier=lambda tool, result: ("ERROR", "query failed")
+        tool_result_classifier=lambda **_: ("ERROR", "query failed")
     )
 
     rows = await self._record_tool_call(
@@ -6789,6 +6869,455 @@ class TestToolResultErrorClassification:
     """A classification can only record a call as OK or ERROR."""
     with pytest.raises(ValueError, match="status"):
       bigquery_agent_analytics_plugin.ToolResultClassification(status="FAILED")
+
+  def test_classification_rejects_a_message_that_is_not_text(self):
+    """A classification's error_message must be a str or None."""
+    with pytest.raises(ValueError, match="error_message"):
+      bigquery_agent_analytics_plugin.ToolResultClassification(
+          status="ERROR", error_message=_RaisingBool()
+      )
+
+  @pytest.mark.parametrize(
+      ("make_result", "event_type"),
+      [
+          (lambda: {"response_type": _RaisingEq()}, "TOOL_COMPLETED"),
+          (
+              lambda: {
+                  "response_type": (
+                      pytest.importorskip("numpy").array(["a", "b"])
+                  )
+              },
+              "TOOL_COMPLETED",
+          ),
+          (
+              lambda: {
+                  "response_type": (
+                      pytest.importorskip("pandas").Series(["a", "b"])
+                  )
+              },
+              "TOOL_COMPLETED",
+          ),
+          (
+              lambda: {
+                  "isError": True,
+                  "response_type": (
+                      pytest.importorskip("numpy").array(["a", "b"])
+                  ),
+              },
+              "TOOL_ERROR",
+          ),
+          (lambda: _RaisingGetDict({"rows": 1}), "TOOL_COMPLETED"),
+          (lambda: _RaisingGetDict({"isError": True}), "TOOL_ERROR"),
+          (lambda: {"isError": _RaisingBool()}, "TOOL_COMPLETED"),
+          (
+              lambda: {
+                  "response_type": "ERROR_HANDLED_BY_REFLECT_AND_RETRY_PLUGIN",
+                  "error_type": "RuntimeError",
+                  "error_details": _RaisingBool(),
+              },
+              "TOOL_ERROR",
+          ),
+          (_RaisingGetattr, "TOOL_COMPLETED"),
+      ],
+      ids=[
+          "raising_eq_response_type",
+          "numpy_response_type",
+          "pandas_response_type",
+          "numpy_response_type_with_error_flag",
+          "raising_get",
+          "raising_get_with_error_flag",
+          "raising_bool_error_flag",
+          "retry_response_with_raising_details",
+          "raising_getattr",
+      ],
+  )
+  @pytest.mark.asyncio
+  async def test_hostile_result_is_recorded_without_logging_it(
+      self,
+      _mock_bq_infra,
+      dummy_arrow_schema,
+      tool_context,
+      caplog,
+      make_result,
+      event_type,
+  ):
+    """A result whose ==, truth test or get() raises still gets its row.
+
+    Classification reads only exact str and bool values, so none of the
+    result's own code runs, and nothing it could raise reaches the log.
+    """
+    with caplog.at_level(logging.DEBUG):
+      rows = await self._record_tool_call(
+          _mock_bq_infra, dummy_arrow_schema, tool_context, make_result()
+      )
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", event_type]
+    assert _PAYLOAD_SECRET not in caplog.text
+
+  @pytest.mark.asyncio
+  async def test_failure_to_classify_a_result_still_records_the_call(
+      self,
+      _mock_bq_infra,
+      dummy_arrow_schema,
+      tool_context,
+      caplog,
+      monkeypatch,
+  ):
+    """If classifying a result fails anyway, the call is still recorded.
+
+    The tool span is already closed when the result is classified, so the
+    failure must not skip the row. The warning leaves the exception out,
+    because it can carry the result.
+    """
+
+    def fail(result):
+      raise RuntimeError(_PAYLOAD_SECRET)
+
+    monkeypatch.setattr(
+        bigquery_agent_analytics_plugin,
+        "_builtin_tool_result_error_message",
+        fail,
+    )
+
+    with caplog.at_level(logging.DEBUG):
+      rows = await self._record_tool_call(
+          _mock_bq_infra, dummy_arrow_schema, tool_context, {"isError": True}
+      )
+
+    assert [r["event_type"] for r in rows] == [
+        "TOOL_STARTING",
+        "TOOL_COMPLETED",
+    ]
+    assert "_run_query" in caplog.text
+    assert _PAYLOAD_SECRET not in caplog.text
+
+  @pytest.mark.parametrize(
+      "make_classification",
+      [
+          lambda: bigquery_agent_analytics_plugin.ToolResultClassification(
+              status="ERROR", error_message=_RaisingBool()
+          ),
+          lambda: bigquery_agent_analytics_plugin.ToolResultClassification(
+              status="ERROR",
+              error_message=pytest.importorskip("numpy").array([1, 2]),
+          ),
+          lambda: _unvalidated_classification(error_message=_RaisingBool()),
+          lambda: _unvalidated_classification(status=_RaisingEq()),
+          lambda: _unvalidated_classification(status=_EqualsEverything()),
+          lambda: _unvalidated_classification(error_message=42),
+          lambda: object.__new__(_UnreadableClassification),
+      ],
+      ids=[
+          "raising_bool_message",
+          "numpy_message",
+          "unvalidated_raising_bool_message",
+          "unvalidated_raising_eq_status",
+          "unvalidated_status_equal_to_everything",
+          "unvalidated_int_message",
+          "unreadable_fields",
+      ],
+  )
+  @pytest.mark.asyncio
+  async def test_malformed_classification_falls_back_to_the_builtin_rules(
+      self,
+      _mock_bq_infra,
+      dummy_arrow_schema,
+      tool_context,
+      caplog,
+      make_classification,
+  ):
+    """A classification that cannot be read is ignored, not fatal.
+
+    The built-in rules then classify the result, and nothing the
+    classification raised reaches the log.
+    """
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=lambda *_, **__: make_classification()
+    )
+
+    with caplog.at_level(logging.DEBUG):
+      rows = await self._record_tool_call(
+          _mock_bq_infra,
+          dummy_arrow_schema,
+          tool_context,
+          {"content": [], "isError": True},
+          config=config,
+      )
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", "TOOL_ERROR"]
+    assert "isError" in rows[1]["error_message"]
+    assert "tool_result_classifier" in caplog.text
+    assert _PAYLOAD_SECRET not in caplog.text
+
+  @pytest.mark.asyncio
+  async def test_classifier_message_of_a_str_subclass_is_recorded_as_text(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A message of a str subclass is recorded as its text.
+
+    The subclass's own methods never run, so one that raises cannot break
+    the row.
+    """
+
+    class _Message(str):
+
+      def __bool__(self):
+        raise RuntimeError(_PAYLOAD_SECRET)
+
+      def __len__(self):
+        raise RuntimeError(_PAYLOAD_SECRET)
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=lambda *_, **__: (
+            bigquery_agent_analytics_plugin.ToolResultClassification(
+                status="ERROR", error_message=_Message("query failed")
+            )
+        )
+    )
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {"rows": 0},
+        config=config,
+    )
+
+    assert rows[1]["event_type"] == "TOOL_ERROR"
+    assert rows[1]["error_message"] == "query failed"
+
+  @pytest.mark.asyncio
+  async def test_base_exception_from_the_classifier_is_not_swallowed(
+      self, _mock_bq_infra, tool_context
+  ):
+    """A BaseException from the classifier propagates.
+
+    Cancellation, KeyboardInterrupt and SystemExit derive from
+    BaseException, and absorbing them would stop a task or a process from
+    shutting down.
+    """
+    from google.adk.tools.function_tool import FunctionTool
+
+    class _Stop(BaseException):
+      pass
+
+    def classify(*_, **__):
+      raise _Stop()
+
+    tool = FunctionTool(_run_query)
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=classify
+    )
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    ) as plugin:
+      await plugin._ensure_started()
+      await plugin.before_tool_callback(
+          tool=tool, tool_args={"query": "a"}, tool_context=tool_context
+      )
+
+      with pytest.raises(_Stop):
+        await plugin.after_tool_callback(
+            tool=tool,
+            tool_args={"query": "a"},
+            tool_context=tool_context,
+            result={"rows": 1},
+        )
+
+  @pytest.mark.asyncio
+  async def test_classifier_receives_the_call_by_keyword(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """The classifier gets tool, tool_args, tool_context and result."""
+    seen = {}
+
+    def classify(*, tool, tool_args, tool_context, result):
+      seen.update(
+          tool=tool.name,
+          tool_args=tool_args,
+          invocation_id=tool_context.invocation_id,
+          result=result,
+      )
+      return None
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=classify
+    )
+
+    await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {"rows": 1},
+        config=config,
+    )
+
+    assert seen == {
+        "tool": "_run_query",
+        "tool_args": {"query": "SELECT 1"},
+        "invocation_id": "inv-789",
+        "result": {"rows": 1},
+    }
+
+  def test_classifier_without_the_keyword_arguments_is_rejected(self):
+    """A classifier that cannot take the keyword arguments fails early."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=lambda tool, result: None
+    )
+
+    with pytest.raises(ValueError, match="keyword"):
+      bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+          PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+      )
+
+  @pytest.mark.parametrize(
+      "make_classifier",
+      [
+          lambda: _async_classifier,
+          lambda: _AsyncCallableClassifier(),
+          lambda: functools.partial(_async_classifier),
+      ],
+      ids=["coroutine_function", "async_call_method", "partial"],
+  )
+  def test_async_classifier_is_rejected(self, make_classifier):
+    """A classifier must be synchronous; its result is never awaited."""
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=make_classifier()
+    )
+
+    with pytest.raises(ValueError, match="synchronous"):
+      bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+          PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+      )
+
+  @pytest.mark.asyncio
+  async def test_classifier_returning_an_awaitable_is_ignored_and_closed(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context, caplog
+  ):
+    """A coroutine returned by a classifier is closed, not left pending.
+
+    It is ignored like any other unsupported value, and closing it keeps
+    Python from warning that it was never awaited.
+    """
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=lambda *_, **__: _async_classifier()
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always")
+      with caplog.at_level(logging.DEBUG):
+        rows = await self._record_tool_call(
+            _mock_bq_infra,
+            dummy_arrow_schema,
+            tool_context,
+            {"rows": 1},
+            config=config,
+        )
+      gc.collect()
+
+    assert [r["event_type"] for r in rows] == [
+        "TOOL_STARTING",
+        "TOOL_COMPLETED",
+    ]
+    assert "awaitable" in caplog.text
+    assert not [w for w in caught if "never awaited" in str(w.message)]
+
+  @pytest.mark.parametrize(
+      ("is_error", "event_type"),
+      [(True, "TOOL_ERROR"), (False, "TOOL_COMPLETED")],
+  )
+  @pytest.mark.asyncio
+  async def test_mcp_call_tool_result_model_is_classified(
+      self,
+      _mock_bq_infra,
+      dummy_arrow_schema,
+      tool_context,
+      is_error,
+      event_type,
+  ):
+    """A tool that returns an MCP CallToolResult model is classified too."""
+    mcp_types = pytest.importorskip("mcp.types")
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        mcp_types.CallToolResult(content=[], isError=is_error),
+    )
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", event_type]
+
+  @pytest.mark.asyncio
+  async def test_mcp_model_from_the_mcp_types_package_is_classified(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context, monkeypatch
+  ):
+    """MCP SDK 2.x models are recognized without the mcp.types module.
+
+    The 2.x SDK defines them in the mcp_types package, which a program can
+    import without ever loading mcp.types.
+    """
+    mcp_types = pytest.importorskip("mcp_types")
+    monkeypatch.delitem(sys.modules, "mcp.types", raising=False)
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        mcp_types.CallToolResult(content=[], isError=True),
+    )
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", "TOOL_ERROR"]
+
+  @pytest.mark.asyncio
+  async def test_error_without_a_message_records_its_type(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A raised error with no message records its type name instead.
+
+    That matches what a ReflectAndRetryToolPlugin answer to the same error
+    records, so both plugin orders agree.
+    """
+    from google.adk.tools.function_tool import FunctionTool
+
+    tool = FunctionTool(_run_query)
+    async with managed_plugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID
+    ) as plugin:
+      await plugin._ensure_started()
+      _mock_bq_infra.append_rows.reset_mock()
+      await plugin.before_tool_callback(
+          tool=tool, tool_args={"query": "a"}, tool_context=tool_context
+      )
+      await plugin.on_tool_error_callback(
+          tool=tool,
+          tool_args={"query": "a"},
+          tool_context=tool_context,
+          error=RuntimeError(),
+      )
+      await plugin.flush()
+      rows = await _get_captured_rows_async(_mock_bq_infra, dummy_arrow_schema)
+
+    assert rows[1]["event_type"] == "TOOL_ERROR"
+    assert rows[1]["error_message"] == "RuntimeError"
+
+  @pytest.mark.asyncio
+  async def test_retry_response_without_error_text_records_a_message(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A retry response with no error text still records a message."""
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {
+            "response_type": "ERROR_HANDLED_BY_REFLECT_AND_RETRY_PLUGIN",
+            "error_type": "",
+            "error_details": "",
+        },
+    )
+
+    assert rows[1]["event_type"] == "TOOL_ERROR"
+    assert rows[1]["error_message"]
 
   @pytest.mark.asyncio
   async def test_errored_final_response_tool_does_not_log_agent_response(
@@ -6933,6 +7462,62 @@ class TestToolResultErrorClassification:
         "TOOL_COMPLETED",
     ]
 
+  @pytest.mark.asyncio
+  async def test_each_analytics_plugin_records_a_raised_error_once(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """Two analytics plugins in one runner each record the error once.
+
+    Setup: both analytics plugins run before ReflectAndRetryToolPlugin.
+    Act: the tool raises, both on_tool_error_callbacks record the error,
+      and the retry plugin's answer reaches both after_tool_callbacks.
+    Assert: one TOOL_ERROR row per plugin and no second outcome row.
+    """
+    from google.adk.plugins.reflect_retry_tool_plugin import ReflectAndRetryToolPlugin
+    from google.adk.tools.function_tool import FunctionTool
+
+    tool = FunctionTool(_run_query)
+    tool_args = {"query": "SELECT 1"}
+    error = RuntimeError("boom")
+    async with (
+        managed_plugin(PROJECT_ID, DATASET_ID, table_id=TABLE_ID) as first,
+        managed_plugin(PROJECT_ID, DATASET_ID, table_id=TABLE_ID) as second,
+    ):
+      await first._ensure_started()
+      await second._ensure_started()
+      _mock_bq_infra.append_rows.reset_mock()
+      for plugin in (first, second):
+        await plugin.before_tool_callback(
+            tool=tool, tool_args=tool_args, tool_context=tool_context
+        )
+      for plugin in (first, second):
+        await plugin.on_tool_error_callback(
+            tool=tool,
+            tool_args=tool_args,
+            tool_context=tool_context,
+            error=error,
+        )
+      answer = await ReflectAndRetryToolPlugin().on_tool_error_callback(
+          tool=tool, tool_args=tool_args, tool_context=tool_context, error=error
+      )
+      for plugin in (first, second):
+        await plugin.after_tool_callback(
+            tool=tool,
+            tool_args=tool_args,
+            tool_context=tool_context,
+            result=answer,
+        )
+      await first.flush()
+      await second.flush()
+      rows = await _get_captured_rows_async(_mock_bq_infra, dummy_arrow_schema)
+
+    assert sorted(r["event_type"] for r in rows) == [
+        "TOOL_ERROR",
+        "TOOL_ERROR",
+        "TOOL_STARTING",
+        "TOOL_STARTING",
+    ]
+
   async def _run_turn(
       self, mock_write_client, dummy_arrow_schema, tool, plugins_around
   ):
@@ -7072,6 +7657,29 @@ class TestToolResultErrorClassification:
         "content": [{"type": "text", "text": "Git reset to remote failed."}],
         "isError": True,
     }]
+
+  @pytest.mark.asyncio
+  async def test_tool_returning_an_mcp_model_is_recorded_as_tool_error(
+      self, _mock_bq_infra, dummy_arrow_schema
+  ):
+    """A tool that returns a CallToolResult model with isError set fails."""
+    from google.adk.tools.function_tool import FunctionTool
+
+    mcp_types = pytest.importorskip("mcp.types")
+
+    def mcp_model_failure():
+      return mcp_types.CallToolResult(content=[], isError=True)
+
+    _, rows = await self._run_turn(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        FunctionTool(mcp_model_failure),
+        lambda bq_plugin: [bq_plugin],
+    )
+
+    assert [
+        r["event_type"] for r in rows if r["event_type"].startswith("TOOL_")
+    ] == ["TOOL_STARTING", "TOOL_ERROR"]
 
 
 class TestHITLTracing:
