@@ -1233,7 +1233,8 @@ def _settle_formatter_outcome(
   tell a KeyboardInterrupt or SystemExit that a signal handler delivered
   from one raised directly: code can even signal its own process. Code that
   the failed class or the rejected result controls runs only while the
-  traceback is rendered and while a rejected generator is closed, and
+  traceback is rendered and while a rejected coroutine or generator is
+  closed, and
   anything raised there, interrupts included, is contained, so that the
   content under redaction cannot end the agent run. A signal that lands
   there is absorbed. Everywhere else only this module's code and the
