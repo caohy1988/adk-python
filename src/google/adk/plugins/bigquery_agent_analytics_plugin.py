@@ -1718,9 +1718,10 @@ def _validate_tool_result_classifier(classifier: Any) -> None:
 
   Raises:
       ValueError: If the classifier is not callable, is a coroutine or async
-        generator function (or its ``__call__`` is), has no signature that
-        ``inspect`` can read, or cannot take the keyword arguments ``tool``,
-        ``tool_args``, ``tool_context`` and ``result``.
+        generator function (or its ``__call__`` is, or that of the callable
+        a ``functools.partial`` wraps), has no signature that ``inspect`` can
+        read, or cannot take the keyword arguments ``tool``, ``tool_args``,
+        ``tool_context`` and ``result``.
   """
   if classifier is None:
     return
@@ -1729,11 +1730,19 @@ def _validate_tool_result_classifier(classifier: Any) -> None:
         "tool_result_classifier must be callable, got"
         f" {type(classifier).__name__}."
     )
-  call = getattr(classifier, "__call__", None)
+  # A functools.partial calls the callable it wraps, whose own __call__ may be
+  # asynchronous even though the partial's is not.
+  wrapped = classifier
+  while isinstance(wrapped, functools.partial):
+    wrapped = wrapped.func
   if any(
       inspect.iscoroutinefunction(function)
       or inspect.isasyncgenfunction(function)
-      for function in (classifier, call)
+      for function in (
+          classifier,
+          getattr(classifier, "__call__", None),
+          getattr(wrapped, "__call__", None),
+      )
   ):
     raise ValueError(
         "tool_result_classifier must be synchronous; after_tool_callback"
@@ -1741,7 +1750,7 @@ def _validate_tool_result_classifier(classifier: Any) -> None:
     )
   try:
     signature = inspect.signature(classifier)
-  except (TypeError, ValueError) as e:
+  except Exception as e:  # pylint: disable=broad-except
     raise ValueError(
         "tool_result_classifier must have a signature that inspect can read,"
         " so that the plugin can check it takes the keyword arguments tool,"
@@ -8690,9 +8699,24 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       )
       return
 
-    resp_truncated, is_truncated = _recursive_smart_truncate(
-        result, self.config.max_content_length
-    )
+    # Serializing the result runs its code, which the classification never
+    # does, so it gets the same boundary: a result that raises is recorded
+    # with the sentinel the serializer writes for a result it rejects itself,
+    # and the constant warning is logged after the except block.
+    serialization_failed = False
+    try:
+      resp_truncated, is_truncated = _recursive_smart_truncate(
+          result, self.config.max_content_length
+      )
+    except Exception:  # pylint: disable=broad-except
+      resp_truncated, is_truncated = "[UNSUPPORTED_OBJECT]", True
+      serialization_failed = True
+    if serialization_failed:
+      logger.warning(
+          "Could not serialize the result of tool %s; recording a sentinel in"
+          " its place.",
+          tool.name,
+      )
     content_dict = {
         "tool": tool.name,
         "result": resp_truncated,
@@ -8844,6 +8868,15 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     }
     span_id, duration = TraceManager.pop_span()
     parent_span_id, _ = TraceManager.get_current_span_and_parent()
+    # Read before the call is marked: after_tool_callback skips a marked call,
+    # so nothing that can fail may run between the mark and the row. An
+    # exception raised without a message, or whose message cannot be read,
+    # records its type name, which is what a ReflectAndRetryToolPlugin answer
+    # records for a message-less one.
+    try:
+      error_message = str(error) or type(error).__name__
+    except Exception:  # pylint: disable=broad-except
+      error_message = type(error).__name__
     try:
       recorded_call = weakref.ref(tool_context)
     except TypeError:
@@ -8864,9 +8897,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         is_truncated=is_truncated,
         event_data=EventData(
             status="ERROR",
-            # An exception raised without a message records its type name,
-            # which is what a ReflectAndRetryToolPlugin answer records for it.
-            error_message=str(error) or type(error).__name__,
+            error_message=error_message,
             latency_ms=duration,
             span_id_override=span_id,
             parent_span_id_override=parent_span_id,
