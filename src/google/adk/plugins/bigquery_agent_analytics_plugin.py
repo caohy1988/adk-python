@@ -1068,8 +1068,7 @@ def _formatter_failure_message(cls: type, *, raised: bool) -> str:
   The class is named only by a trusted label, and a class without one by its
   nearest ancestor that has one. The exception's message, args, and traceback
   are never used: they can embed the content the formatter was protecting.
-  Nothing here runs code the class controls, so describing a failure cannot
-  raise, whatever the failure's class does.
+  Only type's own descriptors are read, so no code the class controls runs.
 
   Args:
     cls: The class of the exception the formatter raised, or of the value it
@@ -1078,31 +1077,34 @@ def _formatter_failure_message(cls: type, *, raised: bool) -> str:
 
   Returns:
     A fixed-shape message such as ``content_formatter raised ImportError`` or
-    ``content_formatter returned unsupported type <subclass of LlmRequest>``.
+    ``content_formatter returned unsupported type <subclass of LlmRequest>``,
+    with ``<unknown class>`` in place of the label when the class cannot be
+    read at all.
   """
   outcome = "raised" if raised else "returned unsupported type"
-  for depth, ancestor in enumerate(_TYPE_MRO.__get__(cls)):
-    label = _trusted_class_label(ancestor)
-    if label is not None:
-      if depth == 0:
-        return f"content_formatter {outcome} {label}"
-      return f"content_formatter {outcome} <subclass of {label}>"
-  # Unreachable for an instantiable class, whose MRO ends with object.
+  try:
+    for depth, ancestor in enumerate(_TYPE_MRO.__get__(cls)):
+      label = _trusted_class_label(ancestor)
+      if label is not None:
+        if depth == 0:
+          return f"content_formatter {outcome} {label}"
+        return f"content_formatter {outcome} <subclass of {label}>"
+  except Exception:
+    # type's descriptors run no hooks but can still raise: they first check
+    # that the metaclass is a subtype of type by walking the metaclass's own
+    # MRO, which a meta-metaclass can rewrite after the class exists.
+    pass
   return f"content_formatter {outcome} <unknown class>"
 
 
 def _render_formatter_traceback(error: BaseException) -> str:
   """Renders a content_formatter exception's traceback for debug logging.
 
-  Rendering runs the exception's own code: its ``__str__`` and the attribute
-  hooks that expose its traceback and chained exceptions. Whatever that code
-  raises is contained here and replaced by a constant, so rendering can never
-  affect the row, with two exceptions. KeyboardInterrupt and SystemExit
-  propagate, as they do everywhere else in the plugin, because a signal
-  handler can deliver either at any bytecode, so one raised here may be
-  genuine. Any other BaseException, asyncio.CancelledError included, can only
-  come from the exception being rendered: rendering never awaits, so it cannot
-  receive a real cancellation.
+  Rendering runs code the exception's class controls: its ``__str__`` and the
+  attribute hooks that expose its traceback and chained exceptions. Whatever
+  that code raises, of any type, yields a constant placeholder instead, for
+  the reasons given in ``_diagnose_formatter_failure``, so the warning is
+  still logged.
 
   Args:
     error: The exception the formatter raised.
@@ -1112,10 +1114,77 @@ def _render_formatter_traceback(error: BaseException) -> str:
   """
   try:
     return "".join(traceback_module.format_exception(error)).rstrip("\n")
-  except (KeyboardInterrupt, SystemExit):
-    raise
   except BaseException:
     return "[traceback could not be rendered]"
+
+
+def _diagnose_formatter_failure(
+    failed_type: type,
+    failure: Optional[BaseException],
+    *,
+    event_type: str,
+    debug: bool,
+) -> str:
+  """Describes a content_formatter failure and logs its warning, best effort.
+
+  Diagnosis runs only after the failure is fully handled: the row's content
+  is already the sentinel and the failure is already counted. Everything it
+  does, naming the failed class, rendering the debug traceback, and emitting
+  the warning through whatever filters and handlers are configured, sits
+  behind this one boundary. Whatever any of it raises, of any type, is
+  contained here and the constant fallback note is returned, so diagnosis
+  can never drop the row, change the sentinel or the counter, or escape the
+  callback.
+
+  BaseException is contained on purpose. Rendering runs code the failed class
+  controls, and filters and handlers run arbitrary code. A KeyboardInterrupt
+  or SystemExit raised by any of them cannot be told apart from one that a
+  signal handler delivered, and letting it through would let the content
+  under redaction abort the agent run and lose the row. Diagnosis never
+  awaits, so it cannot swallow a real asyncio cancellation; a signal that
+  lands inside this short window is absorbed, and the next is delivered
+  normally. Interrupts raised by the formatter call itself still propagate.
+
+  Args:
+    failed_type: The class of the exception the formatter raised, or of the
+      value it returned.
+    failure: The exception the formatter raised, or None when it returned an
+      unsupported value.
+    event_type: The type of the event being logged.
+    debug: Whether to append the rendered traceback to the warning.
+
+  Returns:
+    The note for the error_message column.
+  """
+  outcome = "raised" if failure is not None else "returned unsupported type"
+  note = f"content_formatter {outcome} <unknown class>"
+  try:
+    note = _formatter_failure_message(failed_type, raised=failure is not None)
+    if failure is None:
+      logger.warning(
+          "Content formatter returned an unsupported result type for"
+          " event %s; writing sentinel instead of original content.",
+          event_type,
+      )
+    elif debug:
+      logger.warning(
+          "Content formatter failed for event %s; writing sentinel"
+          " instead of original content. Debug traceback:\n%s",
+          event_type,
+          _render_formatter_traceback(failure),
+      )
+    else:
+      logger.warning(
+          "Content formatter failed for event %s; writing sentinel"
+          " instead of original content.",
+          event_type,
+      )
+  except BaseException:
+    # Contained whatever it is, for the reasons in the docstring. It is not
+    # reported either: the logger may be what failed, and the exception can
+    # carry the content.
+    pass
+  return note
 
 
 # Recursion bound for _recursive_smart_truncate: id()-based cycle detection
@@ -2216,9 +2285,13 @@ class BigQueryLoggerConfig:
         pydantic ``BaseModel``, and ``google.api_core`` ``GoogleAPICallError``)
         are named. Any other class, including one your own code defines, is
         described by its nearest named ancestor, for example
-        ``content_formatter raised <subclass of ValueError>``. An event that
-        already carries an ``error_message``, such as a ``TOOL_ERROR``, keeps
-        it first, followed by ``; `` and the formatter failure.
+        ``content_formatter raised <subclass of ValueError>``, and a class
+        that cannot be read at all as ``<unknown class>``. Describing the
+        failure and logging its warning are best effort: whatever they
+        raise is contained, so they never drop the row or change the
+        sentinel or the counter. An event that already carries an
+        ``error_message``, such as a ``TOOL_ERROR``, keeps it first, followed
+        by ``; `` and the formatter failure.
       gcs_bucket_name: GCS bucket for offloading large content.
       connection_id: BigQuery connection ID for ObjectRef columns.
       log_session_metadata: Whether to log session metadata.
@@ -2280,9 +2353,9 @@ class BigQueryLoggerConfig:
         has configured: the console, the log file that ``adk run`` writes, and
         anything that forwards logs elsewhere, such as a managed runtime
         shipping stderr to Cloud Logging. Enable it only where that content
-        may be seen. Rendering is best effort: if the exception's own code
-        fails while it is rendered, a constant placeholder is logged instead,
-        and the row is unaffected. The plugin never writes the traceback to
+        may be seen. Rendering is best effort: whatever the exception's own
+        code raises while it is rendered, a constant placeholder is logged
+        instead, and the row is unaffected. The plugin never writes the traceback to
         BigQuery; the row's ``error_message`` still names only the exception
         class. ``False`` (the default) logs a constant message with no
         traceback.
@@ -7327,12 +7400,15 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
     timestamp = datetime.now(timezone.utc)
     formatter_error: Optional[str] = None
-    formatter_raised = False
-    formatter_traceback: Optional[str] = None
     if self.config.content_formatter:
+      failed_type: Optional[type] = None
+      failure: Optional[Exception] = None
       try:
         formatted = self.config.content_formatter(raw_content, event_type)
-        if isinstance(formatted, str):
+        # The real type, not isinstance: an object whose __class__ claims to
+        # be str is not one, and normalizing it would raise as if the
+        # formatter had.
+        if issubclass(type(formatted), str):
           if type(formatted) is not str:
             # Normalize str subclasses to the exact built-in.
             formatted = str.__str__(formatted)
@@ -7359,53 +7435,38 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           # the parser's unconditional str(content) fallback OUTSIDE this
           # fail-closed boundary, where a payload-controlled __str__ can
           # republish the original content or raise into the safe
-          # callback's traceback log. The
-          # message is CONSTANT: even a class NAME can be payload-derived
-          # via type(name, ...), so error_message uses only a trusted class
-          # label.
-          logger.warning(
-              "Content formatter returned an unsupported result type for"
-              " event %s; writing sentinel instead of original content.",
-              event_type,
-          )
-          formatter_error = _formatter_failure_message(
-              type(formatted), raised=False
-          )
+          # callback's traceback log.
+          failed_type = type(formatted)
           formatted = _FORMATTER_FAILED_SENTINEL
-          self._count_local_drop("formatter_failed")
         raw_content = formatted
       except Exception as e:
         # Fail CLOSED: the formatter is a redaction/privacy
         # boundary, so its failure must never fall back to the unformatted
         # payload. The exception message and traceback can embed the
         # protected content, and even the class NAME can be payload-derived
-        # via type(name, ...), so error_message uses only a trusted class
-        # label and the warning below stays CONSTANT. The traceback is
-        # rendered, best effort, only when debug_content_formatter_errors
-        # opts in; no handler ever receives the live exception.
-        formatter_raised = True
-        formatter_error = _formatter_failure_message(type(e), raised=True)
-        if self.config.debug_content_formatter_errors:
-          formatter_traceback = _render_formatter_traceback(e)
+        # via type(name, ...), so diagnosis below names only a trusted class
+        # label, keeps the default warning CONSTANT, and renders the
+        # traceback only when debug_content_formatter_errors opts in.
+        failed_type = type(e)
+        failure = e
         raw_content = _FORMATTER_FAILED_SENTINEL
+      if failed_type is not None:
+        # The sentinel is in place and the failure is counted before any
+        # diagnosis runs, and diagnosis contains whatever it raises, so
+        # describing the failure can never drop the row or change either.
+        # It runs after the except block so that a failing log handler,
+        # whose handleError prints the exception being handled, cannot
+        # reach the formatter's exception.
         self._count_local_drop("formatter_failed")
-      if formatter_raised:
-        # Logged only once the formatter's exception is no longer being
-        # handled: a failing handler's handleError prints its own exception
-        # chain, which would otherwise reach that exception and run its code.
-        if formatter_traceback is None:
-          logger.warning(
-              "Content formatter failed for event %s; writing sentinel"
-              " instead of original content.",
-              event_type,
-          )
-        else:
-          logger.warning(
-              "Content formatter failed for event %s; writing sentinel"
-              " instead of original content. Debug traceback:\n%s",
-              event_type,
-              formatter_traceback,
-          )
+        formatter_error = _diagnose_formatter_failure(
+            failed_type,
+            failure,
+            event_type=event_type,
+            debug=self.config.debug_content_formatter_errors,
+        )
+        # The except clause would have dropped this reference itself: the
+        # exception's traceback holds this frame, which holds the exception.
+        failure = None
 
     # The event's own diagnostic (e.g. a TOOL_ERROR's exception text) stays
     # first and intact so an error row keeps its primary cause; a formatter
