@@ -1,0 +1,902 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Deterministic, CI-safe tests for the authored-workflow spike (RFC #93).
+
+No LLM. Capabilities are deterministic stub nodes, so these exercise the
+validator + the interpreter (step / fan_out / pipeline / branch / loop_until + binding
+scope) on the real ADK Workflow engine. The live planner sweep lives in
+test_live_planner_sweep.py (env-gated).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+from google.adk import Event
+from google.adk import Workflow
+from google.adk.runners import Runner
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.workflow import node
+from google.genai import types
+from pydantic import BaseModel
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from authoring import agent_config_coverage
+from authoring import AGENTCONFIG_UNSUPPORTED
+from authoring import Binding  # noqa: E402
+from authoring import Branch
+from authoring import Capability
+from authoring import CapabilityRegistry
+from authoring import export_plan
+from authoring import FanOut
+from authoring import FrozenWorkflowRecord
+from authoring import import_plan
+from authoring import LoopUntil
+from authoring import lower_to_agent_config
+from authoring import Pipeline
+from authoring import PipelineStage
+from authoring import PlanImportError
+from authoring import Route
+from authoring import sha256_hex
+from authoring import SpecInterpreter
+from authoring import SpecValidationError
+from authoring import StepRef
+from authoring import WorkflowSpec
+from authoring import WorkflowSpecValidator
+
+
+# ----------------------------------------------------------------- stub caps
+def _cap_node(name, fn):
+  def build():
+    @node(name=name)
+    async def n(ctx, node_input):
+      yield Event(output=fn(node_input))
+
+    return n
+
+  return build
+
+
+def _registry():
+  return CapabilityRegistry([
+      Capability(
+          name="review",
+          build=_cap_node(
+              "review",
+              lambda f: {
+                  "path": f["path"],
+                  "severity": "HIGH" if "bad" in f["code"] else "NONE",
+              },
+          ),
+          input_kind="item",
+          serialize_input=False,
+          max_fan_out=10,
+      ),
+      Capability(
+          name="count",
+          build=_cap_node(
+              "count",
+              lambda findings: {
+                  "n": len(findings),
+                  "high": sum(1 for x in findings if x["severity"] == "HIGH"),
+              },
+          ),
+          input_kind="list",
+          serialize_input=False,
+      ),
+      Capability(
+          name="classify",
+          build=_cap_node(
+              "classify", lambda s: "tech" if "code" in str(s) else "other"
+          ),
+          input_kind="item",
+          serialize_input=False,
+      ),
+      Capability(
+          name="tech_summary",
+          build=_cap_node("tech_summary", lambda s: "TECH:" + str(s)),
+          input_kind="item",
+          serialize_input=False,
+      ),
+      Capability(
+          name="other_summary",
+          build=_cap_node("other_summary", lambda s: "OTHER:" + str(s)),
+          input_kind="item",
+          serialize_input=False,
+      ),
+      Capability(
+          name="draft",
+          build=_cap_node("draft", lambda s: {"text": "v", "len": len(str(s))}),
+          input_kind="item",
+          serialize_input=False,
+      ),
+      Capability(
+          name="is_good",
+          build=_cap_node("is_good", lambda s: True),
+          input_kind="item",
+          serialize_input=False,
+      ),
+  ])
+
+
+async def _run_spec(spec, registry, task_input):
+  holder = {}
+
+  @node(rerun_on_resume=True)
+  async def parent(ctx, node_input):
+    interp = SpecInterpreter(registry, ctx)
+    holder["out"] = await interp.execute(spec, task_input)
+    yield Event(output={"_done": True})
+
+  wf = Workflow(name="t", edges=[("START", parent)])
+  ss = InMemorySessionService()
+  r = Runner(app_name=wf.name, node=wf, session_service=ss)
+  s = await ss.create_session(app_name=wf.name, user_id="u")
+  async for _ in r.run_async(
+      user_id="u",
+      session_id=s.id,
+      new_message=types.Content(parts=[types.Part(text="go")], role="user"),
+  ):
+    pass
+  return holder["out"]
+
+
+# ----------------------------------------------------------------- validator
+def test_binding_invariant():
+  with pytest.raises(Exception):
+    Binding(source="step")  # step missing
+  with pytest.raises(Exception):
+    Binding(source="task", step="x")  # step set for task
+
+
+def test_loop_max_iters_must_be_positive():
+  with pytest.raises(Exception):
+    LoopUntil(
+        kind="loop_until",
+        id="l",
+        body=[],
+        until_capability="is_good",
+        until_input=Binding(source="task"),
+        max_iters=0,
+    )
+
+
+def _fanout_aggregate_spec():
+  return WorkflowSpec(
+      goal="audit",
+      steps=[
+          FanOut(
+              kind="fan_out",
+              id="rev",
+              over=Binding(source="task", path="files"),
+              capability="review",
+          ),
+          StepRef(
+              kind="step",
+              id="agg",
+              capability="count",
+              input=Binding(source="step", step="rev"),
+          ),
+      ],
+      output=Binding(source="step", step="agg"),
+  )
+
+
+def test_validator_accepts_valid_spec():
+  WorkflowSpecValidator(_registry()).validate(
+      _fanout_aggregate_spec()
+  )  # no raise
+
+
+def test_validator_rejects_unknown_capability():
+  spec = _fanout_aggregate_spec()
+  spec.steps[0].capability = "nope"
+  with pytest.raises(SpecValidationError):
+    WorkflowSpecValidator(_registry()).validate(spec)
+
+
+def test_validator_rejects_nonpreceding_binding():
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          StepRef(
+              kind="step",
+              id="a",
+              capability="count",
+              input=Binding(source="step", step="later"),
+          )
+      ],  # references a later/unknown step
+      output=Binding(source="step", step="a"),
+  )
+  with pytest.raises(SpecValidationError):
+    WorkflowSpecValidator(_registry()).validate(spec)
+
+
+def test_validator_rejects_duplicate_id():
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          StepRef(
+              kind="step",
+              id="a",
+              capability="classify",
+              input=Binding(source="task"),
+          ),
+          StepRef(
+              kind="step",
+              id="a",
+              capability="classify",
+              input=Binding(source="task"),
+          ),
+      ],
+      output=Binding(source="step", step="a"),
+  )
+  with pytest.raises(SpecValidationError):
+    WorkflowSpecValidator(_registry()).validate(spec)
+
+
+def test_open_map_warning():
+  class BadReport(BaseModel):
+    total: int
+    counts: dict[str, int]  # open map — should warn
+
+  reg = CapabilityRegistry([
+      Capability(
+          name="triage",
+          build=lambda: None,
+          input_kind="list",
+          output_model=BadReport,
+      )
+  ])
+  warnings = reg.open_map_warnings()
+  assert any("open map" in w for w in warnings)
+
+
+# ----------------------------------------------------------------- interpreter
+@pytest.mark.asyncio
+async def test_interpreter_fanout_then_aggregate():
+  files = [
+      {"path": "a.py", "code": "bad thing"},
+      {"path": "b.py", "code": "fine"},
+      {"path": "c.py", "code": "bad"},
+  ]
+  out = await _run_spec(_fanout_aggregate_spec(), _registry(), {"files": files})
+  assert out == {"n": 3, "high": 2}
+
+
+@pytest.mark.asyncio
+async def test_interpreter_branch_takes_correct_route():
+  spec = WorkflowSpec(
+      goal="branch",
+      steps=[
+          StepRef(
+              kind="step",
+              id="cls",
+              capability="classify",
+              input=Binding(source="task"),
+          ),
+          Branch(
+              kind="branch",
+              id="br",
+              on=Binding(source="step", step="cls"),
+              routes=[
+                  Route(
+                      value="tech",
+                      block=[
+                          StepRef(
+                              kind="step",
+                              id="t",
+                              capability="tech_summary",
+                              input=Binding(source="task"),
+                          )
+                      ],
+                  ),
+                  Route(
+                      value="other",
+                      block=[
+                          StepRef(
+                              kind="step",
+                              id="o",
+                              capability="other_summary",
+                              input=Binding(source="task"),
+                          )
+                      ],
+                  ),
+              ],
+          ),
+      ],
+      output=Binding(source="step", step="br"),
+  )
+  WorkflowSpecValidator(_registry()).validate(spec)
+  assert (await _run_spec(spec, _registry(), "this is code")).startswith(
+      "TECH:"
+  )
+  assert (await _run_spec(spec, _registry(), "hello world")).startswith(
+      "OTHER:"
+  )
+
+
+@pytest.mark.asyncio
+async def test_interpreter_loop_until_stops_and_outputs():
+  spec = WorkflowSpec(
+      goal="loop",
+      steps=[
+          LoopUntil(
+              kind="loop_until",
+              id="lp",
+              body=[
+                  StepRef(
+                      kind="step",
+                      id="d",
+                      capability="draft",
+                      input=Binding(source="task"),
+                  )
+              ],
+              until_capability="is_good",
+              until_input=Binding(source="step", step="d"),
+              max_iters=3,
+          ),
+      ],
+      output=Binding(source="step", step="lp"),
+  )
+  WorkflowSpecValidator(_registry()).validate(spec)
+  out = await _run_spec(spec, _registry(), "topic")
+  assert out == {
+      "text": "v",
+      "len": len("topic"),
+  }  # loop output = last body node output
+
+
+# ----------------------------------------------------------------- pipeline
+def _timed_registry(log):
+  """reviewer (stage 0) + verifier (stage 1) as deterministic timed stubs."""
+  import asyncio
+  import time
+
+  def stage_cap(name, slow_for=None, key="r"):
+    def build():
+      @node(name=name)
+      async def n(ctx, node_input):
+        item = node_input
+        log.append((name, "start", time.perf_counter()))
+        await asyncio.sleep(
+            0.05 if (slow_for is not None and item == slow_for) else 0.0
+        )
+        log.append((name, "end", time.perf_counter()))
+        yield Event(output={key: item})
+
+      return n
+
+    return Capability(
+        name=name, build=build, input_kind="item", serialize_input=False
+    )
+
+  return CapabilityRegistry([
+      stage_cap("reviewer", slow_for=1, key="review"),
+      stage_cap("verifier", key="verdict"),
+  ])
+
+
+def _pipeline_spec():
+  return WorkflowSpec(
+      goal="pipe",
+      steps=[
+          Pipeline(
+              kind="pipeline",
+              id="pp",
+              over=Binding(source="task", path="items"),
+              stages=[
+                  PipelineStage(capability="reviewer"),
+                  PipelineStage(capability="verifier"),
+              ],
+          )
+      ],
+      output=Binding(source="step", step="pp"),
+  )
+
+
+def test_validator_accepts_pipeline():
+  log = []
+  WorkflowSpecValidator(_timed_registry(log)).validate(_pipeline_spec())
+
+
+def test_validator_rejects_pipeline_list_stage():
+  spec = _pipeline_spec()
+  # "count" takes a list, not an item -> invalid pipeline stage
+  spec.steps[0].stages[1] = PipelineStage(capability="count")
+  with pytest.raises(SpecValidationError):
+    WorkflowSpecValidator(_registry()).validate(spec)
+
+
+@pytest.mark.asyncio
+async def test_interpreter_pipeline_ordered_and_barrier_free():
+  log = []
+  reg = _timed_registry(log)
+  # input items [0, 1]; reviewer is slow for item 1 only.
+  out = await _run_spec(_pipeline_spec(), reg, {"items": [0, 1]})
+
+  # Ordered, per-item review->verify (verdict carries the reviewed value):
+  assert out == [{"verdict": {"review": 0}}, {"verdict": {"review": 1}}]
+
+  starts = {n: t for (n, p, t) in log if p == "start"}
+  ends = {n: t for (n, p, t) in log if p == "end"}
+  # BARRIER-FREE proof: item 0 reaches stage 2 (verifier) BEFORE item 1 finishes
+  # stage 1 (reviewer). Two barriered fan_outs could NOT do this — every
+  # reviewer would finish before any verifier started.
+  assert "verifier" in starts and "reviewer" in ends
+  # earliest verifier start precedes the latest reviewer end:
+  first_verifier_start = min(
+      t for (n, p, t) in log if n == "verifier" and p == "start"
+  )
+  last_reviewer_end = max(
+      t for (n, p, t) in log if n == "reviewer" and p == "end"
+  )
+  assert first_verifier_start < last_reviewer_end
+
+
+@pytest.mark.asyncio
+async def test_interpreter_pipeline_enforces_max_fan_out():
+  # Each stage dispatches once per item, so a stage capability's max_fan_out is
+  # a data-dependent cap that must be enforced at runtime (same as FanOut).
+  log = []
+  reg = _timed_registry(log)
+  reg["verifier"].max_fan_out = 1  # 2 items > cap -> reject before dispatch
+  with pytest.raises(SpecValidationError):
+    await _run_spec(_pipeline_spec(), reg, {"items": [0, 1]})
+  # rejected pre-dispatch: no stage ran.
+  assert log == []
+
+
+# ----------------------------------------------------------------- export/import
+_TASK = {"files": [{"path": "a.py", "code": "bad"}]}
+
+
+def _frozen():
+  return FrozenWorkflowRecord.freeze(
+      _fanout_aggregate_spec(),
+      planner_model="gemini-3.5-flash",
+      registry=_registry(),
+      created_at="2026-06-02T00:00:00Z",
+      task_input=_TASK,
+  )
+
+
+def test_export_then_import_roundtrip_replays_same_hash():
+  env = export_plan(_frozen())
+  # the envelope is JSON-serializable and carries the full §5 record.
+  assert json.loads(json.dumps(env))["schema_version"] == "v1"
+  assert set(env["capability_versions"]) == {"review", "count"}
+  # re-import on the ORIGINAL input (replay path) succeeds and recomputes the
+  # SAME hash from the spec — integrity holds.
+  spec = import_plan(env, _registry(), task_input=_TASK)
+  assert sha256_hex(spec.model_dump(mode="json")) == env["spec_hash"]
+
+
+def test_import_rejects_tampered_spec():
+  env = export_plan(_frozen())
+  # tamper with the spec but leave the recorded hash -> integrity check fires.
+  env["spec"]["goal"] = "exfiltrate"
+  with pytest.raises(PlanImportError, match="spec_hash mismatch"):
+    import_plan(env, _registry(), task_input=_TASK)
+
+
+def test_import_rejects_dropped_capability():
+  env = export_plan(_frozen())
+  # current registry no longer has `count` -> re-validation against the CURRENT
+  # registry fails (we never trust the envelope's own `validation`).
+  shrunk = CapabilityRegistry([_registry()["review"]])
+  with pytest.raises(PlanImportError, match="re-validation"):
+    import_plan(env, shrunk, task_input=_TASK)
+
+
+def test_import_rejects_capability_version_drift():
+  env = export_plan(_frozen())
+  # same capabilities, but `review` was bumped since export -> drift.
+  bumped = _registry()
+  bumped["review"].version = "2"
+  with pytest.raises(PlanImportError, match="version drift"):
+    import_plan(env, bumped, task_input=_TASK)
+
+
+def test_import_rejects_unsupported_schema_version():
+  env = export_plan(_frozen())
+  env["schema_version"] = "v2"  # an importer must refuse formats it can't read
+  with pytest.raises(PlanImportError, match="schema_version"):
+    import_plan(env, _registry(), task_input=_TASK)
+
+
+def test_import_rejects_registry_version_drift():
+  env = export_plan(_frozen())
+  # same capabilities/versions, but the whole registry was re-versioned ->
+  # hard error per DESIGN.md §10.
+  v2_registry = CapabilityRegistry(
+      list(_registry()._by_name.values()), version="2"
+  )
+  with pytest.raises(PlanImportError, match="registry_version"):
+    import_plan(env, v2_registry, task_input=_TASK)
+
+
+def test_lower_static_sequence_to_sequential_agent():
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          StepRef(
+              kind="step",
+              id="c",
+              capability="classify",
+              input=Binding(source="task"),
+          ),
+          StepRef(
+              kind="step",
+              id="s",
+              capability="tech_summary",
+              input=Binding(source="step", step="c"),
+          ),
+      ],
+      output=Binding(source="step", step="s"),
+  )
+  cfg = lower_to_agent_config(spec)
+  assert cfg["agent_class"] == "SequentialAgent"
+  assert [s["agent_class"] for s in cfg["sub_agents"]] == [
+      "LlmAgent",
+      "LlmAgent",
+  ]
+  assert [s["capability"] for s in cfg["sub_agents"]] == [
+      "classify",
+      "tech_summary",
+  ]
+  assert AGENTCONFIG_UNSUPPORTED not in [
+      s["agent_class"] for s in cfg["sub_agents"]
+  ]
+
+
+def test_lower_loop_to_loop_agent():
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          LoopUntil(
+              kind="loop_until",
+              id="lp",
+              body=[
+                  StepRef(
+                      kind="step",
+                      id="d",
+                      capability="draft",
+                      input=Binding(source="task"),
+                  )
+              ],
+              until_capability="is_good",
+              until_input=Binding(source="step", step="d"),
+              max_iters=3,
+          )
+      ],
+      output=Binding(source="step", step="lp"),
+  )
+  loop = lower_to_agent_config(spec)["sub_agents"][0]
+  assert loop["agent_class"] == "LoopAgent"
+  assert loop["max_iterations"] == 3
+  assert loop["sub_agents"][0]["capability"] == "draft"
+
+
+def test_lower_marks_dynamic_blocks_unsupported():
+  # pipeline is per-item over a runtime list -> no AgentConfig equivalent.
+  cov = agent_config_coverage(_pipeline_spec())
+  assert cov == {"total": 1, "lowerable": 0, "dynamic": ["pipeline"]}
+
+
+def test_lower_never_emits_importable_fqn():
+  # leaves are referenced by allow-listed capability name, never by an
+  # importable path; the FQN-bearing keys ADK config would use are absent.
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          StepRef(
+              kind="step",
+              id="c",
+              capability="classify",
+              input=Binding(source="task"),
+          )
+      ],
+      output=Binding(source="step", step="c"),
+  )
+  blob = json.dumps(lower_to_agent_config(spec))
+  assert '"code"' not in blob and '"config_path"' not in blob
+  assert '"capability": "classify"' in blob
+
+
+def test_import_rejects_new_input_without_template_schema():
+  env = export_plan(_frozen())  # no task_input_schema captured -> replay-only
+  other = {"files": [{"path": "z.py", "code": "ok"}]}
+  with pytest.raises(PlanImportError, match="digest mismatch"):
+    import_plan(env, _registry(), task_input=other)
+  # but template promotion (a captured schema) lets a new input through:
+  env["task_input_schema"] = {"required": ["files"]}
+  assert import_plan(env, _registry(), task_input=other) is not None
+
+
+# ------------------------------------------------------------ pattern coverage
+# The six empirically common coordination patterns (classify-route, fan-out/
+# synthesize, generate-filter, loop-until-done, adversarial verification,
+# tournament) must all be expressible in the v1 vocabulary. Four are already
+# exercised above (branch test = classify-route; fanout_then_aggregate =
+# fan-out/synthesize AND generate-filter; loop test = loop-until-done). The two
+# non-obvious shapes get explicit tests here. Tournament is the one that
+# surfaced a vocabulary gap: data-dependent pairing needs LOOP-CARRIED state
+# (`LoopUntil.init` + body bindings to the loop's own id).
+
+
+def _pattern_registry():
+  return CapabilityRegistry([
+      Capability(
+          name="pair_maker",
+          build=_cap_node(
+              "pair_maker",
+              lambda lst: [lst[i : i + 2] for i in range(0, len(lst), 2)],
+          ),
+          input_kind="list",
+          serialize_input=False,
+      ),
+      Capability(
+          name="judge",
+          build=_cap_node("judge", lambda pair: min(pair)),
+          input_kind="item",
+          serialize_input=False,
+      ),
+      Capability(
+          name="single_winner",
+          build=_cap_node("single_winner", lambda lst: len(lst) == 1),
+          input_kind="list",
+          serialize_input=False,
+      ),
+      Capability(
+          name="skeptic",
+          build=_cap_node(
+              "skeptic",
+              lambda f: {"claim": f["claim"], "refuted": not f["evidence"]},
+          ),
+          input_kind="item",
+          serialize_input=False,
+      ),
+      Capability(
+          name="keep_unrefuted",
+          build=_cap_node(
+              "keep_unrefuted",
+              lambda vs: [v["claim"] for v in vs if not v["refuted"]],
+          ),
+          input_kind="list",
+          serialize_input=False,
+      ),
+  ])
+
+
+def _tournament_spec():
+  return WorkflowSpec(
+      goal="single elimination",
+      steps=[
+          LoopUntil(
+              kind="loop_until",
+              id="tourney",
+              init=Binding(source="task", path="candidates"),
+              body=[
+                  StepRef(
+                      kind="step",
+                      id="pairs",
+                      capability="pair_maker",
+                      # reads the LOOP-CARRIED value: the candidates on round 0,
+                      # the prior round's winners afterwards.
+                      input=Binding(source="step", step="tourney"),
+                  ),
+                  FanOut(
+                      kind="fan_out",
+                      id="round_winners",
+                      over=Binding(source="step", step="pairs"),
+                      capability="judge",
+                  ),
+              ],
+              until_capability="single_winner",
+              until_input=Binding(source="step", step="round_winners"),
+              max_iters=4,
+          ),
+      ],
+      output=Binding(source="step", step="tourney"),
+  )
+
+
+@pytest.mark.asyncio
+async def test_pattern_tournament_loop_carried():
+  reg = _pattern_registry()
+  assert WorkflowSpecValidator(reg).validate(_tournament_spec()) == []
+  out = await _run_spec(
+      _tournament_spec(),
+      reg,
+      {"candidates": ["delta", "bravo", "charlie", "alpha"]},
+  )
+  # round 1: (delta,bravo)->bravo, (charlie,alpha)->alpha; round 2: -> alpha.
+  assert out == ["alpha"]
+
+
+def test_validator_rejects_loop_carried_read_without_init():
+  spec = _tournament_spec()
+  spec.steps[0].init = None  # body still binds the loop's own id
+  with pytest.raises(SpecValidationError, match="init"):
+    WorkflowSpecValidator(_pattern_registry()).validate(spec)
+
+
+@pytest.mark.asyncio
+async def test_pattern_adversarial_verification():
+  # Independent skeptics per finding (fan_out) + a threshold/filter step:
+  # only evidence-backed claims survive. No new vocabulary needed.
+  spec = WorkflowSpec(
+      goal="verify findings adversarially",
+      steps=[
+          FanOut(
+              kind="fan_out",
+              id="verdicts",
+              over=Binding(source="task", path="findings"),
+              capability="skeptic",
+          ),
+          StepRef(
+              kind="step",
+              id="confirmed",
+              capability="keep_unrefuted",
+              input=Binding(source="step", step="verdicts"),
+          ),
+      ],
+      output=Binding(source="step", step="confirmed"),
+  )
+  reg = _pattern_registry()
+  assert WorkflowSpecValidator(reg).validate(spec) == []
+  out = await _run_spec(
+      spec,
+      reg,
+      {
+          "findings": [
+              {"claim": "A", "evidence": True},
+              {"claim": "B", "evidence": False},
+              {"claim": "C", "evidence": True},
+          ]
+      },
+  )
+  assert out == ["A", "C"]
+
+
+# ------------------------------------------------------------ quality lints
+def _self_review_spec():
+  return WorkflowSpec(
+      goal="x",
+      steps=[
+          StepRef(
+              kind="step",
+              id="a",
+              capability="classify",
+              input=Binding(source="task"),
+          ),
+          StepRef(
+              kind="step",
+              id="b",
+              capability="classify",
+              input=Binding(source="step", step="a"),
+          ),
+      ],
+      output=Binding(source="step", step="b"),
+  )
+
+
+def test_lint_warns_on_same_capability_review():
+  # classify reviewing classify's own output cannot be independent.
+  warnings = WorkflowSpecValidator(_registry()).validate(_self_review_spec())
+  assert any("same capability 'classify'" in w for w in warnings)
+
+
+def test_lint_self_chain_policy_suppresses():
+  # draft -> critique-own-draft -> redraft is legitimate refinement; a
+  # capability can opt out of the self-review lint via allow_self_chain.
+  reg = _registry()
+  reg["classify"].allow_self_chain = True
+  warnings = WorkflowSpecValidator(reg).validate(_self_review_spec())
+  assert [w for w in warnings if w.startswith("plan-quality")] == []
+
+
+def test_lint_waiver_suppresses_and_is_recorded():
+  # A per-plan waiver (node id -> justification) suppresses the lint AND is
+  # recorded in the frozen record — auditable suppression, not silence.
+  waivers = {"b": "intentional self-refinement pass"}
+  warnings = WorkflowSpecValidator(_registry()).validate(
+      _self_review_spec(), lint_waivers=waivers
+  )
+  assert [w for w in warnings if w.startswith("plan-quality")] == []
+  rec = FrozenWorkflowRecord.freeze(
+      _self_review_spec(),
+      planner_model="gemini-3.5-flash",
+      registry=_registry(),
+      created_at="2026-06-09T00:00:00Z",
+      lint_waivers=waivers,
+  )
+  assert export_plan(rec)["lint_waivers"] == waivers
+
+
+def test_import_rejects_missing_contract_hashes():
+  # Review finding (High): stripping capability_contract_hashes from the
+  # envelope must NOT bypass drift detection. Exact reproduction: export,
+  # delete the field, change a capability's output schema without bumping
+  # the manual version — import must fail closed on the missing hashes.
+  env = export_plan(_frozen())
+  del env["capability_contract_hashes"]
+
+  class NewCountReport(BaseModel):
+    n: int
+
+  changed = _registry()
+  changed["count"].output_model = NewCountReport  # version string unchanged
+  with pytest.raises(PlanImportError, match="missing contract hashes"):
+    import_plan(env, changed, task_input=_TASK)
+  # fail closed even with NO drift at all — the field itself is required:
+  env2 = export_plan(_frozen())
+  del env2["capability_contract_hashes"]
+  with pytest.raises(PlanImportError, match="missing contract hashes"):
+    import_plan(env2, _registry(), task_input=_TASK)
+
+
+def test_import_rejects_partial_contract_hashes():
+  # Dropping a SINGLE capability's hash must fail closed too.
+  env = export_plan(_frozen())
+  del env["capability_contract_hashes"]["count"]
+  with pytest.raises(
+      PlanImportError, match=r"missing contract hashes for \['count'\]"
+  ):
+    import_plan(env, _registry(), task_input=_TASK)
+
+
+def test_import_rejects_contract_hash_drift():
+  # The DERIVED drift signal: change a capability's declared contract (here,
+  # its output schema) WITHOUT bumping the manual version — manual-version
+  # drift stays silent; the contract hash catches it.
+  env = export_plan(_frozen())
+
+  class NewCountReport(BaseModel):
+    n: int  # narrower contract than before
+
+  changed = _registry()
+  changed["count"].output_model = NewCountReport  # version string unchanged
+  with pytest.raises(PlanImportError, match="contract drift"):
+    import_plan(env, changed, task_input=_TASK)
+
+
+def test_lint_warns_on_unsynthesized_fanout():
+  spec = WorkflowSpec(
+      goal="x",
+      steps=[
+          FanOut(
+              kind="fan_out",
+              id="rev",
+              over=Binding(source="task", path="files"),
+              capability="review",
+          ),
+      ],
+      output=Binding(source="step", step="rev"),
+  )
+  warnings = WorkflowSpecValidator(_registry()).validate(spec)
+  assert any("no downstream synthesis" in w for w in warnings)
+
+
+def test_lints_clean_on_independent_plan():
+  # review -> count: different capabilities, fan_out is synthesized. Clean.
+  assert (
+      WorkflowSpecValidator(_registry()).validate(_fanout_aggregate_spec())
+      == []
+  )
