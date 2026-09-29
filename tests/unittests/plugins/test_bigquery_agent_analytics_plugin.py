@@ -7745,6 +7745,177 @@ class TestToolResultErrorClassification:
     assert returned[0].gi_frame is None
 
   @pytest.mark.parametrize(
+      "kind",
+      [
+          "failed_future",
+          "failing_task",
+          "task_failing_once_cancelled",
+          "failing_gather",
+          "async_generator",
+          "custom_awaitable",
+      ],
+  )
+  @pytest.mark.asyncio
+  async def test_classifier_return_value_leaks_nothing_once_collected(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context, caplog, kind
+  ):
+    """Nothing a classifier returns makes asyncio log its failure later.
+
+    asyncio logs the exception of a failed future that nobody retrieved, with
+    its traceback, when the future is collected, and that exception can carry
+    the result. The plugin cancels a pending future or task and retrieves the
+    exception of a finished one. An async generator or other awaitable that
+    never ran holds no failure. Each is ignored, so the built-in rule records
+    the call.
+    """
+    private = f"{_PAYLOAD_SECRET}-{kind}"
+    release = asyncio.Event()
+    ran = []
+
+    async def fail_after_a_yield():
+      ran.append(True)
+      await asyncio.sleep(0)
+      raise ValueError(private)
+
+    async def fail_when_woken():
+      try:
+        await release.wait()
+      except asyncio.CancelledError:
+        pass
+      raise ValueError(private)
+
+    async def private_rows():
+      yield private
+      raise ValueError(private)
+
+    class _FailingAwaitable:
+
+      def __await__(self):
+        yield
+        raise ValueError(private)
+
+    started = []
+    if kind == "task_failing_once_cancelled":
+      started.append(asyncio.create_task(fail_when_woken()))
+      await asyncio.sleep(0)
+
+    def classify(*, tool, tool_args, tool_context, result):
+      if kind == "failed_future":
+        future = asyncio.get_running_loop().create_future()
+        future.set_exception(ValueError(private))
+        return future
+      if kind == "failing_task":
+        return asyncio.create_task(fail_after_a_yield())
+      if kind == "failing_gather":
+        return asyncio.gather(fail_after_a_yield())
+      if kind == "async_generator":
+        return private_rows()
+      if kind == "custom_awaitable":
+        return _FailingAwaitable()
+      return started.pop()
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=classify
+    )
+    # Collect what earlier tests left behind, so that only what this call
+    # returned can be collected below.
+    gc.collect()
+    caplog.clear()
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always")
+      with caplog.at_level(logging.DEBUG):
+        rows = await self._record_tool_call(
+            _mock_bq_infra,
+            dummy_arrow_schema,
+            tool_context,
+            {"isError": True},
+            config=config,
+        )
+        release.set()
+        for _ in range(5):
+          await asyncio.sleep(0)
+        gc.collect()
+
+    assert [r["event_type"] for r in rows] == ["TOOL_STARTING", "TOOL_ERROR"]
+    assert "tool_result_classifier" in caplog.text
+    assert private not in caplog.text
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == "asyncio" and record.levelno >= logging.ERROR
+    ]
+    assert not [
+        warning
+        for warning in caught
+        if private in str(warning.message)
+        or "never awaited" in str(warning.message)
+    ]
+    # A pending task is cancelled before it runs.
+    assert not ran
+
+  @pytest.mark.asyncio
+  async def test_pending_future_from_a_classifier_is_cancelled(
+      self, _mock_bq_infra, dummy_arrow_schema, tool_context
+  ):
+    """A pending future a classifier returns is cancelled, not left pending."""
+    returned = []
+
+    def classify(*, tool, tool_args, tool_context, result):
+      returned.append(asyncio.get_running_loop().create_future())
+      return returned[-1]
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=classify
+    )
+
+    rows = await self._record_tool_call(
+        _mock_bq_infra,
+        dummy_arrow_schema,
+        tool_context,
+        {"rows": 1},
+        config=config,
+    )
+
+    assert [r["event_type"] for r in rows] == [
+        "TOOL_STARTING",
+        "TOOL_COMPLETED",
+    ]
+    assert returned[0].cancelled()
+
+  @pytest.mark.skipif(
+      sys.version_info < (3, 14),
+      reason="Only Python 3.14 and later evaluate annotations lazily.",
+  )
+  def test_classifier_annotated_with_names_it_imports_for_type_checking(self):
+    """The classifier's annotations are not evaluated to check its signature.
+
+    From Python 3.14 a classifier can annotate its parameters with names it
+    imports only under TYPE_CHECKING, and evaluating those annotations raises
+    NameError. The classifier is compiled apart from this module, whose
+    `from __future__ import annotations` would turn them into strings.
+    """
+    namespace = {}
+    exec(  # pylint: disable=exec-used
+        compile(
+            "def classify(*, tool: BaseTool, tool_args, tool_context,"
+            " result):\n  return None\n",
+            "<classifier>",
+            "exec",
+            dont_inherit=True,
+        ),
+        namespace,
+    )
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        tool_result_classifier=namespace["classify"]
+    )
+
+    plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
+        PROJECT_ID, DATASET_ID, table_id=TABLE_ID, config=config
+    )
+
+    assert plugin.config.tool_result_classifier is namespace["classify"]
+
+  @pytest.mark.parametrize(
       "make_classifier",
       [
           lambda: max,

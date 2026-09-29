@@ -871,12 +871,13 @@ def _retry_answer_error_message(fields: dict[str, Any]) -> Optional[str]:
 
 
 def _mcp_error_message(fields: dict[str, Any]) -> Optional[str]:
-  """Returns the message of an MCP ``CallToolResult`` that failed, or None.
+  """Returns the message of a result with an MCP error flag set, or None.
 
-  ``isError`` (``is_error`` in MCP SDK 2.x) must be exactly ``True``. The
-  result's text is tool output, which ``content_formatter`` and
-  ``payload_column_denylist`` govern but ``error_message`` bypasses, so the
-  message is fixed.
+  The flag is the top-level ``isError`` (``is_error`` in MCP SDK 2.x) of any
+  dict result, which covers an MCP ``CallToolResult`` dump, or of a
+  ``CallToolResult`` model, and it must be exactly ``True``. The result's text
+  is tool output, which ``content_formatter`` and ``payload_column_denylist``
+  govern but ``error_message`` bypasses, so the message is fixed.
   """
   if fields.get("isError") is True or fields.get("is_error") is True:
     return _MCP_TOOL_ERROR_MESSAGE
@@ -936,6 +937,36 @@ def _classification_error_message(classification: Any) -> Optional[str]:
   if text is None:
     raise TypeError("ToolResultClassification.error_message is not a str.")
   return text or _CLASSIFIED_TOOL_ERROR_MESSAGE
+
+
+def _retrieve_exception(future: asyncio.Future[Any]) -> None:
+  """Marks the exception of a done future as retrieved.
+
+  asyncio logs an exception that nobody retrieved, with its traceback, when
+  the future is collected, and the exception of a future a classifier returns
+  can carry the tool result.
+  """
+  if not future.cancelled():
+    future.exception()
+
+
+def _release_awaitable(awaitable: Any) -> None:
+  """Releases an awaitable a classifier returned, running none of its code.
+
+  A coroutine, native or generator-based, is closed, so that Python does not
+  warn it was never awaited. An asyncio future or task that is still pending
+  is cancelled, and the exception it ends with is retrieved, as is the
+  exception of one already done. Any other awaitable only runs code when it is
+  awaited, so it is left as it is.
+  """
+  if inspect.iscoroutine(awaitable) or inspect.isgenerator(awaitable):
+    awaitable.close()
+  elif asyncio.isfuture(awaitable):
+    if awaitable.done():
+      _retrieve_exception(awaitable)
+    else:
+      awaitable.add_done_callback(_retrieve_exception)
+      awaitable.cancel()
 
 
 def _extract_tool_declarations(
@@ -1704,6 +1735,24 @@ def _validate_runtime_config(config: "BigQueryLoggerConfig") -> None:
   _validate_tool_result_classifier(config.tool_result_classifier)
 
 
+def _signature_without_annotations(function: Any) -> inspect.Signature:
+  """Returns the signature of ``function`` without evaluating its annotations.
+
+  From Python 3.14, annotations are evaluated only when they are read, so a
+  function may annotate its parameters with names it imports only for type
+  checking, and reading those annotations as values raises NameError. Only the
+  parameters matter here, so on 3.14 the annotations are read as source
+  strings, which evaluates none of them.
+  """
+  if sys.version_info >= (3, 14):
+    import annotationlib  # pylint: disable=g-import-not-at-top
+
+    return inspect.signature(
+        function, annotation_format=annotationlib.Format.STRING
+    )
+  return inspect.signature(function)
+
+
 def _validate_tool_result_classifier(classifier: Any) -> None:
   """Validates ``BigQueryLoggerConfig.tool_result_classifier``.
 
@@ -1749,7 +1798,7 @@ def _validate_tool_result_classifier(classifier: Any) -> None:
         " calls it without awaiting or iterating the result."
     )
   try:
-    signature = inspect.signature(classifier)
+    signature = _signature_without_annotations(classifier)
   except Exception as e:  # pylint: disable=broad-except
     raise ValueError(
         "tool_result_classifier must have a signature that inspect can read,"
@@ -2504,7 +2553,8 @@ class BigQueryLoggerConfig:
         failure. Return a ``ToolResultClassification`` to record the call as
         ``TOOL_ERROR`` (``status="ERROR"``) or as ``TOOL_COMPLETED``
         (``status="OK"``), or ``None`` to leave it to the built-in rule, which
-        records an MCP result with ``isError`` set as ``TOOL_ERROR``. It is not
+        records as ``TOOL_ERROR`` a result whose top-level ``isError`` or
+        ``is_error`` is ``True``, such as an MCP ``CallToolResult``. It is not
         called for a ``ReflectAndRetryToolPlugin`` answer, which stands for a
         raised error and is always recorded as ``TOOL_ERROR``. The arguments
         must not be modified; the model and the agent use them next. A
@@ -8772,15 +8822,17 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
        raises or returns anything but a readable ``ToolResultClassification``
        or None is skipped, and the warning names only the tool: the exception,
        its traceback and the returned value can all carry the result. A
-       returned coroutine, native or generator-based, is closed so that Python
-       does not warn it was never awaited; any other awaitable, such as a
-       ``Future``, is ignored as it is. A ``BaseException`` that is not an
-       ``Exception``, such as a cancellation, ``KeyboardInterrupt`` or
+       returned awaitable is ignored too, once ``_release_awaitable`` has
+       closed it if it is a coroutine, or cancelled it and retrieved its
+       exception if it is an asyncio future or task, so that neither Python
+       nor asyncio later logs anything about it. A ``BaseException`` that is
+       not an ``Exception``, such as a cancellation, ``KeyboardInterrupt`` or
        ``SystemExit``, propagates as it does from every callback of this
        plugin, because absorbing it would keep a task or the process from
        stopping.
-    3. An MCP ``CallToolResult``, as a model or as a dict dump, whose error flag
-       is set.
+    3. A result whose top-level ``isError`` or ``is_error`` is exactly
+       ``True``: any dict, which covers an MCP ``CallToolResult`` dump, or an
+       MCP ``CallToolResult`` model.
 
     Any other result succeeded, including one that merely has an
     ``error_details`` key. The tools' own ``_detect_error_in_response`` hooks,
@@ -8817,10 +8869,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             result=result,
         )
         if inspect.isawaitable(classification):
-          if inspect.iscoroutine(classification) or inspect.isgenerator(
-              classification
-          ):
-            classification.close()
+          _release_awaitable(classification)
           logger.warning(
               "tool_result_classifier returned an awaitable for tool %s; it"
               " must be synchronous. Applying the built-in rule instead.",
