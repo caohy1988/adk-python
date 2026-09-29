@@ -542,17 +542,19 @@ def _build_response_event(
       and 'error' not in function_result
       and has_displayable_result
   ):
-    # Imported lazily: AgentTool is only needed on the skip-summarization
-    # path, so it is not worth pulling into every functions.py import.
+    # Imported lazily: AgentTool and NodeTool are only needed on the
+    # skip-summarization path, so they are not worth pulling into every
+    # functions.py import.
+    from ....tools._node_tool import NodeTool
     from ....tools.agent_tool import AgentTool
 
-    # This is scoped to AgentTool deliberately: other tools (e.g. UI/widget-
-    # rendering tools) set skip_summarization precisely because their function
-    # response is an internal acknowledgement that must NOT be surfaced as
-    # visible text. AgentTool subclasses can still return None (e.g.
+    # This is scoped to AgentTool and NodeTool deliberately: other tools (e.g.
+    # UI/widget-rendering tools) set skip_summarization precisely because their
+    # function response is an internal acknowledgement that must NOT be surfaced
+    # as visible text. AgentTool subclasses can still return None (e.g.
     # _SingleTurnAgentTool delegating to run_node), hence the
     # has_displayable_result guard above.
-    if isinstance(tool, AgentTool):
+    if isinstance(tool, (AgentTool, NodeTool)):
       if isinstance(display_result, str):
         result_text = display_result
       else:
