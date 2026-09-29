@@ -2835,6 +2835,20 @@ def test_fast_api_common_options_rejects_invalid_avatar_config() -> None:
   assert "valid AvatarConfig JSON object" in result.output
 
 
+def test_fast_api_common_options_rejects_missing_avatar_config_file(
+    tmp_path: Path,
+) -> None:
+  """A non-JSON value that is not a readable file is a usage error."""
+  command, _ = _fast_api_command()
+  missing_path = tmp_path / "missing_avatar.json"
+
+  result = CliRunner().invoke(command, ["--avatar_config", str(missing_path)])
+
+  assert result.exit_code == 2
+  assert "could not read avatar configuration file" in result.output
+  assert "missing_avatar.json" in result.output
+
+
 # adk test
 @pytest.fixture
 def fake_pytest_run(monkeypatch: pytest.MonkeyPatch):
