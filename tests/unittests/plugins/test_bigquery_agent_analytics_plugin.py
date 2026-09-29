@@ -17,6 +17,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import dataclasses
+import io
 import json
 import logging
 import os
@@ -3817,8 +3818,8 @@ class TestBigQueryAgentAnalyticsPlugin:
 # TEST CLASS: content_formatter failure diagnostics
 # ==============================================================================
 # Formatters that fail in each way the error_message column must describe.
-# They live at module level so that _RedactionServiceError is bound in this
-# module the way a library binds its exception classes.
+# Payload-derived class names are built from the logged message text, so a
+# leak shows up as that text in a column or a log line.
 
 
 class _RedactionServiceError(Exception):
@@ -3833,9 +3834,89 @@ class _ClaimsStaticTypeMeta(type):
     return int.__flags__
 
 
+class _NeitherInterruptNorCancellation(BaseException):
+  """A BaseException that is not KeyboardInterrupt, SystemExit, or cancel."""
+
+
 def _identifier_from_content(content):
   """Turns the logged message text into a valid class name."""
   return content.parts[0].text.replace("-", "_")
+
+
+def _register_payload_named_class(content, bases):
+  """Creates a payload-named class and binds it in this module under its name.
+
+  Class factories do this so that pickling can find their products, which is
+  what a name-in-its-module check would take as a class defined by code.
+  """
+  name = _identifier_from_content(content)
+  cls = type(name, bases, {"__module__": __name__})
+  globals()[name] = cls
+  return cls
+
+
+class _Tripwire:
+  """Makes hostile hooks raise only while armed.
+
+  pytest reads an escaped exception's class name and message when it reports
+  a failure. Hooks that still raised then would abort the whole session, so
+  each test disarms its tripwire before pytest reports anything.
+  """
+
+  def __init__(self, error_type):
+    self.error_type = error_type
+    self.armed = False
+
+  def fire(self, hook):
+    if self.armed:
+      raise self.error_type(f"TRIPWIRE: {hook} ran")
+
+
+def _metaclass_whose_hooks_raise(tripwire):
+  """Returns a metaclass whose attribute, equality, and hash hooks fire."""
+
+  class _HookedMeta(type):
+
+    def __getattribute__(cls, name):
+      tripwire.fire(f"metaclass __getattribute__({name!r})")
+      return super().__getattribute__(name)
+
+    def __eq__(cls, other):
+      tripwire.fire("metaclass __eq__")
+      return super().__eq__(other)
+
+    def __hash__(cls):
+      tripwire.fire("metaclass __hash__")
+      return super().__hash__()
+
+  return _HookedMeta
+
+
+def _unrenderable_exception(tripwire):
+  """Returns an exception whose traceback cannot be rendered while armed.
+
+  Rendering reads the traceback and the chained exceptions through the
+  exception's own __getattribute__ and calls its __str__; both fire here.
+  """
+
+  class _UnrenderableError(ValueError):
+
+    def __getattribute__(self, name):
+      if name in (
+          "__traceback__",
+          "__cause__",
+          "__context__",
+          "__suppress_context__",
+          "__notes__",
+      ):
+        tripwire.fire(f"exception __getattribute__({name!r})")
+      return super().__getattribute__(name)
+
+    def __str__(self):
+      tripwire.fire("exception __str__")
+      return "unrenderable"
+
+  return _UnrenderableError()
 
 
 def _raise_import_error(content, event_type):
@@ -3863,6 +3944,19 @@ def _raise_payload_named_exception_claiming_static_type(content, event_type):
   )()
 
 
+def _raise_registered_payload_named_exception(content, event_type):
+  raise _register_payload_named_class(content, (ValueError,))()
+
+
+def _raise_subclass_of_registered_payload_named_exception(content, event_type):
+  registered = _register_payload_named_class(content, (ValueError,))
+  raise type("Unregistered", (registered,), {})()
+
+
+def _raise_google_api_error(content, event_type):
+  raise api_exceptions.NotFound("redaction template not found")
+
+
 def _return_tuple(content, event_type):
   return ("not", "supported")
 
@@ -3871,11 +3965,36 @@ def _return_generator(content, event_type):
   yield content
 
 
+def _return_registered_payload_named_object(content, event_type):
+  return _register_payload_named_class(content, ())()
+
+
 def _return_local_llm_request_subclass(content, event_type):
   class LocalRequest(llm_request_lib.LlmRequest):
     pass
 
   return LocalRequest()
+
+
+def _return_local_content_subclass(content, event_type):
+  class LocalContent(types.Content):
+    pass
+
+  return LocalContent()
+
+
+def _return_local_part_subclass(content, event_type):
+  class LocalPart(types.Part):
+    pass
+
+  return LocalPart()
+
+
+def _return_pydantic_model(content, event_type):
+  class RedactedPayload(BaseModel):
+    text: str = "[REDACTED]"
+
+  return RedactedPayload()
 
 
 @pytest.mark.usefixtures(
@@ -3887,12 +4006,24 @@ def _return_local_llm_request_subclass(content, event_type):
 class TestContentFormatterFailureDiagnostics:
   """A failing content_formatter is diagnosable without leaking content.
 
-  The row's error_message names the failure by class. The formatter's input
-  and the exception's message never reach the row, and the traceback reaches
-  the local log only when debug_content_formatter_errors is enabled.
+  The row's error_message names the failure by a trusted class label. The
+  formatter's input, the exception's message, and any class name taken from
+  the class itself never reach the row. Diagnosing the failure never drops
+  the row, and the traceback reaches the local log only when
+  debug_content_formatter_errors is enabled.
   """
 
   SECRET = "TOPSECRET-4111-1111-1111-1111"
+  PAYLOAD_IDENTIFIER = "TOPSECRET_4111_1111_1111_1111"
+  DEFAULT_WARNING = (
+      "Content formatter failed for event USER_MESSAGE_RECEIVED; writing"
+      " sentinel instead of original content."
+  )
+
+  @pytest.fixture(autouse=True)
+  def _unbind_registered_payload_classes(self):
+    yield
+    globals().pop(self.PAYLOAD_IDENTIFIER, None)
 
   async def _log_user_message(
       self, config, mock_write_client, invocation_context, dummy_arrow_schema
@@ -3922,6 +4053,23 @@ class TestContentFormatterFailureDiagnostics:
         if record.getMessage().startswith("Content formatter failed")
     ]
 
+  @staticmethod
+  @contextlib.contextmanager
+  def _standard_handler_on_plugin_logger(stream):
+    """Attaches a stock logging.StreamHandler, as an application would."""
+    plugin_logger = logging.getLogger(
+        "google_adk." + bigquery_agent_analytics_plugin.__name__
+    )
+    handler = logging.StreamHandler(stream)
+    previous_level = plugin_logger.level
+    plugin_logger.addHandler(handler)
+    plugin_logger.setLevel(logging.WARNING)
+    try:
+      yield
+    finally:
+      plugin_logger.removeHandler(handler)
+      plugin_logger.setLevel(previous_level)
+
   @pytest.mark.parametrize(
       ("formatter", "expected_error_message"),
       [
@@ -3932,7 +4080,7 @@ class TestContentFormatterFailureDiagnostics:
           ),
           pytest.param(
               _raise_module_level_exception,
-              "content_formatter raised _RedactionServiceError",
+              "content_formatter raised <subclass of Exception>",
               id="module_level_exception",
           ),
           pytest.param(
@@ -3951,6 +4099,21 @@ class TestContentFormatterFailureDiagnostics:
               id="payload_named_exception_misreporting_type_flags",
           ),
           pytest.param(
+              _raise_registered_payload_named_exception,
+              "content_formatter raised <subclass of ValueError>",
+              id="registered_payload_named_exception",
+          ),
+          pytest.param(
+              _raise_subclass_of_registered_payload_named_exception,
+              "content_formatter raised <subclass of ValueError>",
+              id="subclass_of_registered_payload_named_exception",
+          ),
+          pytest.param(
+              _raise_google_api_error,
+              "content_formatter raised <subclass of GoogleAPICallError>",
+              id="google_api_error",
+          ),
+          pytest.param(
               _return_tuple,
               "content_formatter returned unsupported type tuple",
               id="unsupported_builtin_result",
@@ -3961,10 +4124,33 @@ class TestContentFormatterFailureDiagnostics:
               id="unsupported_unexported_builtin_result",
           ),
           pytest.param(
+              _return_registered_payload_named_object,
+              "content_formatter returned unsupported type"
+              " <subclass of object>",
+              id="registered_payload_named_result",
+          ),
+          pytest.param(
               _return_local_llm_request_subclass,
               "content_formatter returned unsupported type"
               " <subclass of LlmRequest>",
-              id="unsupported_model_subclass_result",
+              id="llm_request_subclass_result",
+          ),
+          pytest.param(
+              _return_local_content_subclass,
+              "content_formatter returned unsupported type"
+              " <subclass of Content>",
+              id="content_subclass_result",
+          ),
+          pytest.param(
+              _return_local_part_subclass,
+              "content_formatter returned unsupported type <subclass of Part>",
+              id="part_subclass_result",
+          ),
+          pytest.param(
+              _return_pydantic_model,
+              "content_formatter returned unsupported type"
+              " <subclass of BaseModel>",
+              id="pydantic_model_result",
           ),
       ],
   )
@@ -3975,19 +4161,23 @@ class TestContentFormatterFailureDiagnostics:
       mock_write_client,
       invocation_context,
       dummy_arrow_schema,
+      caplog,
   ):
-    """A failed formatter's row fails closed and names the failure's class.
+    """A failed formatter's row fails closed and names a trusted class.
 
-    A class name chosen at runtime, e.g. by type(name, ...) from the content,
-    is replaced by its nearest code-defined ancestor.
+    Only a built-in type or an allowlisted class is named. Any other class,
+    including a module-level one or one named after the content, is
+    described by its nearest such ancestor, and its own name appears in no
+    column and no default log line.
     """
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
         content_formatter=formatter
     )
 
-    row, drop_stats = await self._log_user_message(
-        config, mock_write_client, invocation_context, dummy_arrow_schema
-    )
+    with caplog.at_level(logging.WARNING):
+      row, drop_stats = await self._log_user_message(
+          config, mock_write_client, invocation_context, dummy_arrow_schema
+      )
 
     assert row["error_message"] == expected_error_message
     assert (
@@ -3995,6 +4185,100 @@ class TestContentFormatterFailureDiagnostics:
         == bigquery_agent_analytics_plugin._FORMATTER_FAILED_SENTINEL
     )
     assert drop_stats.get("formatter_failed") == 1
+    written = json.dumps(row, default=str)
+    for payload_text in (self.SECRET, self.PAYLOAD_IDENTIFIER):
+      assert payload_text not in written
+      assert payload_text not in caplog.text
+
+  async def test_trusted_class_label_is_fixed_text_not_its_current_name(
+      self, mock_write_client, invocation_context, dummy_arrow_schema
+  ):
+    """Renaming an allowlisted class at runtime cannot change its label."""
+    trusted = api_exceptions.GoogleAPICallError
+    original_names = (trusted.__name__, trusted.__qualname__)
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=_raise_google_api_error
+    )
+
+    trusted.__name__ = trusted.__qualname__ = self.PAYLOAD_IDENTIFIER
+    try:
+      row, _ = await self._log_user_message(
+          config, mock_write_client, invocation_context, dummy_arrow_schema
+      )
+    finally:
+      trusted.__name__, trusted.__qualname__ = original_names
+
+    assert row["error_message"] == (
+        "content_formatter raised <subclass of GoogleAPICallError>"
+    )
+
+  @pytest.mark.parametrize(
+      "hook_error",
+      [asyncio.CancelledError, SystemExit, RuntimeError],
+      ids=["cancelled_error", "system_exit", "runtime_error"],
+  )
+  @pytest.mark.parametrize(
+      ("raised", "expected_error_message"),
+      [
+          pytest.param(
+              True,
+              "content_formatter raised <subclass of ValueError>",
+              id="raised",
+          ),
+          pytest.param(
+              False,
+              "content_formatter returned unsupported type"
+              " <subclass of object>",
+              id="returned",
+          ),
+      ],
+  )
+  async def test_naming_the_failure_runs_none_of_the_class_hooks(
+      self,
+      raised,
+      expected_error_message,
+      hook_error,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+      caplog,
+  ):
+    """Diagnosing a failure never runs the failed class's metaclass hooks.
+
+    Those hooks can raise anything, including BaseException subclasses that
+    the fail-closed boundary deliberately lets through, so the row, its
+    sentinel, and the drop counter must not depend on them.
+    """
+    tripwire = _Tripwire(hook_error)
+    hooked_meta = _metaclass_whose_hooks_raise(tripwire)
+
+    def formatter(content, event_type):
+      name = _identifier_from_content(content)
+      failure = hooked_meta(name, (ValueError,) if raised else (), {})()
+      tripwire.armed = True
+      if raised:
+        raise failure
+      return failure
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=formatter
+    )
+
+    try:
+      with caplog.at_level(logging.WARNING):
+        row, drop_stats = await self._log_user_message(
+            config, mock_write_client, invocation_context, dummy_arrow_schema
+        )
+    finally:
+      tripwire.armed = False
+
+    assert row["error_message"] == expected_error_message
+    assert (
+        row["content"]
+        == bigquery_agent_analytics_plugin._FORMATTER_FAILED_SENTINEL
+    )
+    assert drop_stats.get("formatter_failed") == 1
+    assert "TRIPWIRE" not in caplog.text
 
   async def test_formatter_exception_text_never_reaches_the_row(
       self, mock_write_client, invocation_context, dummy_arrow_schema
@@ -4067,7 +4351,7 @@ class TestContentFormatterFailureDiagnostics:
   async def test_formatter_traceback_is_not_logged_by_default(
       self, mock_write_client, invocation_context, dummy_arrow_schema, caplog
   ):
-    """By default the formatter-failure warning carries no traceback."""
+    """By default the formatter-failure warning is constant, no traceback."""
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
         content_formatter=_raise_import_error
     )
@@ -4078,7 +4362,9 @@ class TestContentFormatterFailureDiagnostics:
       )
 
     warnings = self._formatter_warnings(caplog)
-    assert len(warnings) == 1
+    assert [record.getMessage() for record in warnings] == [
+        self.DEFAULT_WARNING
+    ]
     assert not warnings[0].exc_info
     assert self.SECRET not in caplog.text
 
@@ -4087,8 +4373,9 @@ class TestContentFormatterFailureDiagnostics:
   ):
     """debug_content_formatter_errors sends the traceback to the log only.
 
-    The traceback carries the exception message and the content it embeds,
-    so the row still names only the exception class.
+    The traceback is rendered to text before logging, so no handler ever
+    receives the live exception. It carries the exception message and the
+    content that message embeds, so the row still names only the class.
     """
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
         content_formatter=_raise_import_error,
@@ -4102,10 +4389,151 @@ class TestContentFormatterFailureDiagnostics:
 
     warnings = self._formatter_warnings(caplog)
     assert len(warnings) == 1
-    assert warnings[0].exc_info[0] is ImportError
-    assert self.SECRET in caplog.text
+    message = warnings[0].getMessage()
+    assert message.startswith(self.DEFAULT_WARNING)
+    assert "Traceback (most recent call last)" in message
+    assert self.SECRET in message
+    assert not warnings[0].exc_info
     assert row["error_message"] == "content_formatter raised ImportError"
     assert self.SECRET not in json.dumps(row, default=str)
+
+  @pytest.mark.parametrize(
+      ("debug", "render_error"),
+      [
+          pytest.param(False, RuntimeError, id="debug_off"),
+          pytest.param(True, RuntimeError, id="debug_on_exception"),
+          pytest.param(True, asyncio.CancelledError, id="debug_on_cancelled"),
+          pytest.param(
+              True,
+              _NeitherInterruptNorCancellation,
+              id="debug_on_other_base_exception",
+          ),
+      ],
+  )
+  async def test_unrenderable_traceback_never_affects_the_row(
+      self,
+      debug,
+      render_error,
+      monkeypatch,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """A traceback that cannot be rendered falls back to a constant line.
+
+    Uses a stock StreamHandler with logging.raiseExceptions on, Python's
+    default, whose handleError re-renders a failure's exception chain.
+    """
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+    tripwire = _Tripwire(render_error)
+
+    def formatter(content, event_type):
+      failure = _unrenderable_exception(tripwire)
+      tripwire.armed = True
+      raise failure
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=formatter, debug_content_formatter_errors=debug
+    )
+    stream = io.StringIO()
+
+    try:
+      with self._standard_handler_on_plugin_logger(stream):
+        row, drop_stats = await self._log_user_message(
+            config, mock_write_client, invocation_context, dummy_arrow_schema
+        )
+    finally:
+      tripwire.armed = False
+
+    assert row["error_message"] == (
+        "content_formatter raised <subclass of ValueError>"
+    )
+    assert (
+        row["content"]
+        == bigquery_agent_analytics_plugin._FORMATTER_FAILED_SENTINEL
+    )
+    assert drop_stats.get("formatter_failed") == 1
+    logged = stream.getvalue()
+    assert logged.startswith(self.DEFAULT_WARNING)
+    assert ("[traceback could not be rendered]" in logged) is debug
+    assert "TRIPWIRE" not in logged
+
+  @pytest.mark.parametrize(
+      "signal", [KeyboardInterrupt, SystemExit], ids=["interrupt", "exit"]
+  )
+  async def test_debug_rendering_lets_interrupts_and_exits_propagate(
+      self, signal, mock_write_client, invocation_context, dummy_arrow_schema
+  ):
+    """KeyboardInterrupt and SystemExit raised while rendering propagate.
+
+    A signal handler can deliver either at any bytecode, so one raised while
+    rendering may be genuine, and the plugin never swallows them. Anything
+    else raised there comes from the exception being rendered.
+    """
+
+    tripwire = _Tripwire(signal)
+
+    def formatter(content, event_type):
+      failure = _unrenderable_exception(tripwire)
+      tripwire.armed = True
+      raise failure
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=formatter, debug_content_formatter_errors=True
+    )
+
+    try:
+      with pytest.raises(signal, match="TRIPWIRE"):
+        await self._log_user_message(
+            config, mock_write_client, invocation_context, dummy_arrow_schema
+        )
+    finally:
+      tripwire.armed = False
+
+  @pytest.mark.parametrize(
+      "debug", [False, True], ids=["debug_off", "debug_on"]
+  )
+  async def test_failing_log_handler_cannot_reach_the_formatter_exception(
+      self,
+      debug,
+      monkeypatch,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """A handler failure while warning never re-renders the formatter error.
+
+    logging's handleError prints the failing handler's exception chain. The
+    warning is emitted after the formatter's exception is no longer being
+    handled, so that chain cannot reach it and run its hooks.
+    """
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+    tripwire = _Tripwire(RuntimeError)
+
+    def formatter(content, event_type):
+      failure = _unrenderable_exception(tripwire)
+      tripwire.armed = True
+      raise failure
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=formatter, debug_content_formatter_errors=debug
+    )
+    closed_stream = io.StringIO()
+    closed_stream.close()
+
+    try:
+      with self._standard_handler_on_plugin_logger(closed_stream):
+        row, drop_stats = await self._log_user_message(
+            config, mock_write_client, invocation_context, dummy_arrow_schema
+        )
+    finally:
+      tripwire.armed = False
+
+    assert (
+        row["content"]
+        == bigquery_agent_analytics_plugin._FORMATTER_FAILED_SENTINEL
+    )
+    assert drop_stats.get("formatter_failed") == 1
 
 
 class TestSafeCallbackDecorator:

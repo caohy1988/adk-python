@@ -49,7 +49,6 @@ os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 
 import random
 import re
-import sys
 import threading
 import time
 from types import MappingProxyType
@@ -87,6 +86,7 @@ from google.cloud.bigquery_storage_v1.services.big_query_write.async_client impo
 import google.cloud.storage as cloud_storage
 from google.genai import types
 from opentelemetry import trace
+from pydantic import BaseModel
 
 try:
   import pyarrow as pa
@@ -1014,40 +1014,62 @@ def _sanitize_sensitive_text(text: str, max_len: int) -> tuple[str, bool]:
 _FORMATTER_FAILED_SENTINEL = "[FORMATTER_FAILED]"
 
 # CPython's Py_TPFLAGS_HEAPTYPE: set on every class created at runtime and
-# clear on static types compiled into C.
+# clear on static types compiled into C, whose names cannot be reassigned.
 _PY_TPFLAGS_HEAPTYPE = 1 << 9
 
+# type's own descriptors. Calling them directly reads a class's flags, name,
+# and MRO without running code the class controls: an ordinary attribute read
+# goes through the metaclass, whose hooks can lie or raise anything, including
+# BaseException subclasses that the plugin's boundaries deliberately let pass.
+_TYPE_FLAGS = type.__dict__["__flags__"]
+_TYPE_NAME = type.__dict__["__name__"]
+_TYPE_MRO = type.__dict__["__mro__"]
 
-def _code_defined_class_name(cls: type) -> Optional[str]:
-  """Returns the qualified name of ``cls`` when code chose it, else None.
+# Runtime-created classes that a formatter commonly raises or returns, each
+# with a fixed label. Labels are never read from the class, because a class
+# created at runtime can be renamed.
+_TRUSTED_CLASS_LABELS: tuple[tuple[type, str], ...] = (
+    (LlmRequest, "LlmRequest"),
+    (types.Content, "Content"),
+    (types.Part, "Part"),
+    (BaseModel, "BaseModel"),
+    (api_exceptions.GoogleAPICallError, "GoogleAPICallError"),
+)
 
-  ``type(name, bases, namespace)`` can create a class named after data, such
-  as the content a formatter was protecting, so a class name is not safe to
-  record by default. A name counts as chosen by code when ``cls`` is a static
-  type compiled into C, or when ``cls`` is bound under that name in its
-  imported module, as a module-level ``class`` statement leaves it and a
-  runtime ``type()`` call does not.
+
+def _trusted_class_label(cls: type) -> Optional[str]:
+  """Returns a label for ``cls`` that no runtime data can have chosen.
+
+  Only static types compiled into C, whose names are fixed when the
+  interpreter or extension is built, and the classes in
+  ``_TRUSTED_CLASS_LABELS`` have one. Any other class can be created at
+  runtime by ``type(name, bases, namespace)`` with a name taken from the
+  content a formatter was protecting, bound into a module under that name, or
+  renamed, so its name is never trusted, wherever it is defined.
+
+  Args:
+    cls: The class to label.
+
+  Returns:
+    The label, or None when ``cls`` has none.
   """
-  try:
-    qualname = str.__str__(cls.__qualname__)
-    # A metaclass can misreport __flags__, so they are trusted only when the
-    # metaclass is type itself.
-    if type(cls) is type and not cls.__flags__ & _PY_TPFLAGS_HEAPTYPE:
-      return qualname
-    module = sys.modules.get(cls.__module__)
-    if module is not None and vars(module).get(qualname) is cls:
-      return qualname
-  except Exception:
-    pass
+  for trusted, label in _TRUSTED_CLASS_LABELS:
+    if cls is trusted:
+      return label
+  if not _TYPE_FLAGS.__get__(cls) & _PY_TPFLAGS_HEAPTYPE:
+    name: str = _TYPE_NAME.__get__(cls)
+    return name
   return None
 
 
 def _formatter_failure_message(cls: type, *, raised: bool) -> str:
   """Describes a content_formatter failure for the error_message column.
 
-  Only a class is named: the exception's message, args, and traceback can
-  embed the content the formatter was protecting. A class whose name was not
-  chosen by code is described by its nearest ancestor whose name was.
+  The class is named only by a trusted label, and a class without one by its
+  nearest ancestor that has one. The exception's message, args, and traceback
+  are never used: they can embed the content the formatter was protecting.
+  Nothing here runs code the class controls, so describing a failure cannot
+  raise, whatever the failure's class does.
 
   Args:
     cls: The class of the exception the formatter raised, or of the value it
@@ -1059,18 +1081,41 @@ def _formatter_failure_message(cls: type, *, raised: bool) -> str:
     ``content_formatter returned unsupported type <subclass of LlmRequest>``.
   """
   outcome = "raised" if raised else "returned unsupported type"
-  name = _code_defined_class_name(cls)
-  if name is None:
-    name = "<unknown class>"
-    try:
-      for base in cls.__mro__[1:]:
-        base_name = _code_defined_class_name(base)
-        if base_name is not None:
-          name = f"<subclass of {base_name}>"
-          break
-    except Exception:
-      pass
-  return f"content_formatter {outcome} {name}"
+  for depth, ancestor in enumerate(_TYPE_MRO.__get__(cls)):
+    label = _trusted_class_label(ancestor)
+    if label is not None:
+      if depth == 0:
+        return f"content_formatter {outcome} {label}"
+      return f"content_formatter {outcome} <subclass of {label}>"
+  # Unreachable for an instantiable class, whose MRO ends with object.
+  return f"content_formatter {outcome} <unknown class>"
+
+
+def _render_formatter_traceback(error: BaseException) -> str:
+  """Renders a content_formatter exception's traceback for debug logging.
+
+  Rendering runs the exception's own code: its ``__str__`` and the attribute
+  hooks that expose its traceback and chained exceptions. Whatever that code
+  raises is contained here and replaced by a constant, so rendering can never
+  affect the row, with two exceptions. KeyboardInterrupt and SystemExit
+  propagate, as they do everywhere else in the plugin, because a signal
+  handler can deliver either at any bytecode, so one raised here may be
+  genuine. Any other BaseException, asyncio.CancelledError included, can only
+  come from the exception being rendered: rendering never awaits, so it cannot
+  receive a real cancellation.
+
+  Args:
+    error: The exception the formatter raised.
+
+  Returns:
+    The rendered traceback, or ``[traceback could not be rendered]``.
+  """
+  try:
+    return "".join(traceback_module.format_exception(error)).rstrip("\n")
+  except (KeyboardInterrupt, SystemExit):
+    raise
+  except BaseException:
+    return "[traceback could not be rendered]"
 
 
 # Recursion bound for _recursive_smart_truncate: id()-based cycle detection
@@ -2165,12 +2210,15 @@ class BigQueryLoggerConfig:
         ``[FORMATTER_FAILED]``, the ``formatter_failed`` counter of
         ``get_drop_stats()`` is incremented, and ``error_message`` names the
         failure by class only, for example ``content_formatter raised
-        ImportError``. A class whose name was not chosen by code, such as one
-        created by ``type(name, ...)``, is named by its nearest ancestor whose
-        name was, for example ``content_formatter raised <subclass of
-        ValueError>``. An event that already carries an ``error_message``,
-        such as a ``TOOL_ERROR``, keeps it first, followed by ``; `` and the
-        formatter failure.
+        ImportError``. Because a class can be created or renamed at runtime
+        with a name taken from the content, only built-in types and a few
+        trusted classes (``LlmRequest``, ``types.Content``, ``types.Part``,
+        pydantic ``BaseModel``, and ``google.api_core`` ``GoogleAPICallError``)
+        are named. Any other class, including one your own code defines, is
+        described by its nearest named ancestor, for example
+        ``content_formatter raised <subclass of ValueError>``. An event that
+        already carries an ``error_message``, such as a ``TOOL_ERROR``, keeps
+        it first, followed by ``; `` and the formatter failure.
       gcs_bucket_name: GCS bucket for offloading large content.
       connection_id: BigQuery connection ID for ObjectRef columns.
       log_session_metadata: Whether to log session metadata.
@@ -2223,18 +2271,21 @@ class BigQueryLoggerConfig:
       credentials_identifier: Optional explicit string identifier to
         disambiguate or share background loop states across plugin instances
         with equivalent credential identities.
-      debug_content_formatter_errors: When ``True``, an exception raised by
-        ``content_formatter`` is also logged with its traceback (``exc_info``)
-        through this module's Python logger, to debug the formatter locally.
-        The traceback includes the exception message, which can embed the
-        unformatted content the formatter was protecting, and it reaches every
-        handler the process has configured: the console, the log file that
-        ``adk run`` writes, and anything that forwards logs elsewhere, such as
-        a managed runtime shipping stderr to Cloud Logging. Enable it only
-        where that content may be seen. The plugin never writes the traceback
-        to BigQuery; the row's ``error_message`` still names only the
-        exception class. ``False`` (the default) logs a constant message with
-        no traceback.
+      debug_content_formatter_errors: When ``True``, the traceback of an
+        exception raised by ``content_formatter`` is rendered to text and
+        appended to the formatter-failure warning that this module's Python
+        logger emits, to debug the formatter locally. The traceback includes
+        the exception message, which can embed the unformatted content the
+        formatter was protecting, and it reaches every handler the process
+        has configured: the console, the log file that ``adk run`` writes, and
+        anything that forwards logs elsewhere, such as a managed runtime
+        shipping stderr to Cloud Logging. Enable it only where that content
+        may be seen. Rendering is best effort: if the exception's own code
+        fails while it is rendered, a constant placeholder is logged instead,
+        and the row is unaffected. The plugin never writes the traceback to
+        BigQuery; the row's ``error_message`` still names only the exception
+        class. ``False`` (the default) logs a constant message with no
+        traceback.
   """
 
   enabled: bool = True
@@ -2320,8 +2371,8 @@ class BigQueryLoggerConfig:
   # flush_on_run_end is False.
   use_dedicated_background_loop: Optional[bool] = None
   credentials_identifier: Optional[str] = None
-  # Opt-in: attach a failing content_formatter's traceback to the local
-  # formatter-failure warning. The traceback can embed the unformatted
+  # Opt-in: append a failing content_formatter's rendered traceback to the
+  # local formatter-failure warning. The traceback can embed the unformatted
   # content; see the class docstring before enabling it.
   debug_content_formatter_errors: bool = False
 
@@ -7276,6 +7327,8 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
 
     timestamp = datetime.now(timezone.utc)
     formatter_error: Optional[str] = None
+    formatter_raised = False
+    formatter_traceback: Optional[str] = None
     if self.config.content_formatter:
       try:
         formatted = self.config.content_formatter(raw_content, event_type)
@@ -7294,7 +7347,12 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             # safe callback's traceback log. dict/list subclasses stay isinstance-based — the
             # parser routes them through the hardened recursive
             # sanitizer, whose protocol boundary already fails closed.
-            type(formatted) in (types.Content, types.Part, LlmRequest)
+            # Compared by identity: `in` would call the result class's
+            # metaclass __eq__, which can raise anything or claim a match.
+            any(
+                type(formatted) is shape
+                for shape in (types.Content, types.Part, LlmRequest)
+            )
             or isinstance(formatted, (dict, list))
         ):
           # The formatter is typed Any: a non-native result would reach
@@ -7303,8 +7361,8 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           # republish the original content or raise into the safe
           # callback's traceback log. The
           # message is CONSTANT: even a class NAME can be payload-derived
-          # via type(name, ...), so error_message names only a class whose
-          # name code chose.
+          # via type(name, ...), so error_message uses only a trusted class
+          # label.
           logger.warning(
               "Content formatter returned an unsupported result type for"
               " event %s; writing sentinel instead of original content.",
@@ -7319,24 +7377,40 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       except Exception as e:
         # Fail CLOSED: the formatter is a redaction/privacy
         # boundary, so its failure must never fall back to the unformatted
-        # payload. The log message is CONSTANT and carries no traceback
-        # unless debug_content_formatter_errors opts in — the exception
-        # message and traceback can embed the protected content, and even
-        # the class NAME can be payload-derived via type(name, ...), so
-        # error_message names only a class whose name code chose.
-        logger.warning(
-            "Content formatter failed for event %s; writing sentinel"
-            " instead of original content.",
-            event_type,
-            exc_info=self.config.debug_content_formatter_errors,
-        )
+        # payload. The exception message and traceback can embed the
+        # protected content, and even the class NAME can be payload-derived
+        # via type(name, ...), so error_message uses only a trusted class
+        # label and the warning below stays CONSTANT. The traceback is
+        # rendered, best effort, only when debug_content_formatter_errors
+        # opts in; no handler ever receives the live exception.
+        formatter_raised = True
         formatter_error = _formatter_failure_message(type(e), raised=True)
+        if self.config.debug_content_formatter_errors:
+          formatter_traceback = _render_formatter_traceback(e)
         raw_content = _FORMATTER_FAILED_SENTINEL
         self._count_local_drop("formatter_failed")
+      if formatter_raised:
+        # Logged only once the formatter's exception is no longer being
+        # handled: a failing handler's handleError prints its own exception
+        # chain, which would otherwise reach that exception and run its code.
+        if formatter_traceback is None:
+          logger.warning(
+              "Content formatter failed for event %s; writing sentinel"
+              " instead of original content.",
+              event_type,
+          )
+        else:
+          logger.warning(
+              "Content formatter failed for event %s; writing sentinel"
+              " instead of original content. Debug traceback:\n%s",
+              event_type,
+              formatter_traceback,
+          )
 
     # The event's own diagnostic (e.g. a TOOL_ERROR's exception text) stays
     # first and intact so an error row keeps its primary cause; a formatter
-    # failure is appended after it.
+    # failure is appended after it. The note skips the bounded sanitizer
+    # above: it is fixed text and a trusted class label, never free text.
     error_message = event_data.error_message
     if formatter_error is not None:
       error_message = (
