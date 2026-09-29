@@ -17,6 +17,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import dataclasses
+import gc
 import io
 import json
 import logging
@@ -26,6 +27,7 @@ import sys
 import threading
 import time
 from unittest import mock
+import warnings
 
 from google.adk.agents import base_agent
 from google.adk.agents.callback_context import CallbackContext
@@ -3950,6 +3952,36 @@ class _MetaclassMroBreaker:
       self.metaclass.__bases__ = (type,)
 
 
+def _result_with_class_hook(tripwire, via, claims=None):
+  """Returns an object whose own __class__ lookup fires or lies.
+
+  isinstance falls back to an object's __class__ when its real type does not
+  match, which runs this code. `claims` is what the lookup reports instead of
+  the real class.
+  """
+  if via == "property":
+
+    class _Result:
+
+      @property
+      def __class__(self):
+        tripwire.fire("__class__ property")
+        return claims if claims is not None else type(self)
+
+  else:
+
+    class _Result:
+
+      def __getattribute__(self, name):
+        if name == "__class__":
+          tripwire.fire("__getattribute__('__class__')")
+          if claims is not None:
+            return claims
+        return super().__getattribute__(name)
+
+  return _Result()
+
+
 def _raise_import_error(content, event_type):
   raise ImportError(f"cannot import name 'redact' (formatting {content})")
 
@@ -4686,6 +4718,179 @@ class TestContentFormatterFailureDiagnostics:
       assert payload_text not in caplog.text
 
   @pytest.mark.parametrize(
+      "rethrow",
+      [True, False],
+      ids=["formatter_rethrows_it", "distinct_caller_exception"],
+  )
+  async def test_failing_handler_never_prints_the_callers_active_exception(
+      self,
+      rethrow,
+      capsys,
+      monkeypatch,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """A failing handler cannot print an exception the caller is handling.
+
+    ADK calls error callbacks while it handles the error, and a formatter can
+    re-raise that very exception. logging's handleError prints whatever is
+    being handled, so the warning is emitted while a constant stand-in is
+    handled instead.
+    """
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+    caller_failure = ValueError(f"the caller is handling {self.SECRET}")
+
+    def formatter(content, event_type):
+      if rethrow:
+        raise caller_failure
+      raise ImportError("the formatter failed on its own")
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=formatter
+    )
+    closed_stream = io.StringIO()
+    closed_stream.close()
+
+    with self._standard_handler_on_plugin_logger(closed_stream):
+      try:
+        raise caller_failure
+      except ValueError:
+        row, drop_stats = await self._log_user_message_contained(
+            config, mock_write_client, invocation_context, dummy_arrow_schema
+        )
+
+    stderr = capsys.readouterr().err
+    assert (
+        row["content"]
+        == bigquery_agent_analytics_plugin._FORMATTER_FAILED_SENTINEL
+    )
+    assert drop_stats.get("formatter_failed") == 1
+    assert "--- Logging error ---" in stderr
+    assert self.SECRET not in stderr
+
+  @pytest.mark.parametrize(
+      "hook_error",
+      [
+          asyncio.CancelledError,
+          SystemExit,
+          KeyboardInterrupt,
+          RuntimeError,
+          None,
+      ],
+      ids=[
+          "cancelled_error",
+          "system_exit",
+          "keyboard_interrupt",
+          "runtime_error",
+          "claims_to_be_a_dict",
+      ],
+  )
+  @pytest.mark.parametrize("via", ["property", "getattribute"])
+  async def test_result_that_lies_about_its_class_is_rejected_unrun(
+      self,
+      via,
+      hook_error,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """A result is judged by its real type, never by its own __class__.
+
+    isinstance falls back to an object's __class__, which runs the object's
+    code: it can raise anything, or claim to be a dict. Its real type runs
+    none of that code, so such a result is simply an unsupported one, and
+    the formatter is not reported as having raised.
+    """
+    tripwire = _Tripwire(hook_error or RuntimeError)
+    claims = dict if hook_error is None else None
+
+    def formatter(content, event_type):
+      result = _result_with_class_hook(tripwire, via, claims)
+      tripwire.armed = hook_error is not None
+      return result
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=formatter
+    )
+
+    def disarm():
+      tripwire.armed = False
+
+    row, drop_stats = await self._log_user_message_contained(
+        config,
+        mock_write_client,
+        invocation_context,
+        dummy_arrow_schema,
+        cleanup=disarm,
+    )
+
+    assert row["error_message"] == (
+        "content_formatter returned unsupported type <subclass of object>"
+    )
+    assert (
+        row["content"]
+        == bigquery_agent_analytics_plugin._FORMATTER_FAILED_SENTINEL
+    )
+    assert drop_stats.get("formatter_failed") == 1
+
+  @pytest.mark.parametrize(
+      "payload_named",
+      [False, True],
+      ids=["async_formatter", "payload_named_coroutine"],
+  )
+  async def test_rejected_coroutine_is_closed_without_a_warning(
+      self,
+      payload_named,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """A coroutine result is closed before it starts, so it never warns.
+
+    Released unawaited, it would emit "coroutine '<name>' was never
+    awaited", and a formatter can set that name from the content.
+    """
+    ran = []
+
+    async def coroutine_body():
+      ran.append("coroutine_body")
+
+    if payload_named:
+
+      def formatter(content, event_type):
+        coroutine = coroutine_body()
+        coroutine.__qualname__ = _identifier_from_content(content)
+        return coroutine
+
+    else:
+
+      async def formatter(content, event_type):
+        ran.append("formatter")
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=formatter
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always")
+      row, drop_stats = await self._log_user_message_contained(
+          config, mock_write_client, invocation_context, dummy_arrow_schema
+      )
+      gc.collect()
+
+    assert row["error_message"] == (
+        "content_formatter returned unsupported type coroutine"
+    )
+    assert drop_stats.get("formatter_failed") == 1
+    assert not ran
+    messages = [str(warning.message) for warning in caught]
+    assert not [message for message in messages if "never awaited" in message]
+    assert not [
+        message for message in messages if self.PAYLOAD_IDENTIFIER in message
+    ]
+
+  @pytest.mark.parametrize(
       "injected",
       [
           RuntimeError,
@@ -4712,6 +4917,8 @@ class TestContentFormatterFailureDiagnostics:
           pytest.param("log_handler", False, id="log_handler-returned"),
           pytest.param("log_filter", True, id="log_filter-raised"),
           pytest.param("log_filter", False, id="log_filter-returned"),
+          pytest.param("admit", False, id="admit-returned"),
+          pytest.param("close", False, id="close-returned"),
       ],
   )
   async def test_a_raise_anywhere_in_diagnosis_leaves_the_row_intact(
@@ -4724,13 +4931,14 @@ class TestContentFormatterFailureDiagnostics:
       dummy_arrow_schema,
       caplog,
   ):
-    """Whatever any diagnostic step raises, the row is written unchanged.
+    """Whatever any step after the formatter call raises, the row survives.
 
-    Diagnosis (naming the failed class, rendering the debug traceback, and
-    emitting the warning through the logger's filters and handlers) runs
-    after the failure is handled, behind one boundary. Each step here raises
-    each kind of exception, and the sentinel row, its drop count, and a
-    payload-free error_message must still come out, with nothing escaping.
+    Judging the result, closing a rejected generator, naming the failed
+    class, rendering the debug traceback, and emitting the warning through
+    the logger's filters and handlers all run behind one boundary. Each step
+    here raises each kind of exception, and the sentinel row, its drop count,
+    and a payload-free error_message must still come out, with nothing
+    escaping.
     """
     plugin_module = bigquery_agent_analytics_plugin
     plugin_logger = logging.getLogger("google_adk." + plugin_module.__name__)
@@ -4748,9 +4956,25 @@ class TestContentFormatterFailureDiagnostics:
       def emit(self, record):
         raise_for_formatter_warnings(record)
 
+    def return_started_generator(content, event_type):
+      def generator():
+        try:
+          yield "started"
+        finally:
+          raise_injected()
+
+      started = generator()
+      next(started)
+      return started
+
+    if raised:
+      formatter = _raise_import_error
+    elif step == "close":
+      formatter = return_started_generator
+    else:
+      formatter = _return_tuple
     config = plugin_module.BigQueryLoggerConfig(
-        content_formatter=_raise_import_error if raised else _return_tuple,
-        debug_content_formatter_errors=True,
+        content_formatter=formatter, debug_content_formatter_errors=True
     )
     handler = _RaisingHandler()
     injections = {
@@ -4762,6 +4986,10 @@ class TestContentFormatterFailureDiagnostics:
         ),
         "log_handler": contextlib.nullcontext(),
         "log_filter": contextlib.nullcontext(),
+        "admit": mock.patch.object(
+            plugin_module, "_natively_parsed", raise_injected, create=True
+        ),
+        "close": contextlib.nullcontext(),
     }
     if step == "log_handler":
       plugin_logger.addHandler(handler)
@@ -4777,7 +5005,7 @@ class TestContentFormatterFailureDiagnostics:
       plugin_logger.removeFilter(raise_for_formatter_warnings)
 
     outcome = "raised" if raised else "returned unsupported type"
-    if step == "label":
+    if step in ("label", "admit", "close"):
       expected_error_message = f"content_formatter {outcome} <unknown class>"
     elif raised:
       expected_error_message = "content_formatter raised ImportError"
