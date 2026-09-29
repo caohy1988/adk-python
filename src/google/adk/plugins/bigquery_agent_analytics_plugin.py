@@ -112,7 +112,43 @@ if TYPE_CHECKING:
   from ..agents.invocation_context import InvocationContext
   from ..events.event import Event
 
+
+class _LoggingStandIn(Exception):
+  """The exception being handled while this module's log records are handled.
+
+  logging's ``handleError``, and handlers that report the current exception,
+  print the exception being handled. Without this stand-in that can be one
+  the caller is handling, such as the error ADK passes to an error callback,
+  and its text can carry the content this plugin keeps out of logs.
+  """
+
+
+def _handle_records_with_a_stand_in(target: logging.Logger) -> None:
+  """Makes ``target`` run its filters and handlers while handling a stand-in.
+
+  The stand-in's ``__context__`` is cleared, so no exception chain printed
+  while a record is handled can reach the caller's exception, even by a
+  handler that ignores ``__suppress_context__``. Records are unchanged:
+  ``Logger._log`` resolves the calling function and any ``exc_info`` before
+  it calls ``handle``.
+
+  Args:
+    target: The logger whose records to handle this way.
+  """
+  handle = type(target).handle
+
+  def handle_with_stand_in(record: logging.LogRecord) -> None:
+    try:
+      raise _LoggingStandIn
+    except _LoggingStandIn as stand_in:
+      stand_in.__context__ = None
+      handle(target, record)
+
+  target.handle = handle_with_stand_in  # type: ignore[method-assign]
+
+
 logger: logging.Logger = logging.getLogger("google_adk." + __name__)
+_handle_records_with_a_stand_in(logger)
 
 # Bumped when the schema changes (1 → 2 → 3 …). Used as a table
 # label for governance and to decide whether auto-upgrade should run.
@@ -1120,13 +1156,27 @@ def _render_formatter_traceback(error: BaseException) -> str:
     return "[traceback could not be rendered]"
 
 
-class _WarningIsolation(Exception):
-  """The exception being handled while the formatter-failure warning is logged.
+# SystemExit's own ``code`` descriptor; reading it through the descriptor
+# runs no code of a SystemExit subclass.
+_SYSTEM_EXIT_CODE = SystemExit.__dict__["code"]
 
-  A log handler that fails calls ``handleError``, which prints the exception
-  being handled. Without this stand-in that could be the formatter's
-  exception, or one the caller is handling, and either can carry the content.
+
+def _fresh_interrupt(interrupt: BaseException) -> BaseException:
+  """Returns a new KeyboardInterrupt or SystemExit that carries no text.
+
+  A SystemExit keeps its exit code only when the code is an int or None;
+  any other code, such as a message, becomes 1, Python's failure status.
+
+  Args:
+    interrupt: A KeyboardInterrupt or SystemExit, possibly a subclass.
+
+  Returns:
+    The fresh exception to raise in its place.
   """
+  if issubclass(type(interrupt), KeyboardInterrupt):
+    return KeyboardInterrupt()
+  code = _SYSTEM_EXIT_CODE.__get__(interrupt)
+  return SystemExit(code if code is None or type(code) is int else 1)
 
 
 def _natively_parsed(formatted: Any, result_type: type) -> bool:
@@ -1162,10 +1212,10 @@ def _settle_formatter_outcome(
     *,
     event_type: str,
     debug: bool,
-) -> tuple[Any, Optional[str]]:
+) -> tuple[Any, Optional[str], Optional[BaseException]]:
   """Decides what the row logs after the content_formatter call, fail closed.
 
-  Everything after the call happens behind this one boundary:
+  These steps happen behind this one boundary:
   - judging a returned result by its real type;
   - closing a rejected coroutine or generator;
   - naming the failed class;
@@ -1173,22 +1223,25 @@ def _settle_formatter_outcome(
   - emitting the warning through whatever filters and handlers are
     configured.
 
-  Whatever any step raises, of any type, is contained here. The outcome then
-  falls back to the sentinel and a constant note, so nothing after the call
-  can drop the row, leave the sentinel out, or escape the callback.
+  Whatever those steps raise is contained here, and the outcome falls back
+  to the sentinel and a constant note, so no failure while describing a
+  failed or rejected result can drop the row or leave the sentinel out. A
+  result the parser logs natively leaves unchanged, and the parser's own
+  boundary, which catches Exception only, applies to it.
 
-  BaseException is contained on purpose. These steps run code that the
-  failed class or the rejected result controls, and code in filters and
-  handlers. A KeyboardInterrupt or SystemExit raised there cannot be told
-  apart from one that a signal handler delivered, and letting it through
-  would let the content under redaction abort the agent run and lose the
-  row. The cost is that a signal delivered while these steps run is absorbed
-  and the process does not act on it. That includes a signal that arrives
-  while a configured handler blocks, for example on network I/O. An
-  orchestrator that follows SIGTERM with SIGKILL then loses the rows still
-  buffered. Nothing here awaits, so a real asyncio cancellation is never
-  absorbed, and interrupts raised by the formatter call itself still
-  propagate.
+  Interrupts are sorted by the code that raised them, because Python cannot
+  tell a KeyboardInterrupt or SystemExit that a signal handler delivered
+  from one raised directly: code can even signal its own process. Code that
+  the failed class or the rejected result controls runs only while the
+  traceback is rendered and while a rejected generator is closed, and
+  anything raised there, interrupts included, is contained, so that the
+  content under redaction cannot end the agent run. A signal that lands
+  there is absorbed. Everywhere else only this module's code and the
+  application's log filters and handlers run. There a KeyboardInterrupt or
+  SystemExit came from a signal or from the application, so it is returned,
+  as a fresh exception with no text, for the caller to raise once the row is
+  written. CancelledError is always contained: nothing here awaits, so it
+  cannot be a real cancellation.
 
   Args:
     formatted: What the formatter returned; ignored when ``failure`` is set.
@@ -1197,10 +1250,11 @@ def _settle_formatter_outcome(
     debug: Whether to append the rendered traceback to the warning.
 
   Returns:
-    ``(formatted, None)`` when the parser can log the result as it is. A str
-    subclass is normalized to the exact built-in. Otherwise
-    ``(_FORMATTER_FAILED_SENTINEL, note)``, where ``note`` is the text for
-    the error_message column.
+    ``(formatted, None, None)`` when the parser can log the result as it
+    is; a str subclass is normalized to the exact built-in. Otherwise
+    ``(_FORMATTER_FAILED_SENTINEL, note, interrupt)``, where ``note`` is the
+    text for the error_message column and ``interrupt`` is None or the
+    interrupt to raise after the row is written.
   """
   outcome = "raised" if failure is not None else "returned unsupported type"
   note = f"content_formatter {outcome} <unknown class>"
@@ -1212,46 +1266,47 @@ def _settle_formatter_outcome(
       if _natively_parsed(formatted, failed_type):
         if failed_type is not str and issubclass(failed_type, str):
           formatted = str.__str__(formatted)
-        return formatted, None
+        return formatted, None, None
       # A non-native result would reach the parser's str() fallback, where
       # a payload-controlled __str__ can republish the content, so it is
       # rejected. Close a coroutine first: released unstarted, it warns
       # "coroutine '<name>' was never awaited", and the formatter can set
       # that name from the content. A generator is closed too, so that its
       # cleanup code runs here, contained, rather than at collection.
-      if failed_type is CoroutineType:
-        CoroutineType.close(formatted)
-      elif failed_type is GeneratorType:
-        GeneratorType.close(formatted)
+      try:
+        if failed_type is CoroutineType:
+          CoroutineType.close(formatted)
+        elif failed_type is GeneratorType:
+          GeneratorType.close(formatted)
+      except BaseException:
+        # Closing ran the result's own code; see the docstring.
+        pass
     note = _formatter_failure_message(failed_type, raised=failure is not None)
-    try:
-      raise _WarningIsolation from None
-    except _WarningIsolation:
-      if failure is None:
-        logger.warning(
-            "Content formatter returned an unsupported result type for"
-            " event %s; writing sentinel instead of original content.",
-            event_type,
-        )
-      elif debug:
-        logger.warning(
-            "Content formatter failed for event %s; writing sentinel"
-            " instead of original content. Debug traceback:\n%s",
-            event_type,
-            _render_formatter_traceback(failure),
-        )
-      else:
-        logger.warning(
-            "Content formatter failed for event %s; writing sentinel"
-            " instead of original content.",
-            event_type,
-        )
-  except BaseException:
-    # Contained whatever it is, for the reasons in the docstring. It is not
-    # reported either: the logger may be what failed, and the exception can
-    # carry the content.
-    pass
-  return _FORMATTER_FAILED_SENTINEL, note
+    if failure is None:
+      logger.warning(
+          "Content formatter returned an unsupported result type for"
+          " event %s; writing sentinel instead of original content.",
+          event_type,
+      )
+    elif debug:
+      logger.warning(
+          "Content formatter failed for event %s; writing sentinel"
+          " instead of original content. Debug traceback:\n%s",
+          event_type,
+          _render_formatter_traceback(failure),
+      )
+    else:
+      logger.warning(
+          "Content formatter failed for event %s; writing sentinel"
+          " instead of original content.",
+          event_type,
+      )
+  except BaseException as error:
+    # Nothing is reported: the logger may be what failed, and the exception
+    # can carry the content. See the docstring for which interrupts return.
+    if issubclass(type(error), (KeyboardInterrupt, SystemExit)):
+      return _FORMATTER_FAILED_SENTINEL, note, _fresh_interrupt(error)
+  return _FORMATTER_FAILED_SENTINEL, note, None
 
 
 # Recursion bound for _recursive_smart_truncate: id()-based cycle detection
@@ -2357,12 +2412,17 @@ class BigQueryLoggerConfig:
         are named. Any other class, including one your own code defines, is
         described by its nearest named ancestor, for example
         ``content_formatter raised <subclass of ValueError>``, and a class
-        that cannot be read at all as ``<unknown class>``. Judging the
-        result, describing the failure, and logging its warning are best
-        effort: whatever they raise is contained, so they never drop the
-        row or change the sentinel or the counter. A ``KeyboardInterrupt``,
-        ``SystemExit``, or ``asyncio.CancelledError`` raised by the
-        formatter call itself still propagates, and no row is written. An
+        that cannot be read at all as ``<unknown class>``. Describing a
+        failed or rejected result and logging its warning are best effort:
+        nothing they raise drops the row or changes the sentinel or the
+        counter. A ``KeyboardInterrupt`` or ``SystemExit`` that a signal
+        handler or your own log handlers and filters raise meanwhile is
+        raised again once the row is written, as a new exception without
+        text; one raised by the failed class's or the rejected result's own
+        code is contained, as is a signal that arrives while that code runs.
+        A ``KeyboardInterrupt``, ``SystemExit``, or
+        ``asyncio.CancelledError`` raised by the formatter call itself still
+        propagates, and no row is written. An
         event that already carries an ``error_message``, such as a
         ``TOOL_ERROR``, keeps it first, followed by ``; `` and the formatter
         failure.
@@ -7411,6 +7471,49 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         is_truncated: Whether the content is already truncated.
         event_data: Typed container for structured fields and extra attributes.
           Defaults to ``EventData()`` when not provided.
+
+    Raises:
+        KeyboardInterrupt: A signal handler, or a log handler or filter,
+          raised one while a content_formatter failure was being described.
+          A new one without text is raised after the row was handed to the
+          writer; see ``_settle_formatter_outcome``.
+        SystemExit: Likewise; it keeps the exit code only if that is an int.
+    """
+    interrupts: list[BaseException] = []
+    try:
+      await self._log_event_row(
+          event_type,
+          callback_context,
+          raw_content,
+          is_truncated,
+          event_data,
+          interrupts,
+      )
+    finally:
+      if interrupts:
+        # Raised only now, after the row was handed to the writer, so that
+        # neither the row nor the signal is lost.
+        raise interrupts[0] from None
+
+  async def _log_event_row(
+      self,
+      event_type: str,
+      callback_context: CallbackContext,
+      raw_content: Any,
+      is_truncated: bool,
+      event_data: Optional[EventData],
+      interrupts: list[BaseException],
+  ) -> None:
+    """Builds the row for ``_log_event`` and hands it to the writer.
+
+    Args:
+        event_type: As for ``_log_event``.
+        callback_context: As for ``_log_event``.
+        raw_content: As for ``_log_event``.
+        is_truncated: As for ``_log_event``.
+        event_data: As for ``_log_event``.
+        interrupts: Receives an interrupt deferred while a content_formatter
+          failure was described, for ``_log_event`` to raise afterwards.
     """
     if not self.config.enabled or self._is_shutting_down:
       return
@@ -7491,11 +7594,12 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         # debug_content_formatter_errors opts in.
         failure = e
       # Everything after the call runs behind _settle_formatter_outcome's
-      # one boundary, which contains whatever it raises: judging the result,
-      # closing a rejected coroutine, naming the class, and logging. It runs
-      # after the except block, so the formatter's exception is no longer
-      # the one being handled.
-      raw_content, formatter_error = _settle_formatter_outcome(
+      # one boundary: judging the result, closing a rejected coroutine,
+      # naming the class, and logging. Nothing it raises reaches here; an
+      # interrupt it sets aside comes back to be raised once the row is
+      # written. It runs after the except block, so the formatter's
+      # exception is no longer the one being handled.
+      raw_content, formatter_error, interrupt = _settle_formatter_outcome(
           formatted,
           failure,
           event_type=event_type,
@@ -7503,6 +7607,8 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       )
       if formatter_error is not None:
         self._count_local_drop("formatter_failed")
+      if interrupt is not None:
+        interrupts.append(interrupt)
       # The except clause would have dropped this reference itself: the
       # exception's traceback holds this frame, which holds the exception.
       formatted = failure = None
