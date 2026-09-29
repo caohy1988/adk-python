@@ -951,13 +951,13 @@ def _retrieve_exception(future: asyncio.Future[Any]) -> None:
 
 
 def _release_awaitable(awaitable: Any) -> None:
-  """Releases an awaitable a classifier returned, running none of its code.
+  """Releases an awaitable a classifier returned, without awaiting it.
 
   A coroutine, native or generator-based, is closed, so that Python does not
   warn it was never awaited. An asyncio future or task that is still pending
-  is cancelled, and the exception it ends with is retrieved, as is the
-  exception of one already done. Any other awaitable only runs code when it is
-  awaited, so it is left as it is.
+  is cancelled, so a task that has not started never runs, and the exception
+  it ends with is retrieved, as is the exception of one already done. Any other
+  awaitable only runs code when it is awaited, so it is left as it is.
   """
   if inspect.iscoroutine(awaitable) or inspect.isgenerator(awaitable):
     awaitable.close()
