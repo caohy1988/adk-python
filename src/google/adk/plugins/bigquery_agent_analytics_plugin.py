@@ -119,7 +119,9 @@ class _LoggingStandIn(Exception):
   logging's ``handleError``, and handlers that report the current exception,
   print the exception being handled. Without this stand-in that can be one
   the caller is handling, such as the error ADK passes to an error callback,
-  and its text can carry the content this plugin keeps out of logs.
+  and its text can carry the content this plugin keeps out of logs. For the
+  same reason, a set-aside interrupt is raised while a stand-in is handled,
+  so that the stand-in, not the caller's exception, is its ``__context__``.
   """
 
 
@@ -130,19 +132,19 @@ def _handle_records_with_a_stand_in(target: logging.Logger) -> None:
   while a record is handled can reach the caller's exception, even by a
   handler that ignores ``__suppress_context__``. Records are unchanged:
   ``Logger._log`` resolves the calling function and any ``exc_info`` before
-  it calls ``handle``.
+  it calls ``handle``. The class's ``handle`` is looked up on every call, so
+  a patch applied to it after import still reaches ``target``.
 
   Args:
     target: The logger whose records to handle this way.
   """
-  handle = type(target).handle
 
   def handle_with_stand_in(record: logging.LogRecord) -> None:
     try:
       raise _LoggingStandIn
     except _LoggingStandIn as stand_in:
       stand_in.__context__ = None
-      handle(target, record)
+      type(target).handle(target, record)
 
   target.handle = handle_with_stand_in  # type: ignore[method-assign]
 
@@ -2426,7 +2428,10 @@ class BigQueryLoggerConfig:
         propagates, and no row is written. An
         event that already carries an ``error_message``, such as a
         ``TOOL_ERROR``, keeps it first, followed by ``; `` and the formatter
-        failure.
+        failure. The row's ``status`` is left as the event set it, usually
+        ``'OK'``, so a query that counts any non-NULL ``error_message`` as an
+        error, such as the BigQuery Agent Analytics SDK's error predicate,
+        counts a formatter failure as an error.
       gcs_bucket_name: GCS bucket for offloading large content.
       connection_id: BigQuery connection ID for ObjectRef columns.
       log_session_metadata: Whether to log session metadata.
@@ -7476,8 +7481,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     Raises:
         KeyboardInterrupt: A signal handler, or a log handler or filter,
           raised one while a content_formatter failure was being described.
-          A new one without text is raised after the row was handed to the
-          writer; see ``_settle_formatter_outcome``.
+          A new one without text, chained to no exception the caller is
+          handling, is raised after the row was handed to the writer; see
+          ``_settle_formatter_outcome``.
         SystemExit: Likewise; it keeps the exit code only if that is an int.
     """
     interrupts: list[BaseException] = []
@@ -7493,8 +7499,15 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     finally:
       if interrupts:
         # Raised only now, after the row was handed to the writer, so that
-        # neither the row nor the signal is lost.
-        raise interrupts[0] from None
+        # neither the row nor the signal is lost. Raising it while a
+        # context-free stand-in is handled makes the stand-in its
+        # __context__; `from None` alone would only hide the caller's
+        # exception from printers that honor __suppress_context__.
+        try:
+          raise _LoggingStandIn
+        except _LoggingStandIn as stand_in:
+          stand_in.__context__ = None
+          raise interrupts[0] from None
 
   async def _log_event_row(
       self,

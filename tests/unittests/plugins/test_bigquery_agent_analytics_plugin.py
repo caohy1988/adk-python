@@ -5017,6 +5017,101 @@ class TestContentFormatterFailureDiagnostics:
     assert len(records) == 1
     assert records[0].exc_info[0] is RuntimeError
 
+  async def test_later_patches_of_logger_handle_see_plugin_records(
+      self, mock_write_client, invocation_context, dummy_arrow_schema
+  ):
+    """A patch of Logger.handle made after import applies to this logger too.
+
+    Instrumentation and test fixtures patch the class. The patched handle
+    must still run while the stand-in is handled.
+    """
+    plugin_module = bigquery_agent_analytics_plugin
+    plugin_logger = logging.getLogger("google_adk." + plugin_module.__name__)
+    original_handle = logging.Logger.handle
+    handled_while = []
+
+    def recording_handle(target, record):
+      if target is plugin_logger and record.getMessage().startswith(
+          "Content formatter "
+      ):
+        handled_while.append(sys.exc_info()[0])
+      return original_handle(target, record)
+
+    config = plugin_module.BigQueryLoggerConfig(
+        content_formatter=_raise_import_error
+    )
+    with mock.patch.object(logging.Logger, "handle", recording_handle):
+      row, _ = await self._log_user_message_contained(
+          config, mock_write_client, invocation_context, dummy_arrow_schema
+      )
+
+    assert row["content"] == plugin_module._FORMATTER_FAILED_SENTINEL
+    assert handled_while == [plugin_module._LoggingStandIn]
+
+  @pytest.mark.parametrize(
+      "interrupt",
+      [KeyboardInterrupt, SystemExit],
+      ids=["keyboard_interrupt", "system_exit"],
+  )
+  async def test_raised_interrupt_is_not_chained_to_the_callers_exception(
+      self,
+      interrupt,
+      mock_write_client,
+      invocation_context,
+      dummy_arrow_schema,
+  ):
+    """The interrupt raised after the row links to nothing the caller handles.
+
+    ``from None`` only hides a link from printers that honor
+    ``__suppress_context__``; code that walks ``__context__`` would still
+    reach the caller's exception and its text.
+    """
+    plugin_logger = logging.getLogger(
+        "google_adk." + bigquery_agent_analytics_plugin.__name__
+    )
+
+    class _InterruptingHandler(logging.Handler):
+
+      def emit(self, record):
+        if record.getMessage().startswith("Content formatter "):
+          raise interrupt()
+
+    config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig(
+        content_formatter=_raise_import_error
+    )
+    caller_failure = ValueError(f"the caller is handling {self.SECRET}")
+    handler = _InterruptingHandler()
+    plugin_logger.addHandler(handler)
+    try:
+      try:
+        raise caller_failure
+      except ValueError:
+        row, _, escaped = await self._log_user_message_catching(
+            config, mock_write_client, invocation_context, dummy_arrow_schema
+        )
+    finally:
+      plugin_logger.removeHandler(handler)
+
+    assert (
+        row["content"]
+        == bigquery_agent_analytics_plugin._FORMATTER_FAILED_SENTINEL
+    )
+    assert type(escaped) is interrupt
+    assert escaped.__suppress_context__
+    chain = []
+    link = escaped
+    while link is not None and len(chain) < 10:
+      chain.append(link)
+      link = link.__context__
+    assert not any(
+        link is caller_failure for link in chain
+    ), "the interrupt is chained to the caller's exception"
+    # Only a constant stand-in, itself chained to nothing, may be linked.
+    assert [type(link) for link in chain[1:]] in (
+        [],
+        [bigquery_agent_analytics_plugin._LoggingStandIn],
+    )
+
   @pytest.mark.parametrize(
       "rethrow",
       [True, False],
